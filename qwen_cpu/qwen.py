@@ -68,10 +68,10 @@ def n_past():
     return G_lib.qwen_n_past()
 
 
-def generate(prompt_tokens, max_new_tokens=512, stop_ids=EOS_IDS, **sample_kwargs):
-    # 生成器: 逐个返回新 token id; 调用方负责在新对话前 reset()
+def generate(prompt_tokens, max_new_tokens=512, stop_ids=EOS_IDS, embd=None, embd_mask=None, pos3=None, **sample_kwargs):
+    # 生成器: 逐个返回新 token id; 调用方负责在新对话前 reset(); embd/embd_mask/pos3 含义同 eval_tokens
     t0 = time.time()
-    eval_tokens(prompt_tokens)
+    eval_tokens(prompt_tokens, embd, embd_mask, pos3)
     t1 = time.time()
     log(f"ℹ️ prefill {len(prompt_tokens)} tokens, {t1 - t0:.2f}s, {len(prompt_tokens) / (t1 - t0):.2f} tok/s")
     out = []

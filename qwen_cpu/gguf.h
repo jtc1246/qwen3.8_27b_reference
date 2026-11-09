@@ -9,7 +9,6 @@
 #include <vector>
 #include <unordered_map>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -114,13 +113,22 @@ bool open(File& f, const char* path) {
     struct stat st;
     fstat(fd, &st);
     f.size = st.st_size;
-    void* m = mmap(nullptr, f.size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0); // 预读进内存, 避免推理时缺页
-    close(fd);
-    if (m == MAP_FAILED) {
-        fprintf(stderr, "❌ mmap 失败 %s\n", path);
+    uint8_t* buf = (uint8_t*)malloc(f.size); // 整个文件读进自己分配的内存, 进程生命周期内不释放
+    if (!buf) {
+        fprintf(stderr, "❌ 内存分配失败 %zu 字节\n", f.size);
         return false;
     }
-    f.base = (const uint8_t*)m;
+    for (size_t off = 0; off < f.size;) {
+        size_t want = f.size - off < ((size_t)1 << 30) ? f.size - off : ((size_t)1 << 30);
+        ssize_t n = pread(fd, buf + off, want, off);
+        if (n <= 0) {
+            fprintf(stderr, "❌ 读取失败 %s (偏移 %zu)\n", path, off);
+            return false;
+        }
+        off += n;
+    }
+    close(fd);
+    f.base = buf;
     Reader r{f.base, f.base + f.size};
     if (r.get<uint32_t>() != 0x46554747) { // "GGUF"
         fprintf(stderr, "❌ 不是 GGUF 文件: %s\n", path);

@@ -60,12 +60,14 @@ vector<float> G_work;
 vector<int> G_idx;
 vector<uint8_t> G_seen;
 
-float* alloc_f(size_t n) { // 大块内存走 mmap, 未写入的页不占物理内存
-    float* p = (float*)calloc(n, sizeof(float));
+float* alloc_f(size_t n) { // 直接分配并写零, 物理内存在初始化时就全部占用, 不释放
+    float* p = (float*)malloc(n * sizeof(float));
     if (!p) {
         fprintf(stderr, "❌ 内存分配失败 %zu floats\n", n);
         _Exit(1);
     }
+    memset(p, 0, n * sizeof(float));
+    for (size_t i = 0; i < n * sizeof(float); i += 4096) ((volatile char*)p)[i] = 0; // gcc 会把 malloc+memset(0) 合并成 calloc (延迟分配), 用 volatile 逐页写强制占用
     return p;
 }
 
