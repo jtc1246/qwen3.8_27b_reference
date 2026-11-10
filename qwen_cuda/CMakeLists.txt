@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.20)
+set(CMAKE_CXX_COMPILER $ENV{MUSL_BIN}/g++)
+project(qwen_cuda CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+find_program(NVCC nvcc REQUIRED)
+get_filename_component(CUDA_ROOT "${NVCC}" DIRECTORY)
+set(CUDA_INC "${CUDA_ROOT}/../targets/x86_64-linux/include") # conda 的 cuda-nvcc 头文件位置, 只用其中的 cuda.h (driver API)
+set(FATBIN "${CMAKE_BINARY_DIR}/kernels.fatbin")
+add_custom_command( # 只编译 device 代码; nvcc 预处理需要 glibc 的 host 编译器, 用系统 g++
+    OUTPUT ${FATBIN}
+    COMMAND ${NVCC} -fatbin -O3 -std=c++17 -ccbin /usr/bin/g++ -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 -Xptxas -v -o ${FATBIN} ${CMAKE_SOURCE_DIR}/kernels.cu
+    DEPENDS ${CMAKE_SOURCE_DIR}/kernels.cu
+    VERBATIM)
+add_compile_options(-Wall)
+add_library(qwen_cuda SHARED qwen.cpp)
+target_include_directories(qwen_cuda PRIVATE ${CUDA_INC})
+target_compile_definitions(qwen_cuda PRIVATE FATBIN_PATH="${FATBIN}")
+set_source_files_properties(qwen.cpp PROPERTIES OBJECT_DEPENDS ${FATBIN})
+target_link_options(qwen_cuda PRIVATE -nodefaultlibs)
+target_link_libraries(qwen_cuda PRIVATE -Wl,-Bstatic -lstdc++ -lgcc -lgcc_eh -lc -Wl,-Bdynamic /usr/lib64/libcuda.so.1)

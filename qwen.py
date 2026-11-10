@@ -1,30 +1,37 @@
 #!/usr/bin/env python3
-# libqwen.so 的 ctypes 封装: 输入 token 序列, C++ 内部完成推理和采样, 返回 token id
+# C++ 推理库的 ctypes 封装: 输入 token 序列, C++ 内部完成推理和采样, 返回 token id
+# 各后端的 C 接口相同, load 时用 backend 选择 (见 LIBS), 一个进程 (模块实例) 只加载一个后端
 import os, sys, time, ctypes
 
-LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmake_build", "libqwen.so")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+LIBS = {"cpu": "qwen_cpu/cmake_build/libqwen.so", "cuda": "qwen_cuda/cmake_build/libqwen_cuda.so"}
 EOS_IDS = (248046, 248044) # <|im_end|>, <|endoftext|>
 G_lib = None
+G_backend = None
 
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-def load(gguf_path, n_threads=16, max_ctx=32768):
-    global G_lib
+def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768):
+    # backend: LIBS 的 key; n_threads 只对 cpu 有效, device (GPU 编号) 只对 cuda 有效
+    global G_lib, G_backend
     if G_lib is not None:
         return G_lib
-    lib = ctypes.CDLL(LIB_PATH)
+    if backend not in LIBS:
+        raise ValueError(f"❌ 未知后端 {backend}, 可选 {list(LIBS)}")
+    lib = ctypes.CDLL(os.path.join(ROOT, LIBS[backend]))
     lib.qwen_init.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     lib.qwen_eval.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     lib.qwen_sample.argtypes = [ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
     lib.qwen_seed.argtypes = [ctypes.c_uint64]
     lib.qwen_logits.restype = ctypes.POINTER(ctypes.c_float)
     lib.qwen_hidden.restype = ctypes.POINTER(ctypes.c_float)
-    if lib.qwen_init(gguf_path.encode(), n_threads, max_ctx) != 0:
+    if lib.qwen_init(gguf_path.encode(), n_threads if backend == "cpu" else device, max_ctx) != 0: # 第二个参数: cpu 是线程数, cuda 是 GPU 编号
         raise RuntimeError(f"❌ 模型加载失败: {gguf_path}")
     G_lib = lib
+    G_backend = backend
     return lib
 
 

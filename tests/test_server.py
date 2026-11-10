@@ -38,6 +38,14 @@ def make_image():
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def make_image2():
+    img = Image.new("RGB", (480, 480), "white")
+    ImageDraw.Draw(img).polygon([(240, 60), (60, 420), (420, 420)], fill="green")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
 def main():
     global G_base
     p = argparse.ArgumentParser()
@@ -49,8 +57,17 @@ def main():
     log(f"✅ [system + 关闭思考 + 非流式] {r['choices'][0]['message']} finish={r['choices'][0]['finish_reason']} usage={r['usage']}")
     r = post({"messages": [{"role": "user", "content": "2+3等于几? 只回答数字。"}], "reasoning_effort": "low", "stream": True}, stream=True)
     log(f"✅ [思考 low + 流式] reasoning={r['reasoning']!r} content={r['content']!r} finish={r['finish']}")
-    r = post({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": make_image()}}, {"type": "text", "text": "图里有哪些形状、分别什么颜色? 图里写了什么字? 简短回答。"}]}], "chat_template_kwargs": {"enable_thinking": False}, "temperature": 0})
-    log(f"✅ [图片 + 关闭思考] {r['choices'][0]['message']['content']!r} usage={r['usage']}")
+    body = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": make_image()}}, {"type": "text", "text": "图里有哪些形状、分别什么颜色? 图里写了什么字? 简短回答。"}]}], "chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+    t0 = time.time()
+    r = post(body)
+    t1 = time.time()
+    log(f"✅ [图片 + 关闭思考] {r['choices'][0]['message']['content']!r} usage={r['usage']} {t1 - t0:.2f}s")
+    r2 = post(body) # 同一张图, 服务端应命中缓存 (见服务端日志)
+    same = r2["choices"][0]["message"] == r["choices"][0]["message"]
+    log(f"{'✅' if same else '❌'} [图片缓存, 相同输出] {r2['choices'][0]['message']['content']!r} {time.time() - t1:.2f}s")
+    r = post({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": make_image2()}}, {"type": "image_url", "image_url": {"url": make_image()}}, {"type": "text", "text": "分别描述这两张图里的形状和颜色, 每张图一句话。"}]}], "enable_thinking": False, "temperature": 0})
+    c = r["choices"][0]["message"]["content"]
+    log(f"{'✅' if '绿' in c and ('红' in c or '蓝' in c) else '⚠️'} [两张图, 第二张命中缓存] {c!r} usage={r['usage']}")
     body = {"messages": [{"role": "user", "content": "随便说一个水果的名字, 只说名字。"}], "enable_thinking": False, "temperature": 1.5, "seed": 1234}
     a, b = post(body), post(body)
     log(f"{'✅' if a['choices'][0]['message'] == b['choices'][0]['message'] else '⚠️'} [seed 一致性] {a['choices'][0]['message']['content']!r} vs {b['choices'][0]['message']['content']!r}")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # 冒烟测试: 只用标准库, 从 GGUF 读词表做贪心最长匹配分词 (不是真正的 BPE, 仅用于在没装 tokenizers 时验证模型能跑)
 import os, sys, time, struct, argparse
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "qwen_cpu"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import qwen
 
 SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
@@ -49,6 +49,8 @@ def main():
     p.add_argument("--max-new", type=int, default=40)
     p.add_argument("--temp", type=float, default=0.0)
     p.add_argument("--think", action="store_true", help="开启思考模式 (不预填空的 think 块)")
+    p.add_argument("--type", default="cpu", choices=list(qwen.LIBS), help="推理后端")
+    p.add_argument("--device", type=int, default=0, help="cuda 后端的 GPU 编号")
     args = p.parse_args()
     t0 = time.time()
     vocab = read_vocab(args.gguf)
@@ -76,7 +78,7 @@ def main():
     if not args.think:
         prompt += encode("\n") + sp("</think>") + encode("\n\n")
     qwen.log(f"ℹ️ prompt token 数 {len(prompt)}: {prompt}")
-    lib = qwen.load(args.gguf, args.threads, 4096)
+    lib = qwen.load(args.gguf, args.type, args.threads, args.device, 4096)
     fails = lib.qwen_selftest()
     qwen.log(("✅ 自测全部通过" if fails == 0 else f"❌ 自测失败 {fails} 项"))
     out = []

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # OpenAI 兼容 chat completions 服务: 支持图片、system、temperature、seed、thinking 控制, 其余参数忽略
 # C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
-import os, sys, io, json, time, uuid, base64, random, argparse, threading, urllib.request
+# --type 选择后端 (qwen.LIBS), cuda 时视觉塔也在 GPU 上; 视觉塔输出按图片原始字节的 sha256 缓存在内存 (LRU)
+import os, sys, io, json, time, uuid, base64, random, hashlib, argparse, threading, urllib.request
+from collections import OrderedDict
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import numpy as np
 import torch
@@ -22,6 +24,9 @@ EFFORT_MAP = {"low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh
 G_args = None
 G_proc = None
 G_vis = None
+G_dev = "cpu" # 视觉塔所在的 torch device
+G_img_cache = OrderedDict() # sha256 -> 该图的视觉输出 (n_tok, 5120) float32, 只在 G_lock 内访问
+G_img_cache_bytes = 0
 G_lock = threading.Lock()
 G_queue_lock = threading.Lock()
 G_waiting = 0
@@ -48,10 +53,10 @@ def load_vision(hf_dir):
     missing, unexpected = vis.load_state_dict(sd, strict=False)
     if missing or unexpected:
         raise RuntimeError(f"❌ 视觉塔权重不匹配, missing={missing}, unexpected={unexpected}")
-    return vis.eval()
+    return vis.eval().to(G_dev)
 
 
-def load_image(url):
+def load_image(url): # 返回 (RGB 图片, 原始字节的 sha256)
     if url.startswith("data:"):
         data = base64.b64decode(url.split(",", 1)[1])
     elif url.startswith("http://") or url.startswith("https://"):
@@ -59,11 +64,11 @@ def load_image(url):
             data = resp.read()
     else:
         raise BadRequest("图片只支持 data URL (base64) 或 http(s) URL")
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    return Image.open(io.BytesIO(data)).convert("RGB"), hashlib.sha256(data).hexdigest()
 
 
-def convert_messages(messages): # OpenAI 格式 -> chat 模板格式, 图片单独取出
-    out, images = [], []
+def convert_messages(messages): # OpenAI 格式 -> chat 模板格式, 图片和 sha256 单独取出
+    out, images, hashes = [], [], []
     for m in messages:
         role = "system" if m.get("role") == "developer" else m.get("role")
         content = m.get("content")
@@ -74,7 +79,9 @@ def convert_messages(messages): # OpenAI 格式 -> chat 模板格式, 图片单�
                     parts.append({"type": "text", "text": p.get("text", "")})
                 elif p.get("type") == "image_url":
                     iu = p.get("image_url")
-                    images.append(load_image(iu if isinstance(iu, str) else iu.get("url", "")))
+                    img, h = load_image(iu if isinstance(iu, str) else iu.get("url", ""))
+                    images.append(img)
+                    hashes.append(h)
                     parts.append({"type": "image"})
                 else:
                     raise BadRequest(f"不支持的 content 类型: {p.get('type')}")
@@ -83,7 +90,7 @@ def convert_messages(messages): # OpenAI 格式 -> chat 模板格式, 图片单�
         if isinstance(m.get("reasoning_content"), str):
             msg["reasoning_content"] = m["reasoning_content"]
         out.append(msg)
-    return out, images
+    return out, images, hashes
 
 
 def thinking_options(body): # 返回 (enable_thinking, reasoning_effort)
@@ -124,7 +131,7 @@ def build_prompt(body): # 锁外执行: 解析消息、下载图片、模板渲�
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise BadRequest("messages 不能为空")
-    msgs, images = convert_messages(messages)
+    msgs, images, hashes = convert_messages(messages)
     enable_thinking, effort = thinking_options(body)
     kw = {"enable_thinking": enable_thinking}
     if effort:
@@ -148,20 +155,48 @@ def build_prompt(body): # 锁外执行: 解析消息、下载图片、模板渲�
     seed = body.get("seed")
     if seed is not None and not isinstance(seed, int):
         raise BadRequest("seed 必须是整数")
-    return {"ids": ids, "out": out if images else None, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images)}
+    return {"ids": ids, "out": out if images else None, "hashes": hashes, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images)}
 
 
-def run_vision(p): # 锁内执行: 视觉塔前向, 生成 embedding / mask / 3D 位置
+def vision_embeds(p): # 锁内执行: 命中缓存的图片直接取, 其余图片一起过视觉塔, 返回 (所有图片 token 数, 5120) 和命中数
+    global G_img_cache_bytes
+    grids = p["out"]["image_grid_thw"] # (n_img, 3) t/h/w (patch 数)
+    pv = p["out"]["pixel_values"] # (所有图片 patch 总数, 1536), 按图片顺序拼接
+    offs = np.cumsum([0] + grids.prod(-1).tolist()) # 每张图 patch 的起止位置
+    embs = [G_img_cache.get(h) for h in p["hashes"]]
+    for h, e in zip(p["hashes"], embs):
+        if e is not None:
+            G_img_cache.move_to_end(h)
+    miss = [i for i, e in enumerate(embs) if e is None]
+    if miss:
+        with torch.no_grad():
+            pv_m = torch.cat([pv[offs[i]:offs[i + 1]] for i in miss]).to(G_dev) # (未命中 patch 数, 1536)
+            out = G_vis(pv_m, grid_thw=grids[miss].to(G_dev)).pooler_output.float().cpu().numpy() # (未命中图片 token 数, 5120), spatial_merge 后每 4 个 patch 一个 token
+        cnt = np.cumsum([0] + [int(grids[i].prod()) // 4 for i in miss])
+        for j, i in enumerate(miss):
+            e = out[cnt[j]:cnt[j + 1]].copy() # (该图 token 数, 5120)
+            embs[i] = e
+            if p["hashes"][i] in G_img_cache or e.nbytes > G_args.image_cache_mb << 20:
+                continue
+            G_img_cache[p["hashes"][i]] = e
+            G_img_cache_bytes += e.nbytes
+            while G_img_cache_bytes > G_args.image_cache_mb << 20:
+                G_img_cache_bytes -= G_img_cache.popitem(last=False)[1].nbytes
+    return np.concatenate(embs), len(p["hashes"]) - len(miss)
+
+
+def run_vision(p): # 锁内执行: 视觉塔前向 (带缓存), 生成 embedding / mask / 3D 位置
     if p["out"] is None:
         return None, None, None
     ids = p["ids"]
-    with torch.no_grad():
-        emb = G_vis(p["out"]["pixel_values"], grid_thw=p["out"]["image_grid_thw"]).pooler_output # (n_img_tok, 5120) float32
+    t0 = time.time()
+    emb, hit = vision_embeds(p)
     mask = (np.array(ids) == IMAGE_TOKEN).astype(np.uint8) # (n,)
+    log(f"ℹ️ 视觉塔 {p['n_images']} 张图 (缓存命中 {hit}), {int(mask.sum())} 个图片 token, {time.time() - t0:.2f}s, 缓存 {len(G_img_cache)} 张 {G_img_cache_bytes / 1048576:.0f}MB")
     if int(mask.sum()) != emb.shape[0]:
         raise RuntimeError(f"❌ 图片 token 数 {int(mask.sum())} 与视觉输出 {emb.shape[0]} 不一致")
     embd = np.zeros((len(ids), 5120), dtype=np.float32) # (n, 5120)
-    embd[mask.astype(bool)] = emb.numpy()
+    embd[mask.astype(bool)] = emb
     pos3 = rope_positions(ids, p["out"]["image_grid_thw"].tolist()) # (n, 3)
     return embd, mask, pos3
 
@@ -169,10 +204,7 @@ def run_vision(p): # 锁内执行: 视觉塔前向, 生成 embedding / mask / 3D
 def generate_tokens(p): # 锁内执行的生成器, 逐个返回 token id
     if len(p["ids"]) >= G_args.ctx:
         raise BadRequest(f"prompt 长度 {len(p['ids'])} 超出上下文 {G_args.ctx}")
-    t0 = time.time()
     embd, mask, pos3 = run_vision(p)
-    if p["out"] is not None:
-        log(f"ℹ️ 视觉塔 {p['n_images']} 张图, {int(mask.sum())} 个图片 token, {time.time() - t0:.2f}s")
     qwen.reset()
     qwen.seed(p["seed"] if p["seed"] is not None else random.getrandbits(63))
     yield from qwen.generate(p["ids"], G_args.ctx - len(p["ids"]), embd=embd, embd_mask=mask, pos3=pos3, **p["sampling"])
@@ -324,24 +356,31 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global G_args, G_proc, G_vis
-    p = argparse.ArgumentParser(description="Qwen3.8-27B OpenAI 兼容服务 (CPU)")
+    global G_args, G_proc, G_vis, G_dev
+    p = argparse.ArgumentParser(description="Qwen3.8-27B OpenAI 兼容服务")
     p.add_argument("--gguf", required=True, help="Q4_K_M GGUF 路径")
     p.add_argument("--hf-dir", required=True, help="官方 HF 仓库目录: tokenizer/processor 配置 + 含 model.visual.* 的 safetensors 分片")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--threads", type=int, default=16)
+    p.add_argument("--type", default="cpu", choices=list(qwen.LIBS), help="推理后端; cuda 时文本主干和视觉塔都在 GPU 上")
+    p.add_argument("--threads", type=int, default=16, help="cpu 后端的推理线程数, 以及 torch (CPU 上的视觉塔、预处理) 的线程数")
+    p.add_argument("--device", type=int, default=0, help="cuda 后端使用的 GPU 编号")
     p.add_argument("--ctx", type=int, default=32768, help="最大上下文 (prompt + 输出)")
     p.add_argument("--max-image-pixels", type=int, default=1048576, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 0 表示用官方默认 16777216")
     p.add_argument("--model-name", default="qwen3.8-27b")
+    p.add_argument("--image-cache-mb", type=int, default=4096, help="视觉塔输出缓存上限 (MB, 只在内存, LRU 淘汰), 0 表示不缓存")
     G_args = p.parse_args()
     t0 = time.time()
     torch.set_num_threads(G_args.threads)
-    qwen.load(G_args.gguf, G_args.threads, G_args.ctx)
+    if G_args.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"❌ --type cuda 需要 CUDA 版 torch, 当前 torch {torch.__version__} 不支持 CUDA")
+        G_dev = f"cuda:{G_args.device}"
+    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx)
     G_proc = AutoProcessor.from_pretrained(G_args.hf_dir)
     log("✅ processor / tokenizer 加载完成")
     G_vis = load_vision(G_args.hf_dir)
-    log(f"✅ 视觉塔加载完成, 参数 {sum(x.numel() for x in G_vis.parameters()) / 1e6:.1f}M")
+    log(f"✅ 视觉塔加载完成 ({G_dev}), 参数 {sum(x.numel() for x in G_vis.parameters()) / 1e6:.1f}M")
     server = ThreadingHTTPServer((G_args.host, G_args.port), Handler)
     server.daemon_threads = True
     log(f"✅ 全部加载完成 ({time.time() - t0:.1f}s), 服务已启动 http://{G_args.host}:{G_args.port}/v1")
