@@ -25,7 +25,7 @@ def compare(cpu, gpu, tag):
     lg = np.ctypeslib.as_array(gpu.G_lib.qwen_logits(), (248320,)).copy() # [248320]
     top_c, top_g = np.argsort(-lc)[:10], np.argsort(-lg)[:10] # [10]
     overlap = len(set(top_c.tolist()) & set(top_g.tolist()))
-    ok = top_c[0] == top_g[0] and max(errs) < 1e-3 and rel(lg, lc) < 1e-3
+    ok = top_c[0] == top_g[0] and max(errs) < 5e-3 and rel(lg, lc) < 5e-3 # CUDA 的 matmul 输入和 KV 是 fp16, 实测误差 ~1e-3
     print(f"{'✅' if ok else '❌'} {tag}: hidden 最大相对误差 {max(errs):.2e} (第 {int(np.argmax(errs))} 层), logits 相对误差 {rel(lg, lc):.2e} 最大差 {np.abs(lg - lc).max():.3e}, top1 {top_c[0]}/{top_g[0]}, top10 重合 {overlap}", flush=True)
     return ok
 
@@ -34,7 +34,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--gguf", default="/root/local_llm/models/qwen38_27b_q4km/Qwen3.8-27B-Q4_K_M.gguf")
     p.add_argument("--threads", type=int, default=16)
-    p.add_argument("--n", type=int, default=300, help="随机 token 序列长度 (超过 256 会跨 CUDA chunk)")
+    p.add_argument("--n", type=int, default=1100, help="随机 token 序列长度 (超过 1024 会跨 CUDA chunk)")
     args = p.parse_args()
     cpu = load_mod("qwen_cpu_mod", os.path.join(ROOT, "qwen.py")) # 同一个 qwen.py 加载两次, 两个模块实例各自持有一个后端
     gpu = load_mod("qwen_cuda_mod", os.path.join(ROOT, "qwen.py"))

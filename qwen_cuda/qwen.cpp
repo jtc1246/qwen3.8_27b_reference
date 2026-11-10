@@ -26,7 +26,9 @@ const int N_HEAD = 24, N_KV = 4, HD = 256, ROT = 64;
 const int LK = 16, LV = 48, LHD = 128;
 const int KEY_DIM = LK * LHD, V_DIM = LV * LHD, QKV_DIM = 2 * KEY_DIM + V_DIM;
 const int Q_DIM = N_HEAD * HD * 2, KV_DIM = N_KV * HD, ATT_DIM = N_HEAD * HD;
-const int CHUNK = 256; // prefill 每批处理的 token 数
+const int CHUNK = 1024; // prefill 每批处理的 token 数
+const int ATT_SPLIT = 96; // decode 注意力沿序列最多切的段数
+const int FA_SMEM = (64 + 2 * 32) * (HD + 8) * 2; // k_attn_pf 的动态 smem: sq [64][264] + sk/sv [32][264] (fp16)
 const float THETA = 1e7f;
 
 struct Weight {
@@ -46,7 +48,7 @@ struct Layer {
     CUdeviceptr conv_state = 0, ssm_state = 0; // [10240][3], [48][128 k][128 v]
     Weight wq, wk, wv, wo;
     CUdeviceptr q_norm = 0, k_norm = 0;
-    CUdeviceptr k_cache = 0, v_cache = 0; // [max_ctx][1024] fp32
+    CUdeviceptr k_cache = 0, v_cache = 0; // [max_ctx][1024] fp16
 };
 
 Gguf::File G_file;
@@ -58,9 +60,9 @@ CUdeviceptr G_output_norm = 0;
 int G_max_ctx = 0, G_n_past = 0, G_next_pos = 0;
 bool G_inited = false;
 uint64_t G_rng = 0x853c49e6748fea9bULL;
-CUfunction G_k_mm[16], G_k_dq[16], G_k_embed[16], G_k_add_norm, G_k_silu_mul, G_k_conv, G_k_deltanet, G_k_qk_rope, G_k_attn;
-CUdeviceptr G_d_x, G_d_xn, G_d_out, G_d_qkv, G_d_z, G_d_a, G_d_b, G_d_o, G_d_qg, G_d_k, G_d_v, G_d_att, G_d_g, G_d_u;
-CUdeviceptr G_d_logits, G_d_hidden, G_d_tok, G_d_mask, G_d_embd, G_d_pos, G_d_inv_freq, G_d_conv_all, G_d_ssm_all;
+CUfunction G_k_mm[16], G_k_gemm[16], G_k_dq[16], G_k_embed[16], G_k_add_norm, G_k_silu_mul, G_k_dn_prep, G_k_dn_rec, G_k_dn_post, G_k_qk_rope, G_k_attn_pf, G_k_attn_dec, G_k_attn_merge;
+CUdeviceptr G_d_x, G_d_xn, G_d_out, G_d_qkv, G_d_z, G_d_a, G_d_b, G_d_o, G_d_qg, G_d_k, G_d_v, G_d_att, G_d_g, G_d_u, G_d_h; // matmul 的输入 xn/o/att/h 是 fp16, 其余 fp32
+CUdeviceptr G_d_logits, G_d_hidden, G_d_tok, G_d_mask, G_d_embd, G_d_pos, G_d_inv_freq, G_d_conv_all, G_d_ssm_all, G_d_po, G_d_pml, G_d_cv, G_d_qk, G_d_of; // cv/qk/of: DeltaNet 预处理后的 qkv、q·k、未归一化输出 (fp32)
 float* G_logits = nullptr; // pinned host 内存
 vector<float> G_hidden;
 int G_pos[CHUNK * 3];
@@ -119,7 +121,13 @@ void check_kv(const char* key, double expect) {
     }
 }
 
-void matmul(const Weight& w, CUdeviceptr x, int T, CUdeviceptr y) { Cu::launch(G_k_mm[w.type], w.n / 8, 1, 256, w.data, w.rb, w.k, w.n, x, T, y); }
+void matmul(const Weight& w, CUdeviceptr x, int T, CUdeviceptr y) { // token 数少 (decode) 用 GEMV, 否则用 tensor core GEMM
+    if (T < 16) {
+        Cu::launch(G_k_mm[w.type], w.n / 8, 1, 256, w.data, w.rb, w.k, w.n, x, T, y);
+        return;
+    }
+    Cu::launch(G_k_gemm[w.type], (T + 63) / 64, (w.n + 63) / 64, 128, w.data, w.rb, w.k, w.n, x, T, y);
+}
 
 void add_norm(CUdeviceptr add, CUdeviceptr w, CUdeviceptr hidden, int T) { Cu::launch(G_k_add_norm, T, 1, 1024, G_d_x, add, w, G_d_xn, hidden, T); }
 
@@ -144,23 +152,30 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
             matmul(L.gate_z, G_d_xn, T, G_d_z);
             matmul(L.alpha, G_d_xn, T, G_d_a);
             matmul(L.beta, G_d_xn, T, G_d_b);
-            Cu::launch(G_k_conv, QKV_DIM / 256, 1, 256, G_d_qkv, L.conv_state, L.conv_w, T);
-            Cu::launch(G_k_deltanet, LV, 1, 128, G_d_qkv, G_d_z, G_d_a, G_d_b, L.ssm_a, L.dt_bias, L.ssm_norm, L.ssm_state, G_d_o, T);
+            Cu::launch(G_k_dn_prep, T, LK, 128, G_d_qkv, L.conv_state, L.conv_w, G_d_cv, G_d_a, G_d_b, L.ssm_a, L.dt_bias, G_d_qk, T);
+            Cu::launch(G_k_dn_rec, LV, 4, 128, G_d_qkv, L.conv_state, G_d_cv, G_d_a, G_d_b, G_d_qk, L.ssm_state, G_d_of, T);
+            Cu::launch(G_k_dn_post, T, LV, 128, G_d_of, G_d_z, L.ssm_norm, G_d_o);
             matmul(L.ssm_out, G_d_o, T, G_d_out);
         } else {
             matmul(L.wq, G_d_xn, T, G_d_qg);
             matmul(L.wk, G_d_xn, T, G_d_k);
             matmul(L.wv, G_d_xn, T, G_d_v);
             Cu::launch(G_k_qk_rope, T, N_HEAD + N_KV, 256, G_d_qg, G_d_k, G_d_v, L.q_norm, L.k_norm, G_d_pos, G_d_inv_freq, L.k_cache, L.v_cache, G_n_past);
-            Cu::launch(G_k_attn, T, N_HEAD, 256, G_d_qg, L.k_cache, L.v_cache, G_d_att, G_n_past);
+            if (T == 1) { // decode: 沿序列切段, 每段至少 128 个 key, 段数不超过 ATT_SPLIT
+                int n = G_n_past + 1, kps = (std::max(128, (n + ATT_SPLIT - 1) / ATT_SPLIT) + 63) / 64 * 64, ns = (n + kps - 1) / kps;
+                Cu::launch(G_k_attn_dec, N_KV, ns, 128, G_d_qg, L.k_cache, L.v_cache, G_d_po, G_d_pml, n, kps);
+                Cu::launch(G_k_attn_merge, N_HEAD, 1, 256, G_d_qg, G_d_po, G_d_pml, ns, G_d_att);
+            } else {
+                Cu::launch_s(G_k_attn_pf, (T + 63) / 64, N_HEAD, 128, FA_SMEM, G_d_qg, L.k_cache, L.v_cache, G_d_att, G_n_past, T);
+            }
             matmul(L.wo, G_d_att, T, G_d_out);
         }
         add_norm(G_d_out, L.post_norm, 0, T);
         matmul(L.ffn_gate, G_d_xn, T, G_d_g);
         matmul(L.ffn_up, G_d_xn, T, G_d_u);
         int n = T * FF;
-        Cu::launch(G_k_silu_mul, (n + 255) / 256, 1, 256, G_d_g, G_d_u, n);
-        matmul(L.ffn_down, G_d_g, T, G_d_out);
+        Cu::launch(G_k_silu_mul, (n + 255) / 256, 1, 256, G_d_g, G_d_u, G_d_h, n);
+        matmul(L.ffn_down, G_d_h, T, G_d_out);
     }
     add_norm(G_d_out, G_output_norm, fp(G_d_hidden, (size_t)N_LAYER * D), T);
     int mx = G_next_pos - 1;
@@ -168,7 +183,7 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
     G_next_pos = mx + 1; // 后续默认位置接在最大位置之后, 与 HF get_rope_index 一致
     G_n_past += T;
     if (!need_logits) return;
-    matmul(G_output, fp(G_d_xn, (size_t)(T - 1) * D), 1, G_d_logits);
+    matmul(G_output, G_d_xn + (size_t)(T - 1) * D * 2, 1, G_d_logits);
     Cu::d2h(G_logits, G_d_logits, (size_t)VOCAB * 4);
 }
 
@@ -177,6 +192,13 @@ uint64_t rng_next() { // splitmix64
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
     return z ^ (z >> 31);
+}
+
+uint16_t f2h_exact(float f) { // 只用于自测: f 必须能被 fp16 精确表示且不是非规格化数
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) == 0) return (uint16_t)(u >> 16);
+    return (uint16_t)(((u >> 16) & 0x8000u) | ((((u >> 23) & 0xffu) - 112) << 10) | ((u >> 13) & 0x3ffu));
 }
 
 } // namespace
@@ -194,15 +216,20 @@ int qwen_init(const char* path, int device, int max_ctx) {
     for (int t = 0; t < 15; t++) {
         if (!tnames[t][0]) continue;
         G_k_mm[t] = Cu::func(("k_mm_" + string(tnames[t])).c_str());
+        G_k_gemm[t] = Cu::func(("k_gemm_" + string(tnames[t])).c_str());
         G_k_dq[t] = Cu::func(("k_dq_" + string(tnames[t])).c_str());
         G_k_embed[t] = Cu::func(("k_embed_" + string(tnames[t])).c_str());
     }
     G_k_add_norm = Cu::func("k_add_norm");
     G_k_silu_mul = Cu::func("k_silu_mul");
-    G_k_conv = Cu::func("k_conv");
-    G_k_deltanet = Cu::func("k_deltanet");
+    G_k_dn_prep = Cu::func("k_dn_prep");
+    G_k_dn_rec = Cu::func("k_dn_rec");
+    G_k_dn_post = Cu::func("k_dn_post");
     G_k_qk_rope = Cu::func("k_qk_rope");
-    G_k_attn = Cu::func("k_attn");
+    G_k_attn_pf = Cu::func("k_attn_pf");
+    Cu::ck(cuFuncSetAttribute(G_k_attn_pf, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, FA_SMEM), "cuFuncSetAttribute");
+    G_k_attn_dec = Cu::func("k_attn_dec");
+    G_k_attn_merge = Cu::func("k_attn_merge");
     if (!Gguf::open(G_file, path)) return -1;
     if (G_file.kv_str["general.architecture"] != "qwen35") {
         fprintf(stderr, "❌ 架构不是 qwen35: %s\n", G_file.kv_str["general.architecture"].c_str());
@@ -263,33 +290,39 @@ int qwen_init(const char* path, int device, int max_ctx) {
         L.wo = get_w(p + "attn_output.weight", ATT_DIM, D);
         L.q_norm = get_f(p + "attn_q_norm.weight", HD);
         L.k_norm = get_f(p + "attn_k_norm.weight", HD);
-        L.k_cache = Cu::alloc((size_t)max_ctx * KV_DIM * 4);
-        L.v_cache = Cu::alloc((size_t)max_ctx * KV_DIM * 4);
+        L.k_cache = Cu::alloc((size_t)max_ctx * KV_DIM * 2);
+        L.v_cache = Cu::alloc((size_t)max_ctx * KV_DIM * 2);
     }
     float inv_freq[ROT / 2];
     for (int i = 0; i < ROT / 2; i++) inv_freq[i] = 1.0f / powf(THETA, (float)(2 * i) / ROT); // 与 HF 一致用 fp32 计算
     G_d_inv_freq = Cu::alloc(sizeof(inv_freq));
     Cu::h2d(G_d_inv_freq, inv_freq, sizeof(inv_freq));
     G_d_x = Cu::alloc((size_t)CHUNK * D * 4);
-    G_d_xn = Cu::alloc((size_t)CHUNK * D * 4);
+    G_d_xn = Cu::alloc((size_t)CHUNK * D * 2);
     G_d_out = Cu::alloc((size_t)CHUNK * D * 4);
     G_d_qkv = Cu::alloc((size_t)CHUNK * QKV_DIM * 4);
     G_d_z = Cu::alloc((size_t)CHUNK * V_DIM * 4);
     G_d_a = Cu::alloc((size_t)CHUNK * LV * 4);
     G_d_b = Cu::alloc((size_t)CHUNK * LV * 4);
-    G_d_o = Cu::alloc((size_t)CHUNK * V_DIM * 4);
+    G_d_o = Cu::alloc((size_t)CHUNK * V_DIM * 2);
     G_d_qg = Cu::alloc((size_t)CHUNK * Q_DIM * 4);
     G_d_k = Cu::alloc((size_t)CHUNK * KV_DIM * 4);
     G_d_v = Cu::alloc((size_t)CHUNK * KV_DIM * 4);
-    G_d_att = Cu::alloc((size_t)CHUNK * ATT_DIM * 4);
+    G_d_att = Cu::alloc((size_t)CHUNK * ATT_DIM * 2);
     G_d_g = Cu::alloc((size_t)CHUNK * FF * 4);
     G_d_u = Cu::alloc((size_t)CHUNK * FF * 4);
+    G_d_h = Cu::alloc((size_t)CHUNK * FF * 2);
     G_d_logits = Cu::alloc((size_t)VOCAB * 4);
     G_d_hidden = Cu::alloc((size_t)(N_LAYER + 1) * D * 4);
     G_d_tok = Cu::alloc((size_t)CHUNK * 4);
     G_d_mask = Cu::alloc(CHUNK);
     G_d_embd = Cu::alloc((size_t)CHUNK * D * 4);
     G_d_pos = Cu::alloc((size_t)CHUNK * 3 * 4);
+    G_d_cv = Cu::alloc((size_t)CHUNK * QKV_DIM * 4);
+    G_d_qk = Cu::alloc((size_t)CHUNK * LK * 4);
+    G_d_of = Cu::alloc((size_t)CHUNK * V_DIM * 4);
+    G_d_po = Cu::alloc((size_t)ATT_SPLIT * ATT_DIM * 4);
+    G_d_pml = Cu::alloc((size_t)ATT_SPLIT * N_HEAD * 8);
     Cu::ck(cuMemAllocHost((void**)&G_logits, (size_t)VOCAB * 4), "cuMemAllocHost");
     memset(G_logits, 0, (size_t)VOCAB * 4);
     G_hidden.resize((size_t)(N_LAYER + 1) * D);
@@ -392,17 +425,16 @@ float* qwen_hidden() { // [65][5120], 0 是 embedding, i 是第 i 层输出, 都
     return G_hidden.data();
 }
 
-int qwen_selftest() { // GPU 反量化 vs 标量参考, GPU matmul (T=13, 覆盖 8 + 5 两组) vs double 逐行点积, 返回失败项数; 会覆盖激活缓冲
+int qwen_selftest() { // GPU 反量化 vs 标量参考, GPU matmul (T=13 走 GEMV, 覆盖 8 + 5 两组; T=100 走 tensor core GEMM, 覆盖不满 64 的 tile) vs double 逐行点积, 返回失败项数; 会覆盖激活缓冲
     Cu::bind();
     int fails = 0;
     const char* names[] = {"blk.0.attn_qkv.weight", "blk.0.ffn_gate.weight", "blk.51.ffn_down.weight", "blk.0.ffn_up.weight", "blk.0.ssm_alpha.weight", "output.weight"};
-    const int T = 13;
     for (const char* name : names) {
         const Gguf::Tensor& t = find_tensor(name);
         int k = (int)t.dims[0], n = (int)t.dims[1];
         Weight w = get_w(name, k, n);
         vector<uint8_t> raw(w.rb * 8);
-        vector<float> a((size_t)8 * k), b(k), x((size_t)T * k), y((size_t)T * n);
+        vector<float> a((size_t)8 * k), b(k);
         int rows[8] = {0, 1, 2, 3, n - 4, n - 3, n - 2, n - 1};
         Cu::h2d(G_d_tok, rows, sizeof(rows));
         Cu::launch(G_k_dq[w.type], 8, 1, 256, w.data, w.rb, k, G_d_tok, G_d_out);
@@ -416,26 +448,35 @@ int qwen_selftest() { // GPU 反量化 vs 标量参考, GPU matmul (T=13, 覆盖
                 max_abs = std::max(max_abs, (double)std::fabs(b[i]));
             }
         }
-        for (auto& v : x) v = (float)((rng_next() >> 11) * (1.0 / 9007199254740992.0) * 2 - 1);
-        Cu::h2d(G_d_g, x.data(), x.size() * 4);
-        matmul(w, G_d_g, T, G_d_u);
-        Cu::d2h(y.data(), G_d_u, y.size() * 4);
-        double max_rel = 0;
-        for (int r = 0; r < n; r += std::max(1, n / 37)) {
-            Cu::d2h(raw.data(), w.data + (size_t)r * w.rb, w.rb);
-            Quants::Ref::dequant_row(w.type, raw.data(), b.data(), k);
-            for (int tt = 0; tt < T; tt++) {
-                double ref = 0, mag = 0;
-                for (int i = 0; i < k; i++) {
-                    ref += (double)b[i] * x[(size_t)tt * k + i];
-                    mag += std::fabs((double)b[i] * x[(size_t)tt * k + i]);
+        double max_rel[2] = {0, 0}; // T = 13, 100
+        for (int ti = 0; ti < 2; ti++) {
+            int T = ti ? 100 : 13;
+            if ((size_t)T * n > (size_t)CHUNK * FF) continue; // 输出缓冲放不下 (lm_head 只测 T=13)
+            vector<float> x((size_t)T * k), y((size_t)T * n);
+            vector<uint16_t> xh(x.size());
+            for (size_t i = 0; i < x.size(); i++) { // matmul 输入是 fp16, 取 [-1, 1] 内 1/1024 的整数倍, fp16 可精确表示
+                x[i] = (float)((int)(rng_next() % 2049) - 1024) / 1024.0f;
+                xh[i] = f2h_exact(x[i]);
+            }
+            Cu::h2d(G_d_g, xh.data(), xh.size() * 2);
+            matmul(w, G_d_g, T, G_d_u);
+            Cu::d2h(y.data(), G_d_u, y.size() * 4);
+            for (int r = 0; r < n; r += std::max(1, n / 37)) {
+                Cu::d2h(raw.data(), w.data + (size_t)r * w.rb, w.rb);
+                Quants::Ref::dequant_row(w.type, raw.data(), b.data(), k);
+                for (int tt = 0; tt < T; tt++) {
+                    double ref = 0, mag = 0;
+                    for (int i = 0; i < k; i++) {
+                        ref += (double)b[i] * x[(size_t)tt * k + i];
+                        mag += std::fabs((double)b[i] * x[(size_t)tt * k + i]);
+                    }
+                    max_rel[ti] = std::max(max_rel[ti], std::fabs(ref - y[(size_t)tt * n + r]) / (mag + 1e-30));
                 }
-                max_rel = std::max(max_rel, std::fabs(ref - y[(size_t)tt * n + r]) / (mag + 1e-30));
             }
         }
-        bool ok = max_diff <= 1e-6 * max_abs && max_rel < 1e-5; // q4_k/q5_k 在 GPU 上用 fma, 与标量参考差最后一位
+        bool ok = max_diff <= 1e-6 * max_abs && max_rel[0] < 2e-4 && max_rel[1] < 2e-4; // q4_k/q5_k 在 GPU 上用 fma, 与标量参考差最后一位; GEMV 权重解成 fp16 + half2 部分和, 实测 2~5e-5
         fails += !ok;
-        fprintf(stderr, "%s %s type=%u [%d, %d] 反量化最大差 %.3g (最大绝对值 %.3g), matmul 最大相对误差 %.3g\n", ok ? "✅" : "❌", name, w.type, k, n, max_diff, max_abs, max_rel);
+        fprintf(stderr, "%s %s type=%u [%d, %d] 反量化最大差 %.3g (最大绝对值 %.3g), matmul 最大相对误差 GEMV %.3g / GEMM %.3g\n", ok ? "✅" : "❌", name, w.type, k, n, max_diff, max_abs, max_rel[0], max_rel[1]);
     }
     return fails;
 }

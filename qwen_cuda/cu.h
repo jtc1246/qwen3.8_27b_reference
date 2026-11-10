@@ -58,6 +58,11 @@ template <class... A> void launch(CUfunction f, unsigned gx, unsigned gy, unsign
     ck(cuLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, nullptr, params, nullptr), "cuLaunchKernel");
 }
 
+template <class... A> void launch_s(CUfunction f, unsigned gx, unsigned gy, unsigned block, unsigned smem, A... args) { // 同 launch, 带动态 smem 字节数
+    void* params[] = {(void*)&args..., nullptr};
+    ck(cuLaunchKernel(f, gx, gy, 1, block, 1, 1, smem, nullptr, params, nullptr), "cuLaunchKernel");
+}
+
 } // namespace Cu
 } // namespace
 
