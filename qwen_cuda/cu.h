@@ -10,6 +10,7 @@ namespace Cu { // CUDA driver API 的薄封装, 出错直接退出进程
 
 CUcontext G_ctx = nullptr;
 CUmodule G_mod = nullptr;
+CUstream G_stream = nullptr; // 所有 kernel 和拷贝都走这个非阻塞 stream (可被 CUDA Graph 捕获, 不与同进程 torch 的 legacy stream 隐式同步)
 
 void ck(CUresult r, const char* what) {
     if (r == CUDA_SUCCESS) return;
@@ -32,6 +33,7 @@ void init(int device, const void* image) {
     ck(cuDevicePrimaryCtxRetain(&G_ctx, dev), "cuDevicePrimaryCtxRetain");
     ck(cuCtxSetCurrent(G_ctx), "cuCtxSetCurrent");
     ck(cuModuleLoadData(&G_mod, image), "cuModuleLoadData");
+    ck(cuStreamCreate(&G_stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
     fprintf(stderr, "ℹ️ GPU %d: %s, sm_%d%d, 驱动 CUDA %d.%d\n", device, name, cc_major, cc_minor, ver / 1000, ver % 1000 / 10);
 }
 
@@ -46,21 +48,24 @@ CUfunction func(const char* name) {
 CUdeviceptr alloc(size_t bytes) { // 分配并清零
     CUdeviceptr p;
     ck(cuMemAlloc(&p, bytes), "cuMemAlloc");
-    ck(cuMemsetD8(p, 0, bytes), "cuMemsetD8");
+    ck(cuMemsetD8Async(p, 0, bytes, G_stream), "cuMemsetD8Async");
     return p;
 }
 
-void h2d(CUdeviceptr dst, const void* src, size_t bytes) { ck(cuMemcpyHtoD(dst, src, bytes), "cuMemcpyHtoD"); }
-void d2h(void* dst, CUdeviceptr src, size_t bytes) { ck(cuMemcpyDtoH(dst, src, bytes), "cuMemcpyDtoH"); }
+void h2d(CUdeviceptr dst, const void* src, size_t bytes) { ck(cuMemcpyHtoDAsync(dst, src, bytes, G_stream), "cuMemcpyHtoDAsync"); } // 源是可分页内存时返回前已拷到暂存区, src 可立即复用
+void d2h(void* dst, CUdeviceptr src, size_t bytes) { // 同步: 返回时数据已到 dst
+    ck(cuMemcpyDtoHAsync(dst, src, bytes, G_stream), "cuMemcpyDtoHAsync");
+    ck(cuStreamSynchronize(G_stream), "cuStreamSynchronize");
+}
 
 template <class... A> void launch(CUfunction f, unsigned gx, unsigned gy, unsigned block, A... args) { // 参数类型必须与 kernel 声明的大小一致 (指针用 CUdeviceptr)
     void* params[] = {(void*)&args..., nullptr};
-    ck(cuLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, nullptr, params, nullptr), "cuLaunchKernel");
+    ck(cuLaunchKernel(f, gx, gy, 1, block, 1, 1, 0, G_stream, params, nullptr), "cuLaunchKernel");
 }
 
 template <class... A> void launch_s(CUfunction f, unsigned gx, unsigned gy, unsigned block, unsigned smem, A... args) { // 同 launch, 带动态 smem 字节数
     void* params[] = {(void*)&args..., nullptr};
-    ck(cuLaunchKernel(f, gx, gy, 1, block, 1, 1, smem, nullptr, params, nullptr), "cuLaunchKernel");
+    ck(cuLaunchKernel(f, gx, gy, 1, block, 1, 1, smem, G_stream, params, nullptr), "cuLaunchKernel");
 }
 
 } // namespace Cu

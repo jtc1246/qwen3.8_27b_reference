@@ -27,8 +27,8 @@ const int LK = 16, LV = 48, LHD = 128;
 const int KEY_DIM = LK * LHD, V_DIM = LV * LHD, QKV_DIM = 2 * KEY_DIM + V_DIM;
 const int Q_DIM = N_HEAD * HD * 2, KV_DIM = N_KV * HD, ATT_DIM = N_HEAD * HD;
 const int CHUNK = 1024; // prefill 每批处理的 token 数
-const int ATT_SPLIT = 96; // decode 注意力沿序列最多切的段数
-const int FA_SMEM = (64 + 2 * 32) * (HD + 8) * 2; // k_attn_pf 的动态 smem: sq [64][264] + sk/sv [32][264] (fp16)
+const int ATT_SPLIT = 78; // decode 注意力沿序列最多切的段数, 与 kernels.cu 一致
+const int FA_SMEM = (64 + 4 * 32) * (HD + 8) * 2; // k_attn_pf 的动态 smem: sq [64][264] + sk/sv [2][32][264] (fp16), 101376 字节
 const float THETA = 1e7f;
 
 struct Weight {
@@ -60,9 +60,16 @@ CUdeviceptr G_output_norm = 0;
 int G_max_ctx = 0, G_n_past = 0, G_next_pos = 0;
 bool G_inited = false;
 uint64_t G_rng = 0x853c49e6748fea9bULL;
-CUfunction G_k_mm[16], G_k_gemm[16], G_k_dq[16], G_k_embed[16], G_k_add_norm, G_k_silu_mul, G_k_dn_prep, G_k_dn_rec, G_k_dn_post, G_k_qk_rope, G_k_attn_pf, G_k_attn_dec, G_k_attn_merge;
+struct MmGroup { // 与 kernels.cu 的 MmGroup 布局一致
+    uint64_t w[4], rb[4], y[4];
+    int n[4], type[4];
+    int cnt, glu;
+};
+
+CUfunction G_k_gemv, G_k_gemv_glu, G_k_gemv1, G_k_gemv1_glu, G_k_gemm[16], G_k_dq[16], G_k_embed[16], G_k_add_norm, G_k_silu_mul, G_k_dn_prep, G_k_dn_rec, G_k_dn_post, G_k_qk_rope, G_k_attn_pf, G_k_attn_dec, G_k_attn_merge;
 CUdeviceptr G_d_x, G_d_xn, G_d_out, G_d_qkv, G_d_z, G_d_a, G_d_b, G_d_o, G_d_qg, G_d_k, G_d_v, G_d_att, G_d_g, G_d_u, G_d_h; // matmul 的输入 xn/o/att/h 是 fp16, 其余 fp32
-CUdeviceptr G_d_logits, G_d_hidden, G_d_tok, G_d_mask, G_d_embd, G_d_pos, G_d_inv_freq, G_d_conv_all, G_d_ssm_all, G_d_po, G_d_pml, G_d_cv, G_d_qk, G_d_of; // cv/qk/of: DeltaNet 预处理后的 qkv、q·k、未归一化输出 (fp32)
+CUdeviceptr G_d_logits, G_d_hidden, G_d_tok, G_d_mask, G_d_embd, G_d_pos, G_d_inv_freq, G_d_conv_all, G_d_ssm_all, G_d_po, G_d_pml, G_d_cv, G_d_qk, G_d_of, G_d_np; // cv/qk/of: DeltaNet 预处理后的 qkv、q·k、未归一化输出 (fp32); np: n_past (int)
+CUgraphExec G_graph = nullptr; // decode (T = 1) 的 CUDA Graph
 float* G_logits = nullptr; // pinned host 内存
 vector<float> G_hidden;
 int G_pos[CHUNK * 3];
@@ -89,7 +96,7 @@ Weight get_w(const string& name, int k, int n) {
         fprintf(stderr, "❌ %s 形状不对, 期望 [%d, %d]\n", name.c_str(), k, n);
         _Exit(1);
     }
-    if (t.type >= 16 || !G_k_mm[t.type]) {
+    if (t.type >= 16 || !G_k_gemm[t.type]) {
         fprintf(stderr, "❌ %s 的量化类型 %u 没有对应 kernel\n", name.c_str(), t.type);
         _Exit(1);
     }
@@ -121,9 +128,25 @@ void check_kv(const char* key, double expect) {
     }
 }
 
+void gemv(const Weight* const* ws, const CUdeviceptr* ys, int cnt, bool glu, CUdeviceptr x, int T) { // decode (T < 16): 共享输入 x 的 cnt 个矩阵一次 launch; glu: ws[0]/ws[1] 是 gate/up, ys[0] = silu(gate)·up (fp16)
+    MmGroup g = {};
+    int rows = 0;
+    for (int i = 0; i < cnt; i++) {
+        g.w[i] = ws[i]->data, g.rb[i] = ws[i]->rb, g.n[i] = ws[i]->n, g.type[i] = (int)ws[i]->type;
+        g.y[i] = glu ? ys[0] : ys[i];
+        rows += ws[i]->n;
+    }
+    g.cnt = glu ? 1 : cnt;
+    g.glu = glu;
+    if (glu) rows = ws[0]->n;
+    CUfunction f = T == 1 ? (glu ? G_k_gemv1_glu : G_k_gemv1) : (glu ? G_k_gemv_glu : G_k_gemv);
+    Cu::launch(f, (rows + 1) / 2, 1, 64, g, ws[0]->k, x, T);
+}
+
 void matmul(const Weight& w, CUdeviceptr x, int T, CUdeviceptr y) { // token 数少 (decode) 用 GEMV, 否则用 tensor core GEMM
     if (T < 16) {
-        Cu::launch(G_k_mm[w.type], w.n / 8, 1, 256, w.data, w.rb, w.k, w.n, x, T, y);
+        const Weight* ws[1] = {&w};
+        gemv(ws, &y, 1, false, x, T);
         return;
     }
     Cu::launch(G_k_gemm[w.type], (T + 63) / 64, (w.n + 63) / 64, 128, w.data, w.rb, w.k, w.n, x, T, y);
@@ -131,11 +154,67 @@ void matmul(const Weight& w, CUdeviceptr x, int T, CUdeviceptr y) { // token 数
 
 void add_norm(CUdeviceptr add, CUdeviceptr w, CUdeviceptr hidden, int T) { Cu::launch(G_k_add_norm, T, 1, 1024, G_d_x, add, w, G_d_xn, hidden, T); }
 
+void forward(int T, CUdeviceptr d_mask, CUdeviceptr d_embd, bool need_logits) { // 一个 chunk 的全部 kernel (输入已在显存: token、位置、n_past); 只 launch, 不同步, 可被 CUDA Graph 捕获
+    Cu::launch(G_k_embed[G_tok_embd.type], T, 1, 256, G_tok_embd.data, G_tok_embd.rb, G_d_tok, d_mask, d_embd, G_d_x);
+    for (int l = 0; l < N_LAYER; l++) {
+        Layer& L = G_layers[l];
+        add_norm(l ? G_d_out : 0, L.attn_norm, fp(G_d_hidden, (size_t)l * D), T); // 先加上一层 FFN 的残差, 同时保存上一层输出
+        if (L.recr) {
+            if (T < 16) {
+                const Weight* ws[4] = {&L.qkv, &L.gate_z, &L.alpha, &L.beta};
+                CUdeviceptr ys[4] = {G_d_qkv, G_d_z, G_d_a, G_d_b};
+                gemv(ws, ys, 4, false, G_d_xn, T);
+            } else {
+                matmul(L.qkv, G_d_xn, T, G_d_qkv);
+                matmul(L.gate_z, G_d_xn, T, G_d_z);
+                matmul(L.alpha, G_d_xn, T, G_d_a);
+                matmul(L.beta, G_d_xn, T, G_d_b);
+            }
+            Cu::launch(G_k_dn_prep, T, LK, 128, G_d_qkv, L.conv_state, L.conv_w, G_d_cv, G_d_a, G_d_b, L.ssm_a, L.dt_bias, G_d_qk, T);
+            Cu::launch(G_k_dn_rec, LV, 4, 128, G_d_qkv, L.conv_state, G_d_cv, G_d_a, G_d_b, G_d_qk, L.ssm_state, G_d_of, T);
+            Cu::launch(G_k_dn_post, T, LV, 128, G_d_of, G_d_z, L.ssm_norm, G_d_o);
+            matmul(L.ssm_out, G_d_o, T, G_d_out);
+        } else {
+            if (T < 16) {
+                const Weight* ws[3] = {&L.wq, &L.wk, &L.wv};
+                CUdeviceptr ys[3] = {G_d_qg, G_d_k, G_d_v};
+                gemv(ws, ys, 3, false, G_d_xn, T);
+            } else {
+                matmul(L.wq, G_d_xn, T, G_d_qg);
+                matmul(L.wk, G_d_xn, T, G_d_k);
+                matmul(L.wv, G_d_xn, T, G_d_v);
+            }
+            Cu::launch(G_k_qk_rope, T, N_HEAD + N_KV, 256, G_d_qg, G_d_k, G_d_v, L.q_norm, L.k_norm, G_d_pos, G_d_inv_freq, L.k_cache, L.v_cache, G_d_np);
+            if (T == 1) { // decode: 沿序列切段 (段数在 kernel 里由 n_past 算出, 多余的 block 直接退出)
+                Cu::launch(G_k_attn_dec, N_KV, ATT_SPLIT, 128, G_d_qg, L.k_cache, L.v_cache, G_d_po, G_d_pml, G_d_np);
+                Cu::launch(G_k_attn_merge, N_HEAD, 1, 256, G_d_qg, G_d_po, G_d_pml, G_d_np, G_d_att);
+            } else {
+                Cu::launch_s(G_k_attn_pf, (T + 63) / 64, N_HEAD, 128, FA_SMEM, G_d_qg, L.k_cache, L.v_cache, G_d_att, G_n_past, T);
+            }
+            matmul(L.wo, G_d_att, T, G_d_out);
+        }
+        add_norm(G_d_out, L.post_norm, 0, T);
+        if (T < 16) { // gate/up 一次 launch, 直接输出 silu(gate)·up
+            const Weight* ws[2] = {&L.ffn_gate, &L.ffn_up};
+            gemv(ws, &G_d_h, 2, true, G_d_xn, T);
+        } else {
+            matmul(L.ffn_gate, G_d_xn, T, G_d_g);
+            matmul(L.ffn_up, G_d_xn, T, G_d_u);
+            int n = T * FF;
+            Cu::launch(G_k_silu_mul, (n + 255) / 256, 1, 256, G_d_g, G_d_u, G_d_h, n);
+        }
+        matmul(L.ffn_down, G_d_h, T, G_d_out);
+    }
+    add_norm(G_d_out, G_output_norm, fp(G_d_hidden, (size_t)N_LAYER * D), T);
+    if (need_logits) matmul(G_output, G_d_xn + (size_t)(T - 1) * D * 2, 1, G_d_logits);
+}
+
 void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask, const int* pos3, bool need_logits) {
     for (int t = 0; t < T; t++)
         for (int j = 0; j < 3; j++) G_pos[t * 3 + j] = pos3 ? pos3[t * 3 + j] : G_next_pos + t;
     Cu::h2d(G_d_tok, tokens, (size_t)T * 4);
     Cu::h2d(G_d_pos, G_pos, (size_t)T * 3 * 4);
+    Cu::h2d(G_d_np, &G_n_past, 4);
     CUdeviceptr d_mask = 0, d_embd = 0;
     if (mask) {
         Cu::h2d(G_d_mask, mask, T);
@@ -143,48 +222,24 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
         d_mask = G_d_mask;
         d_embd = G_d_embd;
     }
-    Cu::launch(G_k_embed[G_tok_embd.type], T, 1, 256, G_tok_embd.data, G_tok_embd.rb, G_d_tok, d_mask, d_embd, G_d_x);
-    for (int l = 0; l < N_LAYER; l++) {
-        Layer& L = G_layers[l];
-        add_norm(l ? G_d_out : 0, L.attn_norm, fp(G_d_hidden, (size_t)l * D), T); // 先加上一层 FFN 的残差, 同时保存上一层输出
-        if (L.recr) {
-            matmul(L.qkv, G_d_xn, T, G_d_qkv);
-            matmul(L.gate_z, G_d_xn, T, G_d_z);
-            matmul(L.alpha, G_d_xn, T, G_d_a);
-            matmul(L.beta, G_d_xn, T, G_d_b);
-            Cu::launch(G_k_dn_prep, T, LK, 128, G_d_qkv, L.conv_state, L.conv_w, G_d_cv, G_d_a, G_d_b, L.ssm_a, L.dt_bias, G_d_qk, T);
-            Cu::launch(G_k_dn_rec, LV, 4, 128, G_d_qkv, L.conv_state, G_d_cv, G_d_a, G_d_b, G_d_qk, L.ssm_state, G_d_of, T);
-            Cu::launch(G_k_dn_post, T, LV, 128, G_d_of, G_d_z, L.ssm_norm, G_d_o);
-            matmul(L.ssm_out, G_d_o, T, G_d_out);
-        } else {
-            matmul(L.wq, G_d_xn, T, G_d_qg);
-            matmul(L.wk, G_d_xn, T, G_d_k);
-            matmul(L.wv, G_d_xn, T, G_d_v);
-            Cu::launch(G_k_qk_rope, T, N_HEAD + N_KV, 256, G_d_qg, G_d_k, G_d_v, L.q_norm, L.k_norm, G_d_pos, G_d_inv_freq, L.k_cache, L.v_cache, G_n_past);
-            if (T == 1) { // decode: 沿序列切段, 每段至少 128 个 key, 段数不超过 ATT_SPLIT
-                int n = G_n_past + 1, kps = (std::max(128, (n + ATT_SPLIT - 1) / ATT_SPLIT) + 63) / 64 * 64, ns = (n + kps - 1) / kps;
-                Cu::launch(G_k_attn_dec, N_KV, ns, 128, G_d_qg, L.k_cache, L.v_cache, G_d_po, G_d_pml, n, kps);
-                Cu::launch(G_k_attn_merge, N_HEAD, 1, 256, G_d_qg, G_d_po, G_d_pml, ns, G_d_att);
-            } else {
-                Cu::launch_s(G_k_attn_pf, (T + 63) / 64, N_HEAD, 128, FA_SMEM, G_d_qg, L.k_cache, L.v_cache, G_d_att, G_n_past, T);
-            }
-            matmul(L.wo, G_d_att, T, G_d_out);
+    if (T == 1 && !mask && need_logits) { // 普通 decode: 第一次捕获成 CUDA Graph, 之后直接重放 (kernel 参数都不随 token 变化)
+        if (!G_graph) {
+            CUgraph g;
+            Cu::ck(cuStreamBeginCapture(Cu::G_stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL), "cuStreamBeginCapture");
+            forward(T, 0, 0, true);
+            Cu::ck(cuStreamEndCapture(Cu::G_stream, &g), "cuStreamEndCapture");
+            Cu::ck(cuGraphInstantiate(&G_graph, g, 0), "cuGraphInstantiate");
+            Cu::ck(cuGraphDestroy(g), "cuGraphDestroy");
         }
-        add_norm(G_d_out, L.post_norm, 0, T);
-        matmul(L.ffn_gate, G_d_xn, T, G_d_g);
-        matmul(L.ffn_up, G_d_xn, T, G_d_u);
-        int n = T * FF;
-        Cu::launch(G_k_silu_mul, (n + 255) / 256, 1, 256, G_d_g, G_d_u, G_d_h, n);
-        matmul(L.ffn_down, G_d_h, T, G_d_out);
+        Cu::ck(cuGraphLaunch(G_graph, Cu::G_stream), "cuGraphLaunch");
+    } else {
+        forward(T, d_mask, d_embd, need_logits);
     }
-    add_norm(G_d_out, G_output_norm, fp(G_d_hidden, (size_t)N_LAYER * D), T);
     int mx = G_next_pos - 1;
     for (int i = 0; i < T * 3; i++) mx = std::max(mx, G_pos[i]);
     G_next_pos = mx + 1; // 后续默认位置接在最大位置之后, 与 HF get_rope_index 一致
     G_n_past += T;
-    if (!need_logits) return;
-    matmul(G_output, G_d_xn + (size_t)(T - 1) * D * 2, 1, G_d_logits);
-    Cu::d2h(G_logits, G_d_logits, (size_t)VOCAB * 4);
+    if (need_logits) Cu::d2h(G_logits, G_d_logits, (size_t)VOCAB * 4);
 }
 
 uint64_t rng_next() { // splitmix64
@@ -215,11 +270,14 @@ int qwen_init(const char* path, int device, int max_ctx) {
     const char* tnames[] = {"f32", "", "", "", "", "", "", "", "q8_0", "", "", "", "q4_k", "q5_k", "q6_k"};
     for (int t = 0; t < 15; t++) {
         if (!tnames[t][0]) continue;
-        G_k_mm[t] = Cu::func(("k_mm_" + string(tnames[t])).c_str());
         G_k_gemm[t] = Cu::func(("k_gemm_" + string(tnames[t])).c_str());
         G_k_dq[t] = Cu::func(("k_dq_" + string(tnames[t])).c_str());
         G_k_embed[t] = Cu::func(("k_embed_" + string(tnames[t])).c_str());
     }
+    G_k_gemv = Cu::func("k_gemv");
+    G_k_gemv_glu = Cu::func("k_gemv_glu");
+    G_k_gemv1 = Cu::func("k_gemv1");
+    G_k_gemv1_glu = Cu::func("k_gemv1_glu");
     G_k_add_norm = Cu::func("k_add_norm");
     G_k_silu_mul = Cu::func("k_silu_mul");
     G_k_dn_prep = Cu::func("k_dn_prep");
@@ -321,6 +379,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_d_cv = Cu::alloc((size_t)CHUNK * QKV_DIM * 4);
     G_d_qk = Cu::alloc((size_t)CHUNK * LK * 4);
     G_d_of = Cu::alloc((size_t)CHUNK * V_DIM * 4);
+    G_d_np = Cu::alloc(4);
     G_d_po = Cu::alloc((size_t)ATT_SPLIT * ATT_DIM * 4);
     G_d_pml = Cu::alloc((size_t)ATT_SPLIT * N_HEAD * 8);
     Cu::ck(cuMemAllocHost((void**)&G_logits, (size_t)VOCAB * 4), "cuMemAllocHost");
@@ -331,6 +390,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_seen.resize(VOCAB);
     G_inited = true;
     size_t free_b = 0, total_b = 0;
+    Cu::ck(cuStreamSynchronize(Cu::G_stream), "cuStreamSynchronize");
     Cu::ck(cuMemGetInfo(&free_b, &total_b), "cuMemGetInfo");
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr, "✅ 模型初始化完成, 最大上下文 %d, 显存已用 %.2f / %.2f GB, 耗时 %.1fs\n", max_ctx, (total_b - free_b) / 1073741824.0, total_b / 1073741824.0, sec);
@@ -358,9 +418,10 @@ int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_m
 }
 
 int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist) {
-    float* l = G_work.data();
-    memcpy(l, G_logits, VOCAB * sizeof(float));
+    float* l = G_logits; // 只读; 有 presence penalty 时才拷贝一份再改
     if (presence_penalty != 0 && hist) {
+        l = G_work.data();
+        memcpy(l, G_logits, VOCAB * sizeof(float));
         for (int i = 0; i < n_hist; i++) {
             int t = hist[i];
             if (t < 0 || t >= VOCAB || G_seen[t]) continue;
@@ -372,11 +433,22 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
     }
     if (temperature <= 0) return (int)(std::max_element(l, l + VOCAB) - l);
     int* idx = G_idx.data();
-    for (int i = 0; i < VOCAB; i++) idx[i] = i;
     int n = (top_k > 0 && top_k < VOCAB) ? top_k : VOCAB;
-    auto cmp = [&](int a, int b) { return l[a] > l[b]; };
-    if (n < VOCAB) std::nth_element(idx, idx + n, idx + VOCAB, cmp);
-    std::sort(idx, idx + n, cmp);
+    if (n <= 256) { // top_k 较小: 单遍扫描, 维护按 logit 降序的前 n 个 (多数元素只和当前第 n 大比较一次)
+        int cnt = 0;
+        for (int i = 0; i < VOCAB; i++) {
+            float v = l[i];
+            if (cnt == n && v <= l[idx[n - 1]]) continue;
+            int j = cnt < n ? cnt++ : n - 1;
+            for (; j > 0 && l[idx[j - 1]] < v; j--) idx[j] = idx[j - 1];
+            idx[j] = i;
+        }
+    } else {
+        for (int i = 0; i < VOCAB; i++) idx[i] = i;
+        auto cmp = [&](int a, int b) { return l[a] > l[b]; };
+        if (n < VOCAB) std::nth_element(idx, idx + n, idx + VOCAB, cmp);
+        std::sort(idx, idx + n, cmp);
+    }
     vector<double> p(n);
     double sum = 0;
     for (int i = 0; i < n; i++) {
@@ -410,8 +482,8 @@ void qwen_seed(uint64_t seed) { G_rng = seed; }
 
 void qwen_reset() {
     Cu::bind();
-    Cu::ck(cuMemsetD8(G_d_conv_all, 0, (size_t)N_LAYER * QKV_DIM * 3 * 4), "cuMemsetD8");
-    Cu::ck(cuMemsetD8(G_d_ssm_all, 0, (size_t)N_LAYER * LV * LHD * LHD * 4), "cuMemsetD8");
+    Cu::ck(cuMemsetD8Async(G_d_conv_all, 0, (size_t)N_LAYER * QKV_DIM * 3 * 4, Cu::G_stream), "cuMemsetD8Async");
+    Cu::ck(cuMemsetD8Async(G_d_ssm_all, 0, (size_t)N_LAYER * LV * LHD * LHD * 4, Cu::G_stream), "cuMemsetD8Async");
     G_n_past = 0;
     G_next_pos = 0;
 }

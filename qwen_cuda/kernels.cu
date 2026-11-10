@@ -172,38 +172,38 @@ template <int TYPE> __device__ __forceinline__ void dq8h(const uint8_t* row, int
     }
 }
 
-// y[t][n] = sum_k W[n][k] * x[t][k], x 是 fp16; block 256 线程 = 8 个 warp, 每个 warp 一行; 权重每 NT 个 token 解一次 (解成 half2)
-// 每个 lane 每个超块的 8 个乘积及其部分和全用 half (half2 累加后两半相加), 再转 fp32 累加
-template <int TYPE> __device__ __forceinline__ void matmul_body(const uint8_t* W, uint64_t rb, int k, int n, const __half* x, int T, float* y) {
-    int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
-    if (row >= n) return;
-    const uint8_t* wr = W + (size_t)row * rb;
-    int nsb = k / 256;
-    for (int t0 = 0; t0 < T; t0 += NT) {
-        float acc[NT];
+// 一个 warp 算权重的一行 wr 与 token t0..t0+NTT-1 的点积 (x 是 fp16), 结果 warp 归约后每个 lane 都有; 权重每 NTT 个 token 解一次 (解成 half2)
+// 每个 lane 每个超块的 8 个乘积及其部分和全用 half (half2 累加后两半相加), 再转 fp32 累加; decode 用 NTT = 1, 寄存器少
+template <int TYPE, int NTT> __device__ __forceinline__ void gemv_row(const uint8_t* wr, int k, const __half* x, int t0, int T, float* acc) {
+    int lane = threadIdx.x & 31, nsb = k / 256;
 #pragma unroll
-        for (int t = 0; t < NT; t++) acc[t] = 0;
-#pragma unroll 2
-        for (int sb = 0; sb < nsb; sb++) {
-            half2 w[4];
-            dq8h<TYPE>(wr, sb, lane, w);
+    for (int t = 0; t < NTT; t++) acc[t] = 0;
+#pragma unroll 4
+    for (int sb = 0; sb < nsb; sb++) {
+        half2 w[4];
+        dq8h<TYPE>(wr, sb, lane, w);
 #pragma unroll
-            for (int t = 0; t < NT; t++) {
-                if (t0 + t >= T) break;
-                uint4 xv = *(const uint4*)(x + (size_t)(t0 + t) * k + sb * 256 + lane * 8);
-                half2 s = __hmul2(w[0], *(half2*)&xv.x);
-                s = __hfma2(w[1], *(half2*)&xv.y, s);
-                s = __hfma2(w[2], *(half2*)&xv.z, s);
-                s = __hfma2(w[3], *(half2*)&xv.w, s);
-                acc[t] += __half2float(__hadd(__low2half(s), __high2half(s)));
-            }
-        }
-#pragma unroll
-        for (int t = 0; t < NT; t++) {
+        for (int t = 0; t < NTT; t++) {
             if (t0 + t >= T) break;
-            float s = warp_sum(acc[t]);
-            if (lane == 0) y[(size_t)(t0 + t) * n + row] = s;
+            uint4 xv = *(const uint4*)(x + (size_t)(t0 + t) * k + sb * 256 + lane * 8);
+            half2 s = __hmul2(w[0], *(half2*)&xv.x);
+            s = __hfma2(w[1], *(half2*)&xv.y, s);
+            s = __hfma2(w[2], *(half2*)&xv.z, s);
+            s = __hfma2(w[3], *(half2*)&xv.w, s);
+            acc[t] += __half2float(__hadd(__low2half(s), __high2half(s)));
         }
+    }
+#pragma unroll
+    for (int t = 0; t < NTT; t++) acc[t] = warp_sum(acc[t]);
+}
+
+template <int NTT> __device__ __forceinline__ void gemv_row_rt(int type, const uint8_t* wr, int k, const __half* x, int t0, int T, float* acc) { // 运行时按量化类型分发 (同一 warp 内一致)
+    switch (type) {
+    case T_F32: gemv_row<T_F32, NTT>(wr, k, x, t0, T, acc); break;
+    case T_Q8_0: gemv_row<T_Q8_0, NTT>(wr, k, x, t0, T, acc); break;
+    case T_Q4_K: gemv_row<T_Q4_K, NTT>(wr, k, x, t0, T, acc); break;
+    case T_Q5_K: gemv_row<T_Q5_K, NTT>(wr, k, x, t0, T, acc); break;
+    default: gemv_row<T_Q6_K, NTT>(wr, k, x, t0, T, acc); break;
     }
 }
 
@@ -294,7 +294,6 @@ template <int TYPE> __device__ __forceinline__ void embed_body(const uint8_t* W,
 } // namespace
 
 #define INST(NAME, TYPE)                                                                                                                                                                  \
-    extern "C" __global__ void __launch_bounds__(256) k_mm_##NAME(const uint8_t* W, uint64_t rb, int k, int n, const __half* x, int T, float* y) { matmul_body<TYPE>(W, rb, k, n, x, T, y); } \
     extern "C" __global__ void __launch_bounds__(128) k_gemm_##NAME(const uint8_t* W, uint64_t rb, int k, int n, const __half* x, int T, float* y) { gemm_body<TYPE>(W, rb, k, n, x, T, y); } \
     extern "C" __global__ void __launch_bounds__(256) k_dq_##NAME(const uint8_t* W, uint64_t rb, int k, const int* rows, float* out) { dequant_body<TYPE>(W, rb, k, rows, out); }          \
     extern "C" __global__ void __launch_bounds__(256) k_embed_##NAME(const uint8_t* W, uint64_t rb, const int* tokens, const uint8_t* mask, const float* embd, float* x) { embed_body<TYPE>(W, rb, tokens, mask, embd, x); }
@@ -303,6 +302,41 @@ INST(q8_0, T_Q8_0)
 INST(q4_k, T_Q4_K)
 INST(q5_k, T_Q5_K)
 INST(q6_k, T_Q6_K)
+
+struct MmGroup { // decode GEMV 的一组矩阵 (共享输入 x 和 k), 与 host 端布局一致
+    uint64_t w[4], rb[4], y[4];
+    int n[4], type[4];
+    int cnt, glu; // glu (k_gemv_glu): 矩阵 0/1 是 ffn gate/up, 行按矩阵 0 分配, y[0] = silu(gate)·up (fp16); 否则 (k_gemv) 行按 cnt 个矩阵依次拼接, 输出 fp32
+};
+
+// decode (T < 16) 的矩阵乘: grid 总行数/2, block 64 = 2 个 warp, 每个 warp 一行; 一组矩阵一次 launch, 块小使各 SM 负载均衡
+// GLU 和普通版分开, T = 1 和 T > 1 分开 (NTT): 寄存器少, n = 5120 的 2560 个 block 能一次全部驻留 (每 SM 最多 24 个 block)
+template <bool GLU, int NTT> __device__ __forceinline__ void gemv_body(const MmGroup& g, int k, const __half* x, int T) {
+    int lane = threadIdx.x & 31, row = blockIdx.x * 2 + (threadIdx.x >> 5), m = 0;
+    while (m < g.cnt - 1 && row >= g.n[m]) row -= g.n[m++];
+    if (row >= g.n[m]) return;
+    for (int t0 = 0; t0 < T; t0 += NTT) {
+        float acc[NTT];
+        gemv_row_rt<NTT>(g.type[m], (const uint8_t*)g.w[m] + (size_t)row * g.rb[m], k, x, t0, T, acc);
+        if constexpr (GLU) {
+            float au[NTT];
+            gemv_row_rt<NTT>(g.type[1], (const uint8_t*)g.w[1] + (size_t)row * g.rb[1], k, x, t0, T, au);
+            if (lane == 0)
+#pragma unroll
+                for (int t = 0; t < NTT; t++)
+                    if (t0 + t < T) ((__half*)g.y[0])[(size_t)(t0 + t) * g.n[0] + row] = __float2half_rn(silu(acc[t]) * au[t]);
+        } else if (lane == 0) {
+#pragma unroll
+            for (int t = 0; t < NTT; t++)
+                if (t0 + t < T) ((float*)g.y[m])[(size_t)(t0 + t) * g.n[m] + row] = acc[t];
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64) k_gemv(MmGroup g, int k, const __half* x, int T) { gemv_body<false, NT>(g, k, x, T); }
+extern "C" __global__ void __launch_bounds__(64) k_gemv_glu(MmGroup g, int k, const __half* x, int T) { gemv_body<true, NT>(g, k, x, T); }
+extern "C" __global__ void __launch_bounds__(64) k_gemv1(MmGroup g, int k, const __half* x, int T) { gemv_body<false, 1>(g, k, x, T); }
+extern "C" __global__ void __launch_bounds__(64) k_gemv1_glu(MmGroup g, int k, const __half* x, int T) { gemv_body<true, 1>(g, k, x, T); }
 
 // x += add (add 可为空); y = rmsnorm(x) * w (fp16, 作为 matmul 输入); hidden 非空时保存最后一个 token 的 x. grid T, block 1024, 每线程 5 个元素
 extern "C" __global__ void __launch_bounds__(1024) k_add_norm(float* x, const float* add, const float* w, __half* y, float* hidden, int T) {
@@ -469,7 +503,7 @@ extern "C" __global__ void __launch_bounds__(128) k_dn_post(const float* of, con
 }
 
 // q/k 的 RMSNorm + 交错 MRoPE, 并把 k、v 写入 KV cache (fp16). grid (T, 24 + 4), block 256; y < 24 是 q 头, 其余是 k 头
-extern "C" __global__ void __launch_bounds__(256) k_qk_rope(float* qg, const float* k, const float* v, const float* q_norm, const float* k_norm, const int* pos3, const float* inv_freq, __half* kc, __half* vc, int n_past) {
+extern "C" __global__ void __launch_bounds__(256) k_qk_rope(float* qg, const float* k, const float* v, const float* q_norm, const float* k_norm, const int* pos3, const float* inv_freq, __half* kc, __half* vc, const int* np) { // np: 显存里的 n_past (CUDA Graph 重放时会变)
     __shared__ float sh[HD], red[8];
     int t = blockIdx.x, hh = blockIdx.y, i = threadIdx.x;
     bool is_q = hh < N_HEAD;
@@ -491,7 +525,7 @@ extern "C" __global__ void __launch_bounds__(256) k_qk_rope(float* qg, const flo
         return;
     }
     int kh = hh - N_HEAD;
-    size_t dst = (size_t)(n_past + t) * KV_DIM + kh * HD + i;
+    size_t dst = (size_t)(*np + t) * KV_DIM + kh * HD + i;
     kc[dst] = __float2half_rn(y);
     vc[dst] = __float2half_rn(v[(size_t)t * KV_DIM + kh * HD + i]);
 }
@@ -504,11 +538,11 @@ __device__ __forceinline__ void ldm4t(uint32_t* r, const __half* p) { // ldmatri
 }
 
 // prefill (T > 1) 因果 GQA 注意力 + 输出门控, flash attention + tensor core (fp16 输入, fp32 累加)
-// grid (T/64 向上取整, 24), block 128 = 4 个 warp, 每个 warp 16 个 query; 动态 smem: sq [64][FS], sk/sv [32][FS]
-// 每轮装入 32 个 key 的 K/V: S = Q·Kᵀ (16x32), online softmax (fp32), P 转 fp16 后 O += P·V (16x256), V 用 ldmatrix.trans 得到 B fragment
+// grid (T/64 向上取整, 24), block 128 = 4 个 warp, 每个 warp 16 个 query; 动态 smem: sq [64][FS], sk/sv [2][32][FS] (共 101376 字节, 正好是单 block 上限)
+// K/V 每 32 个 key 一轮, cp.async 双缓冲 (算这一轮时预取下一轮): S = Q·Kᵀ (16x32), online softmax (fp32), P 转 fp16 后 O += P·V (16x256), V 用 ldmatrix.trans 得到 B fragment
 extern "C" __global__ void __launch_bounds__(128) k_attn_pf(const float* qg, const __half* kc, const __half* vc, __half* att, int n_past, int T) {
     extern __shared__ __align__(16) __half smem[];
-    __half *sq = smem, *sk = sq + FA_Q * FS, *sv = sk + FA_K * FS;
+    __half *sq = smem, *skb = sq + FA_Q * FS, *svb = skb + 2 * FA_K * FS;
     int tid = threadIdx.x, lane = tid & 31, wp = tid >> 5, g = lane >> 2, t = lane & 3;
     int t0 = blockIdx.x * FA_Q, h = blockIdx.y, kvh = h / (N_HEAD / N_KV);
     for (int i = tid; i < FA_Q * HD / 4; i += 128) { // q 转 fp16 写 smem, 超出 T 的行写 0
@@ -521,20 +555,25 @@ extern "C" __global__ void __launch_bounds__(128) k_attn_pf(const float* qg, con
     int qp0 = n_past + t0 + wp * 16 + g, qp1 = qp0 + 8; // 本线程两行 query (c0/c1 行, c2/c3 行) 的绝对位置
     int nk = n_past + min(t0 + FA_Q, T); // 本 block 要看的 key 数
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0, l1 = 0, o[32][4] = {}; // o[d]: 维度 8d + 2t + {0,1}
-    for (int kb = 0; kb < nk; kb += FA_K) {
-        __syncthreads(); // 上一轮 sk/sv 读完 (第一轮: sq 写完)
+    auto load = [&](int bi, int kb) { // key [kb, kb+32) 的 K/V 预取到第 bi 个缓冲; 超出 nk 的行夹到 nk-1 (分数被 mask, 权重为 0)
         for (int i = tid; i < FA_K * HD / 8; i += 128) {
             int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
-            uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
-            if (kb + r < nk) {
-                size_t off = (size_t)(kb + r) * KV_DIM + kvh * HD + c;
-                kv = *(const uint4*)(kc + off);
-                vv = *(const uint4*)(vc + off);
-            }
-            *(uint4*)&sk[r * FS + c] = kv;
-            *(uint4*)&sv[r * FS + c] = vv;
+            size_t off = (size_t)min(kb + r, nk - 1) * KV_DIM + kvh * HD + c;
+            cp_async(&skb[(bi * FA_K + r) * FS + c], kc + off, 16);
+            cp_async(&svb[(bi * FA_K + r) * FS + c], vc + off, 16);
         }
-        __syncthreads();
+        asm volatile("cp.async.commit_group;");
+    };
+    load(0, 0);
+    for (int kb = 0, bi = 0; kb < nk; kb += FA_K, bi ^= 1) {
+        if (kb + FA_K < nk) {
+            load(bi ^ 1, kb + FA_K);
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads(); // 本轮 K/V 到齐 (第一轮: sq 也写完了)
+        const __half *sk = skb + bi * FA_K * FS, *sv = svb + bi * FA_K * FS;
         float s[4][4] = {}; // s[ni]: key kb + 8ni + 2t + {0,1}; [0..1] 是 qp0 行, [2..3] 是 qp1 行
 #pragma unroll
         for (int kk = 0; kk < HD; kk += 16) {
@@ -585,6 +624,7 @@ extern "C" __global__ void __launch_bounds__(128) k_attn_pf(const float* qg, con
                 mma16816(o[dp * 2 + 1][0], o[dp * 2 + 1][1], o[dp * 2 + 1][2], o[dp * 2 + 1][3], pa0, pa1, pa2, pa3, b[2], b[3]);
             }
         }
+        __syncthreads(); // 本缓冲读完, 下一轮才能往里预取
     }
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
     l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
@@ -605,15 +645,21 @@ extern "C" __global__ void __launch_bounds__(128) k_attn_pf(const float* qg, con
     }
 }
 
-// decode (T = 1) 注意力, flash-decoding + tensor core (fp16 输入, fp32 累加). grid (4 个 kv 头, nsplit), block 128 = 4 个 warp
+constexpr int ATT_SPLIT = 78; // decode 注意力沿序列最多切的段数: 4 x 78 = 312 个 block = 156 SM x 2 (寄存器限制每 SM 2 个), 一波跑完
+
+__device__ __forceinline__ void att_split(int n, int& kps, int& ns) { kps = (max(128, (n + ATT_SPLIT - 1) / ATT_SPLIT) + 63) / 64 * 64, ns = (n + kps - 1) / kps; } // 每段至少 128 个 key, 段数不超过 ATT_SPLIT
+
+// decode (T = 1) 注意力, flash-decoding + tensor core (fp16 输入, fp32 累加). grid (4 个 kv 头, ATT_SPLIT), block 128 = 4 个 warp; n = *np + 1, 超出段数的 block 直接退出
 // 一个 block 处理一个 kv 头下的 6 个 q 头 (K/V 只读一次) 和 [sp*kps, min(n, sp*kps+kps)) 段的 key, 段内每 16 个 key 一组轮流分给 4 个 warp
 // S = Q·Kᵀ: A 的 16 行中前 6 行是 q 头, 其余为 0; head 维重排: 第 c 个 32 维块里 lane (g, t) 读 K/V 第 g 行的 [c*32 + 8t, +8), 16 字节连续
 // O += P·V: P 由 S 的累加器直接转 fp16 作为 A; V 的 B fragment 由 movmatrix 转置得到, 结果中 lane (g, t) 持有 q 头 g 的维度 [c*32 + 8t, +8)
 // 输出未归一化的 po [nsplit][24][256] 和 pml [nsplit][24] = (max, sum), 由 k_attn_merge 合并
-extern "C" __global__ void __launch_bounds__(128) k_attn_dec(const float* qg, const __half* kc, const __half* vc, float* po, float2* pml, int n, int kps) {
+extern "C" __global__ void __launch_bounds__(128) k_attn_dec(const float* qg, const __half* kc, const __half* vc, float* po, float2* pml, const int* np) {
     constexpr int G = N_HEAD / N_KV;
     __shared__ float sm[4][G], sl[4][G], so[4][G][HD];
-    int kvh = blockIdx.x, sp = blockIdx.y, lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    int kvh = blockIdx.x, sp = blockIdx.y, lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3, n = *np + 1, kps, ns;
+    att_split(n, kps, ns);
+    if (sp >= ns) return;
     int j0 = sp * kps, j1 = min(n, j0 + kps);
     uint32_t qa[8][4] = {}; // q 头 g 的维度 [c*32 + 8t, +8), g >= 6 为 0
     if (g < G) {
@@ -703,8 +749,9 @@ extern "C" __global__ void __launch_bounds__(128) k_attn_dec(const float* qg, co
 }
 
 // 合并 k_attn_dec 各段: grid 24 (q 头), block 256 (维度); att = o / L * sigmoid(gate), 写 fp16
-extern "C" __global__ void __launch_bounds__(256) k_attn_merge(const float* qg, const float* po, const float2* pml, int nsplit, __half* att) {
-    int h = blockIdx.x, i = threadIdx.x;
+extern "C" __global__ void __launch_bounds__(256) k_attn_merge(const float* qg, const float* po, const float2* pml, const int* np, __half* att) {
+    int h = blockIdx.x, i = threadIdx.x, kps, nsplit;
+    att_split(*np + 1, kps, nsplit);
     float M = -INFINITY, L = 0, o = 0;
     for (int s = 0; s < nsplit; s++) M = fmaxf(M, pml[s * N_HEAD + h].x);
     for (int s = 0; s < nsplit; s++) {

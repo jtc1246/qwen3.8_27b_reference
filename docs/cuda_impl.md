@@ -44,15 +44,15 @@ python 端共用仓库根目录的 `qwen.py` (`load(gguf, "cuda", device=N)`), C
 | kernel | grid × block | 说明 |
 |---|---|---|
 | `k_gemm_<type>` | (T/64, n/64) × 128 | prefill 的矩阵乘 (T ≥ 16)。block tile 64 行 × 64 token, 4 个 warp 2×2, 每个 warp 32×32; 沿 k 每步 64, 权重用 `dq8h` 反量化成 fp16 写 smem, x (fp16) 写 smem, 行跨度补 8 个 half 防 bank 冲突; `ldmatrix` + `mma.m16n8k16`。实测 120~143 TFLOPS |
-| `k_mm_<type>` | n/8 × 256 | decode 的矩阵乘 (T < 16, GEMV): 反量化 + 矩阵乘, 输入 x 是 fp16。一个 warp 算一行, 每次解一个 256 元素超块, lane 负责其中连续 8 个 (量化值用 `__byte_perm` 拼成 1024+q 的 half 再减偏移, 精确转换, 乘 scale 时舍入一次); 每 8 个 token 一组累加 (8 个 fp32 累加器), token 多于 8 时该行权重重新解码; 最后 warp shuffle 求和 |
+| `k_gemv` / `k_gemv_glu` (`k_gemv1*`: T = 1 特化) | 总行数/2 × 64 | decode 的矩阵乘 (T < 16): 一个 warp 一行, block 只有 2 个 warp 使各 SM 负载均衡; 一组共享输入的矩阵一次 launch (qkv+z+alpha+beta, q+k+v), 量化类型运行时分发; glu 版同一 warp 算 gate 和 up 的同一行, 直接输出 silu(gate)·up (fp16)。权重解成 half2 (`__byte_perm` 拼成 1024+q 再减偏移, 精确), 8 个乘积的部分和用 half, 再 fp32 累加; 超块循环 unroll 4 |
 | `k_dq_<type>` / `k_embed_<type>` | 行数 × 256 | 反量化整行 (自测用) / token embedding (mask 为 1 时拷贝外部 embedding) |
 | `k_add_norm` | T × 1024 | `x += add` (可为空) + RMSNorm, 顺便保存最后一个 token 的 hidden。上一层 FFN 的残差在下一层开头的这个 kernel 里加 |
 | `k_dn_prep` | (T, 16) × 128 | DeltaNet 中与状态无关的部分, 各 token 并行: 因果 conv1d + SiLU、q/k L2 归一化 (q 乘 1/√128)、q·k、beta = sigmoid(b)、decay = exp(ssm_a·softplus(a + dt_bias)) |
 | `k_dn_rec` | (48, 4) × 128 | DeltaNet 递推, 每个 block 一个 v 头的 32 列; lane = 4·列 + 行段, 线程在寄存器持有 S 的 32 行 × 1 列。用旧状态算 a = kᵀS、b = qᵀS (行段间 2 次 shuffle), delta = (v − decay·a)·beta, o = decay·b + (q·k)·delta, S = decay·S + k·delta, 每个 token 没有 `__syncthreads`; 每 16 个 token 的输入用 `cp.async` 双缓冲预取到 smem; 开头顺便更新 conv 状态 |
 | `k_dn_post` | (T, 48) × 128 | DeltaNet 输出的门控 RMSNorm, 输出 fp16 |
 | `k_qk_rope` | (T, 28) × 256 | q/k 头的 RMSNorm + 交错 MRoPE, k/v 写入 KV cache |
-| `k_attn_pf` | (T/64, 24) × 128 | prefill (T > 1) 的 flash attention: 每个 block 64 个 query × 1 个 q 头, 每个 warp 16 个 query; 每轮装入 32 个 key 的 K/V 到 smem (动态 smem 66KB), S = Q·Kᵀ 用 `ldmatrix` + `mma`, 因果 mask + online softmax (fp32), P 由 S 的累加器转 fp16 直接作为 A, V 用 `ldmatrix.trans` 得到 B; 最后乘 sigmoid(gate) |
-| `k_attn_dec` | (4, nsplit) × 128 | decode (T = 1) 的 flash-decoding: 每个 block 一个 kv 头的 6 个 q 头 (K/V 只读一次) × 一段 key (每段 ≥ 128 个, 最多 96 段), 4 个 warp 轮流处理 16 个 key 一组; mma 的 A 有 16 行, 前 6 行是 q 头; head 维重排后 K/V 每行每 32 维 16 字节连续读并直接作为 B fragment, V 用 `movmatrix` 转置; 段内 4 个 warp 在 smem 合并后输出 (max, sum, 未归一化 o) |
+| `k_attn_pf` | (T/64, 24) × 128 | prefill (T > 1) 的 flash attention: 每个 block 64 个 query × 1 个 q 头, 每个 warp 16 个 query; 每轮 32 个 key 的 K/V 用 `cp.async` 双缓冲预取到 smem (动态 smem 101376 字节), S = Q·Kᵀ 用 `ldmatrix` + `mma`, 因果 mask + online softmax (fp32), P 由 S 的累加器转 fp16 直接作为 A, V 用 `ldmatrix.trans` 得到 B; 最后乘 sigmoid(gate) |
+| `k_attn_dec` | (4, 78) × 128 | decode (T = 1) 的 flash-decoding: 每个 block 一个 kv 头的 6 个 q 头 (K/V 只读一次) × 一段 key (每段 ≥ 128 个, 最多 78 段, 4 × 78 = 312 = 每 SM 2 个 block 一波), 4 个 warp 轮流处理 16 个 key 一组; mma 的 A 有 16 行, 前 6 行是 q 头; head 维重排后 K/V 每行每 32 维 16 字节连续读并直接作为 B fragment, V 用 `movmatrix` 转置; 段内 4 个 warp 在 smem 合并后输出 (max, sum, 未归一化 o) |
 | `k_attn_merge` | 24 × 256 | 合并 `k_attn_dec` 各段, 乘 sigmoid(gate) |
 | `k_silu_mul` | 逐元素 | `silu(g) · u`, 输出 fp16 |
 
@@ -67,7 +67,8 @@ lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, �
 
 ## 4. 其他
 
-- 所有 kernel 在默认 stream 上顺序执行, 只在拷回 logits 时同步
+- 所有 kernel 和拷贝都在一个非阻塞 stream 上顺序执行 (不与同进程 torch 的 legacy stream 隐式同步), 只在拷回 logits 时同步
+- decode (T = 1, 无外部 embedding) 第一次运行时捕获成 CUDA Graph, 之后每个 token 只拷 token/位置/n_past 再重放; n_past 放在显存里, `k_attn_dec` 的 grid 固定为 4 × ATT_SPLIT, 多余的段直接退出
 - CUDA context 是每线程的, 每个 C 接口入口都会 `cuCtxSetCurrent` (server.py 会从不同的 HTTP 线程调用)
 - 用的是 device 的 primary context, 与同进程的 torch (`server.py --type cuda` 时视觉塔在 GPU 上) 共用同一个 context
 - CUDA 出错直接打印并 `_Exit(1)`
@@ -82,14 +83,13 @@ lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, �
 
 | 上下文 | prefill | decode |
 |---|---|---|
-| 256 | 1611 tok/s | 57 tok/s |
-| 1024 | 2448 tok/s | 57 tok/s |
-| 4096 | 2413 tok/s | 56 tok/s |
-| 16384 | 2293 tok/s | 54 tok/s |
-| 65536 | 1908 tok/s | 47 tok/s |
-| 262144 | 996 tok/s (263s) | 30 tok/s |
+| 256 | 1606 tok/s | 66 tok/s |
+| 4096 | 2410 tok/s | 65 tok/s |
+| 16384 | 2294 tok/s | 63 tok/s |
+| 65536 | 1922 tok/s | 53 tok/s |
+| 262144 | 996 tok/s (263s) | 30 tok/s (GEMV 优化前测的) |
 
-bench 的 decode 包含 python 和采样开销, 短 prompt 实际 decode 约 65 tok/s (CPU 版 3.6 tok/s)。prefill 的 prompt 不满一个 chunk (256) 时 block 数少, 速度偏低。
+bench 的 decode 包含 python 和采样开销, 单纯 `qwen_eval` 约 15.0ms/token; 采样: 贪心 0.16ms, top_k=20 约 0.09ms (单遍扫描维护前 k 个, 原来 nth_element 要 1.5ms)。prefill 的 prompt 不满一个 chunk (256) 时 block 数少, 速度偏低。
 
 理论上限 (实测只读带宽 1339GB/s, mma 145 TFLOPS): decode 短上下文 79 tok/s、256K 39 tok/s (每 token 读权重 16.7GB + KV); prefill 只算 matmul 约 2980 tok/s (48.7 GFLOP/token), 256K 平均 (attention 计算量与 matmul 相当) 约 1430 tok/s。
 
@@ -97,6 +97,6 @@ bench 的 decode 包含 python 和采样开销, 短 prompt 实际 decode 约 65 
 
 ## 7. 可改进的方向
 
-- **decode**: 每 token 约 850 次 kernel launch, 可以用 CUDA Graph 或融合 (gate/up 合并、silu 融进 gate/up 输出、norm 融进 matmul); `ssm_alpha`/`ssm_beta` (n = 48, 只有 6 个 block) 和 attn k/v (n = 1024) 的 GEMV 并行度不够; ffn 的 GEMV 只到带宽的 75~80% (lm_head 能到 96%)
+- **decode**: 约为带宽理论值 (12.5ms/token) 的 84%; GEMV 带宽利用率 gate/up、qkv 约 88%, down / ssm_out 约 80%, lm_head 98%; 长上下文 attention 约 80~89%
 - **prefill**: GEMM 已接近 tensor core 峰值, 剩下的是 DeltaNet 递推 (按 token 串行) 和小 n 的 matmul; 递推可以改成 chunked (WY) 形式用 mma 计算
 - 仍然是单序列, 没有 batch / 并发 / 前缀缓存
