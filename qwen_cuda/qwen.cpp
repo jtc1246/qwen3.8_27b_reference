@@ -48,7 +48,7 @@ struct Layer {
     CUdeviceptr conv_state = 0, ssm_state = 0; // [10240][3], [48][128 k][128 v]
     Weight wq, wk, wv, wo;
     CUdeviceptr q_norm = 0, k_norm = 0;
-    CUdeviceptr k_cache = 0, v_cache = 0; // [max_ctx][1024] fp16
+    CUdeviceptr k_cache = 0, v_cache = 0, k_scale = 0, v_scale = 0; // q8_0: [max_ctx][1024] int8, scale [max_ctx][32] fp16 (每 32 维一个)
 };
 
 Gguf::File G_file;
@@ -184,12 +184,12 @@ void forward(int T, CUdeviceptr d_mask, CUdeviceptr d_embd, bool need_logits) { 
                 matmul(L.wk, G_d_xn, T, G_d_k);
                 matmul(L.wv, G_d_xn, T, G_d_v);
             }
-            Cu::launch(G_k_qk_rope, T, N_HEAD + N_KV, 256, G_d_qg, G_d_k, G_d_v, L.q_norm, L.k_norm, G_d_pos, G_d_inv_freq, L.k_cache, L.v_cache, G_d_np);
+            Cu::launch(G_k_qk_rope, T, N_HEAD + N_KV, 256, G_d_qg, G_d_k, G_d_v, L.q_norm, L.k_norm, G_d_pos, G_d_inv_freq, L.k_cache, L.v_cache, L.k_scale, L.v_scale, G_d_np);
             if (T == 1) { // decode: 沿序列切段 (段数在 kernel 里由 n_past 算出, 多余的 block 直接退出)
-                Cu::launch(G_k_attn_dec, N_KV, ATT_SPLIT, 128, G_d_qg, L.k_cache, L.v_cache, G_d_po, G_d_pml, G_d_np);
+                Cu::launch(G_k_attn_dec, N_KV, ATT_SPLIT, 128, G_d_qg, L.k_cache, L.v_cache, L.k_scale, L.v_scale, G_d_po, G_d_pml, G_d_np);
                 Cu::launch(G_k_attn_merge, N_HEAD, 1, 256, G_d_qg, G_d_po, G_d_pml, G_d_np, G_d_att);
             } else {
-                Cu::launch_s(G_k_attn_pf, (T + 63) / 64, N_HEAD, 128, FA_SMEM, G_d_qg, L.k_cache, L.v_cache, G_d_att, G_n_past, T);
+                Cu::launch_s(G_k_attn_pf, (T + 63) / 64, N_HEAD, 128, FA_SMEM, G_d_qg, L.k_cache, L.v_cache, L.k_scale, L.v_scale, G_d_att, G_n_past, T);
             }
             matmul(L.wo, G_d_att, T, G_d_out);
         }
@@ -348,8 +348,10 @@ int qwen_init(const char* path, int device, int max_ctx) {
         L.wo = get_w(p + "attn_output.weight", ATT_DIM, D);
         L.q_norm = get_f(p + "attn_q_norm.weight", HD);
         L.k_norm = get_f(p + "attn_k_norm.weight", HD);
-        L.k_cache = Cu::alloc((size_t)max_ctx * KV_DIM * 2);
-        L.v_cache = Cu::alloc((size_t)max_ctx * KV_DIM * 2);
+        L.k_cache = Cu::alloc((size_t)max_ctx * KV_DIM);
+        L.v_cache = Cu::alloc((size_t)max_ctx * KV_DIM);
+        L.k_scale = Cu::alloc((size_t)max_ctx * 32 * 2);
+        L.v_scale = Cu::alloc((size_t)max_ctx * 32 * 2);
     }
     float inv_freq[ROT / 2];
     for (int i = 0; i < ROT / 2; i++) inv_freq[i] = 1.0f / powf(THETA, (float)(2 * i) / ROT); // 与 HF 一致用 fp32 计算
