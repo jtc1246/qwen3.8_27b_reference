@@ -361,15 +361,16 @@ def main():
     p.add_argument("--gguf", required=True, help="Q4_K_M GGUF 路径")
     p.add_argument("--hf-dir", required=True, help="官方 HF 仓库目录: tokenizer/processor 配置 + 含 model.visual.* 的 safetensors 分片")
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--port", type=int, default=8000, help="0 表示由系统自动分配, 实际端口见启动完成的日志")
     p.add_argument("--type", default="cpu", choices=list(qwen.LIBS), help="推理后端; cuda 时文本主干和视觉塔都在 GPU 上")
     p.add_argument("--threads", type=int, default=16, help="cpu 后端的推理线程数, 以及 torch (CPU 上的视觉塔、预处理) 的线程数")
     p.add_argument("--device", type=int, default=0, help="cuda 后端使用的 GPU 编号")
     p.add_argument("--ctx", type=int, default=32768, help="最大上下文 (prompt + 输出)")
     p.add_argument("--max-image-pixels", type=int, default=1048576, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 0 表示用官方默认 16777216")
-    p.add_argument("--model-name", default="qwen3.8-27b")
+    p.add_argument("--model-name", default="qwen3.8-27b", help="模型名前缀, 对外返回的名称是 {model-name}-{type}; 请求里的 model 不校验")
     p.add_argument("--image-cache-mb", type=int, default=4096, help="视觉塔输出缓存上限 (MB, 只在内存, LRU 淘汰), 0 表示不缓存")
     G_args = p.parse_args()
+    G_args.model_name = f"{G_args.model_name}-{G_args.type}"
     t0 = time.time()
     torch.set_num_threads(G_args.threads)
     if G_args.type == "cuda":
@@ -383,7 +384,7 @@ def main():
     log(f"✅ 视觉塔加载完成 ({G_dev}), 参数 {sum(x.numel() for x in G_vis.parameters()) / 1e6:.1f}M")
     server = ThreadingHTTPServer((G_args.host, G_args.port), Handler)
     server.daemon_threads = True
-    log(f"✅ 全部加载完成 ({time.time() - t0:.1f}s), 服务已启动 http://{G_args.host}:{G_args.port}/v1")
+    log(f"✅ 全部加载完成 ({time.time() - t0:.1f}s), 模型 {G_args.model_name}, 服务已启动 http://{G_args.host}:{server.server_address[1]}/v1") # router.py 靠这一行获取实际端口
     try:
         server.serve_forever()
     except KeyboardInterrupt:

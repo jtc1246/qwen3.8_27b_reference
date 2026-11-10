@@ -4,6 +4,7 @@ import io, sys, json, time, base64, argparse, threading, urllib.request
 from PIL import Image, ImageDraw
 
 G_base = None
+G_model = None
 
 
 def log(msg):
@@ -11,7 +12,9 @@ def log(msg):
 
 
 def post(body, stream=False):
-    req = urllib.request.Request(G_base + "/chat/completions", data=json.dumps(body, ensure_ascii=False).encode(), headers={"Content-Type": "application/json"})
+    if G_model:
+        body = {**body, "model": G_model}
+    req =urllib.request.Request(G_base + "/chat/completions", data=json.dumps(body, ensure_ascii=False).encode(), headers={"Content-Type": "application/json"})
     resp = urllib.request.urlopen(req, timeout=3600)
     if not stream:
         return json.load(resp)
@@ -47,11 +50,13 @@ def make_image2():
 
 
 def main():
-    global G_base
+    global G_base, G_model
     p = argparse.ArgumentParser()
     p.add_argument("--base", default="http://127.0.0.1:8000/v1")
+    p.add_argument("--model", default=None, help="请求里带的 model 字段 (通过 router.py 测试时用来选后端), 默认不带")
     args = p.parse_args()
     G_base = args.base
+    G_model = args.model
     log(f"ℹ️ models: {json.load(urllib.request.urlopen(G_base + '/models'))}")
     r = post({"messages": [{"role": "system", "content": "你是一个只用一句话回答的助手。"}, {"role": "user", "content": "1+1等于几?"}], "temperature": 0, "enable_thinking": False})
     log(f"✅ [system + 关闭思考 + 非流式] {r['choices'][0]['message']} finish={r['choices'][0]['finish_reason']} usage={r['usage']}")
