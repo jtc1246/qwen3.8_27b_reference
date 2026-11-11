@@ -21,7 +21,9 @@ python 端共用仓库根目录的 `qwen.py` (`load(gguf, "cuda", device=N)`), C
 
 ## 2. 显存
 
-- 整个 GGUF 文件 (16.24GB) 原样 `cuMemcpyHtoD` 到显存, 权重在 GPU 上直接按 GGUF 量化格式使用, 不做重排; 上传后释放 host 内存 (之后自测需要的原始字节从显存拷回)
+- 整个 GGUF 文件 (16.24GB) 原样 `cuMemcpyHtoD` 到显存, 之后 `k_repack` 把 q8_0 / q6_k 矩阵按行原地重排 (字节数不变, 使 decode GEMV 对齐读取), 其余类型直接按 GGUF 量化格式使用; 上传后释放 host 内存 (之后自测需要的原始字节从显存拷回, 在 host 上还原成 GGUF 布局再对比)
+  - q8_0: 每 8 块 (256 元素) 一组 272 字节 = [2][8][16] 量化值 (每块前 16 个 / 后 16 个) + 8 个 fp16 scale, 量化值 16 字节对齐
+  - q6_k: 每 4 个超块一组 840 字节 = 4 × 208 (ql, qh, scales) + 4 个 fp16 d; 行起点只保证 8 字节对齐
 - KV cache q8_0 (见下面精度一节), 每 token 34KB (32K 上下文 1.06GB, 256K 上下文 8.5GB; fp16 时是 64KB / 2GB / 16GB); DeltaNet 状态 144MiB; 激活按 CHUNK = 1024 (prefill 每批 token 数)
 - 实测 ctx = 32768 时显存占用约 18.4GB
 
@@ -31,7 +33,7 @@ python 端共用仓库根目录的 `qwen.py` (`load(gguf, "cuda", device=N)`), C
 
 - matmul 的输入激活: norm 输出 `xn`、DeltaNet 输出 `o`、attention 输出 `att`、`silu(g)·u` (llama.cpp 把它们量化成 q8_1, 即 int8)
 - prefill 的 matmul (T ≥ 16): 权重解成 fp16, tensor core `mma` (fp16 输入, 乘积精确, fp32 累加)
-- decode 的 matmul (T < 16, GEMV): 权重解成 half2, 每个 lane 每个超块的 8 个乘积及其部分和全用 half, 再转 fp32 跨超块累加和 warp 归约 (llama.cpp 的 f16 权重 mmvf 默认整行用 half2 累加)
+- decode 的 matmul (T < 16, GEMV): 每个 lane 负责一个 32 元素子块。q4_k/q5_k/q6_k 的量化值 (整数, half 精确) 直接与 x 用 half2 相乘累加, scale/min 提到子块外 (d1·Σ(x·q) − m1·Σx), 每 4 项转 fp32 (激活最大 ~437 时不溢出, q6_k 余量最小, 上限约 511); q8_0/f32 仍是 w = q·d (half) 再乘 x, 每 8 个乘积 half 累加后转 fp32; 之后 fp32 跨子块累加和 warp 归约 (llama.cpp 的 f16 权重 mmvf 默认整行用 half2 累加)
 - attention (prefill 和 decode): q、p 转 fp16, q·Kᵀ 和 P·V 用 tensor core `mma` (fp32 累加); softmax (max/exp/sum) 和跨 warp / 跨段的合并是 fp32 (llama.cpp 的 flash attention 强制 F32 累加)
 
 本卡实测 (`/root/local_llm/tests/mma_bench`): mma fp16 输入 fp32 累加 142~148 TFLOPS, fp16 累加 140 TFLOPS (fp32 累加没有变慢), CUDA core HFMA2 97 TFLOPS, FFMA 72 TFLOPS。
@@ -45,7 +47,7 @@ KV cache 是 q8_0 (llama.cpp 默认 F16, q8_0 是可选的 `-ctk q8_0 -ctv q8_0`
 | kernel | grid × block | 说明 |
 |---|---|---|
 | `k_gemm_<type>` | (T/64, n/64) × 128 | prefill 的矩阵乘 (T ≥ 16)。block tile 64 行 × 64 token, 4 个 warp 2×2, 每个 warp 32×32; 沿 k 每步 64, 权重用 `dq8h` 反量化成 fp16 写 smem, x (fp16) 写 smem, 行跨度补 8 个 half 防 bank 冲突; `ldmatrix` + `mma.m16n8k16`。实测 120~143 TFLOPS |
-| `k_gemv` / `k_gemv_glu` (`k_gemv1*`: T = 1 特化) | 总行数/2 × 64 | decode 的矩阵乘 (T < 16): 一个 warp 一行, block 只有 2 个 warp 使各 SM 负载均衡; 一组共享输入的矩阵一次 launch (qkv+z+alpha+beta, q+k+v), 量化类型运行时分发; glu 版同一 warp 算 gate 和 up 的同一行, 直接输出 silu(gate)·up (fp16)。权重解成 half2 (`__byte_perm` 拼成 1024+q 再减偏移, 精确), 8 个乘积的部分和用 half, 再 fp32 累加; 超块循环 unroll 4 |
+| `k_gemv` / `k_gemv_glu` (`k_gemv1*`: T = 1 特化) | 总行数/2 × 64 | decode 的矩阵乘 (T < 16): 一个 warp 一行, block 只有 2 个 warp 使各 SM 负载均衡; 一组共享输入的矩阵一次 launch (qkv+z+alpha+beta, q+k+v), 量化类型运行时分发; glu 版同一 warp 算 gate 和 up 的同一行, 直接输出 silu(gate)·up (fp16)。lane = 超块内第 lane%8 个 32 元素子块, warp 每轮 4 个超块 (要求 k 是 1024 的倍数); 量化值 `__byte_perm` 拼成 1024+q 再减偏移 (精确), 子块 scale/min 无分支解码 (`scale_min_k4_bl`), q8_0/q6_k 读重排后的对齐布局; decode (T = 1) 时输入 x 是 `xperm` 布局 (由产生它的 `k_add_norm`、`k_dn_post`、`k_attn_merge`、`k_gemv1_glu` 直接写成), 每条 load 指令 32 个 lane 读连续 512 字节; `k_gemv1` 限制每 SM 18 个 block (寄存器 ≤ 56), n = 5120 的 2560 个 block 一波放下; 精度见上 |
 | `k_dq_<type>` / `k_embed_<type>` | 行数 × 256 | 反量化整行 (自测用) / token embedding (mask 为 1 时拷贝外部 embedding) |
 | `k_add_norm` | T × 1024 | `x += add` (可为空) + RMSNorm, 顺便保存最后一个 token 的 hidden。上一层 FFN 的残差在下一层开头的这个 kernel 里加 |
 | `k_dn_prep` | (T, 16) × 128 | DeltaNet 中与状态无关的部分, 各 token 并行: 因果 conv1d + SiLU、q/k L2 归一化 (q 乘 1/√128)、q·k、beta = sigmoid(b)、decay = exp(ssm_a·softplus(a + dt_bias)) |
@@ -60,8 +62,8 @@ KV cache 是 q8_0 (llama.cpp 默认 F16, q8_0 是可选的 `-ctk q8_0 -ctv q8_0`
 各量化类型的 lane 映射和对齐 (`dq8<TYPE>`):
 
 - **q4_k / q5_k**: 超块 144 / 176 字节, 都是 16 的倍数, qs/qh 可以按 8 字节读; lane 的子块 = lane / 4, 64 元素组 = lane / 8
-- **q6_k**: 超块 210 字节, 只保证 2 字节对齐, 8 字节按 4 个 uint16 读
-- **q8_0**: 34 字节一块, lane / 4 是块号, 同样按 uint16 读
+- **q6_k**: 超块 210 字节, 重排后每 4 个超块一组 (d 移到组尾), 8 字节对齐, 按 uint2 读
+- **q8_0**: 34 字节一块, 重排后每 8 块一组 (scale 移到组尾), 量化值按 uint2 / uint4 读
 - 所有矩阵的行数都是 8 的倍数, k 都是 256 的倍数
 
 lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, 采样复用 CPU 版的代码。
@@ -100,8 +102,20 @@ bench 的 decode 包含 python 和采样开销, 单纯 `qwen_eval` 约 15.0ms/to
 
 历史 (16K 上下文): 全 fp32 版 prefill 141 / decode 20 → 改 fp16 后 247 / 26 → decode 改 flash-decoding 54 → prefill 改 tensor core GEMM 900 → flash attention + CHUNK 1024 1980 → DeltaNet 拆分 + 预取 2293。
 
+### 少 SM 时的 decode
+
+用 green context (`cuDevSmResourceSplit`, 测试副本里, 正式代码不含) 限制可用 SM 数, 模拟算力 / 带宽比更低的卡 (3090 的比例约相当于本卡 80 个 SM)。decode GEMV 改为每 lane 一个 32 元素子块、scale/min 提到子块外、无分支解码、x 用 `xperm` 布局、q8_0/q6_k 重排之后 (每 token, 上下文 4K):
+
+| SM 数 | 改之前 | 现在 |
+|---|---|---|
+| 32 | 34.9ms | 21.8ms |
+| 78 | 17.5ms | 15.0ms |
+| 156 (整卡) | 15.1ms | 15.0ms |
+
+改之前少 SM 时慢的原因: 反量化每个权重的指令多 (每 8 个元素解一次子块 scale, 且有分支发散), 32 SM 时即使权重全在 L1 (只计算) q4_k 也只能处理约 680GB/s; 改成每 lane 32 个连续元素后又出现读 x 的跨步访问 (每条 load 指令跨 16 个 cache line), 用 `xperm` 布局解决。
+
 ## 7. 可改进的方向
 
-- **decode**: 约为带宽理论值 (12.5ms/token) 的 84%; GEMV 带宽利用率 gate/up、qkv 约 88%, down / ssm_out 约 80%, lm_head 98%; 长上下文 attention 约 80~89%
+- **decode**: 约为带宽理论值 (12.5ms/token) 的 84%; 单个 GEMV (真实形状, 不命中 L2) 整卡 1070~1270GB/s (带宽的 80~95%), 32 SM 时 720~1210GB/s (q8_0 最高, q4_k 最低); 长上下文 attention 约 80~89%
 - **prefill**: GEMM 已接近 tensor core 峰值, 剩下的是 DeltaNet 递推 (按 token 串行) 和小 n 的 matmul; 递推可以改成 chunked (WY) 形式用 mma 计算
 - 仍然是单序列, 没有 batch / 并发 / 前缀缓存

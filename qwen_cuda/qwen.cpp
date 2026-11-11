@@ -64,9 +64,11 @@ struct MmGroup { // 与 kernels.cu 的 MmGroup 布局一致
     uint64_t w[4], rb[4], y[4];
     int n[4], type[4];
     int cnt, glu;
+    int xp; // x 是 xperm 布局 (decode, 见 kernels.cu)
 };
 
-CUfunction G_k_gemv, G_k_gemv_glu, G_k_gemv1, G_k_gemv1_glu, G_k_gemm[16], G_k_dq[16], G_k_embed[16], G_k_add_norm, G_k_silu_mul, G_k_dn_prep, G_k_dn_rec, G_k_dn_post, G_k_qk_rope, G_k_attn_pf, G_k_attn_dec, G_k_attn_merge;
+CUfunction G_k_gemv, G_k_gemv_glu, G_k_gemv1, G_k_gemv1_glu, G_k_gemm[16], G_k_dq[16], G_k_embed[16], G_k_add_norm, G_k_silu_mul, G_k_dn_prep, G_k_dn_rec, G_k_dn_post, G_k_qk_rope, G_k_attn_pf, G_k_attn_dec, G_k_attn_merge, G_k_repack;
+bool G_xperm = false; // 当前 forward 是 T = 1: GEMV 的输入 (xn/o/att/h) 是 xperm 布局
 CUdeviceptr G_d_x, G_d_xn, G_d_out, G_d_qkv, G_d_z, G_d_a, G_d_b, G_d_o, G_d_qg, G_d_k, G_d_v, G_d_att, G_d_g, G_d_u, G_d_h; // matmul 的输入 xn/o/att/h 是 fp16, 其余 fp32
 CUdeviceptr G_d_logits, G_d_hidden, G_d_tok, G_d_mask, G_d_embd, G_d_pos, G_d_inv_freq, G_d_conv_all, G_d_ssm_all, G_d_po, G_d_pml, G_d_cv, G_d_qk, G_d_of, G_d_np; // cv/qk/of: DeltaNet 预处理后的 qkv、q·k、未归一化输出 (fp32); np: n_past (int)
 CUgraphExec G_graph = nullptr; // decode (T = 1) 的 CUDA Graph
@@ -100,6 +102,10 @@ Weight get_w(const string& name, int k, int n) {
         fprintf(stderr, "❌ %s 的量化类型 %u 没有对应 kernel\n", name.c_str(), t.type);
         _Exit(1);
     }
+    if ((t.type == Gguf::T_Q8_0 || t.type == Gguf::T_Q6_K) && k % 1024) { // 没有被 repack_weights 重排
+        fprintf(stderr, "❌ %s: q8_0/q6_k 要求 k 是 1024 的倍数, 实际 %d\n", name.c_str(), k);
+        _Exit(1);
+    }
     Weight w;
     w.data = dev_ptr(t);
     w.type = t.type;
@@ -107,6 +113,32 @@ Weight get_w(const string& name, int k, int n) {
     w.n = n;
     w.rb = Quants::row_bytes(t.type, k);
     return w;
+}
+
+// q8_0 / q6_k 的 k 字节映射, 与 kernels.cu 的 k_repack 一致: 重排后第 p 字节 = 原第 repack_src(p) 字节
+uint64_t repack_src(uint32_t type, uint64_t p) {
+    if (type == Gguf::T_Q8_0) {
+        uint64_t g = p / 272, r = p % 272;
+        return r < 256 ? (g * 8 + (r & 127) / 16) * 34 + 2 + (r / 128) * 16 + (r & 15) : (g * 8 + (r - 256) / 2) * 34 + (r & 1);
+    }
+    uint64_t g = p / 840, r = p % 840;
+    return r < 832 ? (g * 4 + r / 208) * 210 + r % 208 : (g * 4 + (r - 832) / 2) * 210 + 208 + (r & 1);
+}
+
+void repack_weights() { // 上传后把所有 q8_0 / q6_k 矩阵 (k 是 1024 的倍数) 按行原地重排, 使 decode GEMV 对齐读取; 字节数不变
+    for (auto& [name, t] : G_file.tensors) {
+        if ((t.type != Gguf::T_Q8_0 && t.type != Gguf::T_Q6_K) || t.dims.size() < 2 || t.dims[0] % 1024) continue;
+        int64_t rows = 1;
+        for (size_t i = 1; i < t.dims.size(); i++) rows *= t.dims[i];
+        uint64_t rb = Quants::row_bytes(t.type, (int)t.dims[0]);
+        Cu::launch_s(G_k_repack, (unsigned)rows, 1, 256, (unsigned)rb, dev_ptr(t), rb, (int)t.type);
+    }
+}
+
+void unrepack_row(uint32_t type, uint8_t* row, uint64_t rb) { // 自测用: 还原成 GGUF 布局再交给标量参考
+    if (type != Gguf::T_Q8_0 && type != Gguf::T_Q6_K) return;
+    vector<uint8_t> o(row, row + rb);
+    for (uint64_t p = 0; p < rb; p++) row[repack_src(type, p)] = o[p];
 }
 
 CUdeviceptr get_f(const string& name, int64_t numel) {
@@ -129,6 +161,10 @@ void check_kv(const char* key, double expect) {
 }
 
 void gemv(const Weight* const* ws, const CUdeviceptr* ys, int cnt, bool glu, CUdeviceptr x, int T) { // decode (T < 16): 共享输入 x 的 cnt 个矩阵一次 launch; glu: ws[0]/ws[1] 是 gate/up, ys[0] = silu(gate)·up (fp16)
+    if (ws[0]->k % 1024) { // gemv_row 每轮 4 个超块
+        fprintf(stderr, "❌ decode GEMV 要求 k 是 1024 的倍数, 实际 %d\n", ws[0]->k);
+        _Exit(1);
+    }
     MmGroup g = {};
     int rows = 0;
     for (int i = 0; i < cnt; i++) {
@@ -138,6 +174,7 @@ void gemv(const Weight* const* ws, const CUdeviceptr* ys, int cnt, bool glu, CUd
     }
     g.cnt = glu ? 1 : cnt;
     g.glu = glu;
+    g.xp = T == 1 && G_xperm;
     if (glu) rows = ws[0]->n;
     CUfunction f = T == 1 ? (glu ? G_k_gemv1_glu : G_k_gemv1) : (glu ? G_k_gemv_glu : G_k_gemv);
     Cu::launch(f, (rows + 1) / 2, 1, 64, g, ws[0]->k, x, T);
@@ -155,6 +192,7 @@ void matmul(const Weight& w, CUdeviceptr x, int T, CUdeviceptr y) { // token 数
 void add_norm(CUdeviceptr add, CUdeviceptr w, CUdeviceptr hidden, int T) { Cu::launch(G_k_add_norm, T, 1, 1024, G_d_x, add, w, G_d_xn, hidden, T); }
 
 void forward(int T, CUdeviceptr d_mask, CUdeviceptr d_embd, bool need_logits) { // 一个 chunk 的全部 kernel (输入已在显存: token、位置、n_past); 只 launch, 不同步, 可被 CUDA Graph 捕获
+    G_xperm = T == 1; // T = 1 时各 kernel 把 GEMV 输入写成 xperm 布局; T > 1 时只有末尾 lm_head 走 GEMV, 输入是正常布局
     Cu::launch(G_k_embed[G_tok_embd.type], T, 1, 256, G_tok_embd.data, G_tok_embd.rb, G_d_tok, d_mask, d_embd, G_d_x);
     for (int l = 0; l < N_LAYER; l++) {
         Layer& L = G_layers[l];
@@ -288,6 +326,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
     Cu::ck(cuFuncSetAttribute(G_k_attn_pf, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, FA_SMEM), "cuFuncSetAttribute");
     G_k_attn_dec = Cu::func("k_attn_dec");
     G_k_attn_merge = Cu::func("k_attn_merge");
+    G_k_repack = Cu::func("k_repack");
     if (!Gguf::open(G_file, path)) return -1;
     if (G_file.kv_str["general.architecture"] != "qwen35") {
         fprintf(stderr, "❌ 架构不是 qwen35: %s\n", G_file.kv_str["general.architecture"].c_str());
@@ -307,10 +346,11 @@ int qwen_init(const char* path, int device, int max_ctx) {
     check_kv("qwen35.full_attention_interval", 4);
     auto t1 = std::chrono::steady_clock::now();
     Cu::ck(cuMemAlloc(&G_dbase, G_file.size), "cuMemAlloc 权重");
-    Cu::h2d(G_dbase, G_file.base, G_file.size); // 整个文件原样上传, 权重在 GPU 上按 GGUF 格式直接使用
+    Cu::h2d(G_dbase, G_file.base, G_file.size); // 整个文件原样上传, 之后 repack_weights 只重排 q8_0 / q6_k, 其余按 GGUF 格式直接使用
     G_hbase = (uintptr_t)G_file.base;
     free((void*)G_file.base);
     G_file.base = nullptr;
+    repack_weights();
     double up = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     fprintf(stderr, "ℹ️ 权重上传 %.2f GB, %.1fs\n", G_file.size / 1073741824.0, up);
     G_max_ctx = max_ctx;
@@ -516,6 +556,7 @@ int qwen_selftest() { // GPU 反量化 vs 标量参考, GPU matmul (T=13 走 GEM
         double max_diff = 0, max_abs = 0;
         for (int r = 0; r < 8; r++) {
             Cu::d2h(raw.data(), w.data + (size_t)rows[r] * w.rb, w.rb);
+            unrepack_row(w.type, raw.data(), w.rb);
             Quants::Ref::dequant_row(w.type, raw.data(), b.data(), k);
             for (int i = 0; i < k; i++) {
                 max_diff = std::max(max_diff, (double)std::fabs(a[(size_t)r * k + i] - b[i]));
@@ -537,6 +578,7 @@ int qwen_selftest() { // GPU 反量化 vs 标量参考, GPU matmul (T=13 走 GEM
             Cu::d2h(y.data(), G_d_u, y.size() * 4);
             for (int r = 0; r < n; r += std::max(1, n / 37)) {
                 Cu::d2h(raw.data(), w.data + (size_t)r * w.rb, w.rb);
+                unrepack_row(w.type, raw.data(), w.rb);
                 Quants::Ref::dequant_row(w.type, raw.data(), b.data(), k);
                 for (int tt = 0; tt < T; tt++) {
                     double ref = 0, mag = 0;

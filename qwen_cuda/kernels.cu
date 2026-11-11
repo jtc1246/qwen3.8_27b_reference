@@ -13,10 +13,6 @@ enum : int { T_F32 = 0, T_Q8_0 = 8, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14 };
 
 __device__ __forceinline__ float h2f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
 __device__ __forceinline__ uint16_t ld16(const uint8_t* p) { return *(const uint16_t*)p; }
-__device__ __forceinline__ uint2 ld8_a2(const uint8_t* p) { // 只保证 2 字节对齐时读 8 字节
-    const uint16_t* q = (const uint16_t*)p;
-    return make_uint2((uint32_t)q[0] | ((uint32_t)q[1] << 16), (uint32_t)q[2] | ((uint32_t)q[3] << 16));
-}
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
@@ -27,6 +23,16 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 __device__ __forceinline__ uint32_t h2u(half2 h) { return *(uint32_t*)&h; }
+
+// decode (T = 1) 时 GEMV 输入 x 的布局: 每 1024 个一组, 元素 sbl*256 + j*32 + c*8 + e 放在 c*256 + (sbl*8 + j)*8 + e, 使 GEMV 第 c 条 load 指令 32 个 lane 读连续 512 字节 (lane sbl*8+j 负责第 sbl 个超块的第 j 个子块)
+__device__ __forceinline__ int xperm(int i) { return (i & ~1023) | (((i >> 3) & 3) << 8) | (((i >> 8) & 3) << 6) | (((i >> 5) & 7) << 3) | (i & 7); }
+
+// q8_0 / q6_k 上传后按行重排 (k_repack), 字节数不变:
+// q8_0: 每 8 块 (256 元素) 一组 272 字节: [2][8][16] 量化值 (第 c 半 16 个, 第 i 块) + [8] 个 fp16 scale; 量化值 16 字节对齐
+// q6_k: 每 4 个超块一组 840 字节: [4][208] (ql, qh, scales) + [4] 个 fp16 d; 行起点只保证 8 字节对齐
+__device__ __forceinline__ const uint8_t* q8_grp(const uint8_t* row, int sb) { return row + (size_t)sb * 272; }
+__device__ __forceinline__ const uint8_t* q6_sb(const uint8_t* row, int sb) { return row + (size_t)(sb >> 2) * 840 + (sb & 3) * 208; }
+__device__ __forceinline__ uint16_t q6_d(const uint8_t* row, int sb) { return ld16(row + (size_t)(sb >> 2) * 840 + 832 + (sb & 3) * 2); }
 
 // tensor core: D = A(16x16, fp16, 行优先) * B(16x8, fp16, 列优先) + C (fp32). lane = 4g + t
 // a0: (g, 2t..2t+1), a1: (g+8, 2t..), a2: (g, 8+2t..), a3: (g+8, 8+2t..); b0: (k = 2t.., n = g), b1: (k = 8+2t.., n = g); c0/c1: (g, 2t..), c2/c3: (g+8, 2t..)
@@ -70,10 +76,11 @@ template <int TYPE> __device__ __forceinline__ void dq8(const uint8_t* row, int 
         const float4* p = (const float4*)(row + (size_t)sb * 1024 + lane * 32);
         float4 a = p[0], b = p[1];
         w[0] = a.x, w[1] = a.y, w[2] = a.z, w[3] = a.w, w[4] = b.x, w[5] = b.y, w[6] = b.z, w[7] = b.w;
-    } else if constexpr (TYPE == T_Q8_0) { // 34 字节一块, 32 个元素, 一个超块对应 8 块
-        const uint8_t* b = row + (size_t)(sb * 8 + lane / 4) * 34;
-        float d = h2f(ld16(b));
-        uint2 q = ld8_a2(b + 2 + (lane % 4) * 8);
+    } else if constexpr (TYPE == T_Q8_0) { // 32 个元素一块, 一个超块对应 8 块 (重排后的布局见 q8_grp)
+        const uint8_t* b = q8_grp(row, sb);
+        int i = lane / 4, p = lane % 4;
+        float d = h2f(ld16(b + 256 + i * 2));
+        uint2 q = *(const uint2*)(b + (p >> 1) * 128 + i * 16 + (p & 1) * 8);
 #pragma unroll
         for (int e = 0; e < 4; e++) {
             w[e] = (float)(int8_t)(q.x >> (8 * e)) * d;
@@ -102,12 +109,12 @@ template <int TYPE> __device__ __forceinline__ void dq8(const uint8_t* row, int 
             w[e] = fmaf(d1, (float)(((q.x >> (8 * e + sh)) & 0xF) | (((h.x >> (8 * e + hb)) & 1) << 4)), -m1);
             w[e + 4] = fmaf(d1, (float)(((q.y >> (8 * e + sh)) & 0xF) | (((h.y >> (8 * e + hb)) & 1) << 4)), -m1);
         }
-    } else if constexpr (TYPE == T_Q6_K) { // ql[128], qh[64], scales[16] (int8), d; 每 128 个一半, 半内 4 个 32 元素段 s, ql 取 (s&1) 段的低/高 4 位, qh 取 bit 2s
-        const uint8_t* b = row + (size_t)sb * 210;
+    } else if constexpr (TYPE == T_Q6_K) { // ql[128], qh[64], scales[16] (int8), d (重排后 d 在组尾, 见 q6_sb); 每 128 个一半, 半内 4 个 32 元素段 s, ql 取 (s&1) 段的低/高 4 位, qh 取 bit 2s
+        const uint8_t* b = q6_sb(row, sb);
         int n = lane / 16, s = (lane % 16) / 4, l0 = (lane % 4) * 8;
-        uint2 ql = ld8_a2(b + 64 * n + l0 + 32 * (s & 1));
-        uint2 qh = ld8_a2(b + 128 + 32 * n + l0);
-        float ds = h2f(ld16(b + 208)) * (float)(int8_t)b[192 + 8 * n + l0 / 16 + 2 * s];
+        uint2 ql = *(const uint2*)(b + 64 * n + l0 + 32 * (s & 1));
+        uint2 qh = *(const uint2*)(b + 128 + 32 * n + l0);
+        float ds = h2f(q6_d(row, sb)) * (float)(int8_t)b[192 + 8 * n + l0 / 16 + 2 * s];
         int sh = s >= 2 ? 4 : 0;
 #pragma unroll
         for (int e = 0; e < 4; e++) {
@@ -130,9 +137,10 @@ template <int TYPE> __device__ __forceinline__ void dq8h(const uint8_t* row, int
         float4 a = p[0], b = p[1];
         w[0] = __floats2half2_rn(a.x, a.y), w[1] = __floats2half2_rn(a.z, a.w), w[2] = __floats2half2_rn(b.x, b.y), w[3] = __floats2half2_rn(b.z, b.w);
     } else if constexpr (TYPE == T_Q8_0) {
-        const uint8_t* b = row + (size_t)(sb * 8 + lane / 4) * 34;
-        half2 d = __half2half2(__ushort_as_half(ld16(b)));
-        uint2 q = ld8_a2(b + 2 + (lane % 4) * 8);
+        const uint8_t* b = q8_grp(row, sb);
+        int i = lane / 4, p = lane % 4;
+        half2 d = __half2half2(__ushort_as_half(ld16(b + 256 + i * 2)));
+        uint2 q = *(const uint2*)(b + (p >> 1) * 128 + i * 16 + (p & 1) * 8);
         const half2 off = __float2half2_rn(1152.0f); // int8 异或 0x80 后是 q+128
         b4h(q.x ^ 0x80808080u, off, w);
         b4h(q.y ^ 0x80808080u, off, w + 2);
@@ -157,11 +165,11 @@ template <int TYPE> __device__ __forceinline__ void dq8h(const uint8_t* row, int
 #pragma unroll
         for (int i = 0; i < 4; i++) w[i] = __hfma2(w[i], dh, mh);
     } else if constexpr (TYPE == T_Q6_K) {
-        const uint8_t* b = row + (size_t)sb * 210;
+        const uint8_t* b = q6_sb(row, sb);
         int n = lane / 16, s = (lane % 16) / 4, l0 = (lane % 4) * 8;
-        uint2 ql = ld8_a2(b + 64 * n + l0 + 32 * (s & 1));
-        uint2 qh = ld8_a2(b + 128 + 32 * n + l0);
-        float ds = h2f(ld16(b + 208)) * (float)(int8_t)b[192 + 8 * n + l0 / 16 + 2 * s];
+        uint2 ql = *(const uint2*)(b + 64 * n + l0 + 32 * (s & 1));
+        uint2 qh = *(const uint2*)(b + 128 + 32 * n + l0);
+        float ds = h2f(q6_d(row, sb)) * (float)(int8_t)b[192 + 8 * n + l0 / 16 + 2 * s];
         int sh = s >= 2 ? 4 : 0;
         uint32_t vx = ((ql.x >> sh) & 0x0F0F0F0Fu) | (((qh.x >> (2 * s)) & 0x03030303u) << 4), vy = ((ql.y >> sh) & 0x0F0F0F0Fu) | (((qh.y >> (2 * s)) & 0x03030303u) << 4);
         const half2 off = __float2half2_rn(1056.0f), dh = __float2half2_rn(ds); // 6bit 值减 32
@@ -172,38 +180,127 @@ template <int TYPE> __device__ __forceinline__ void dq8h(const uint8_t* row, int
     }
 }
 
-// 一个 warp 算权重的一行 wr 与 token t0..t0+NTT-1 的点积 (x 是 fp16), 结果 warp 归约后每个 lane 都有; 权重每 NTT 个 token 解一次 (解成 half2)
-// 每个 lane 每个超块的 8 个乘积及其部分和全用 half (half2 累加后两半相加), 再转 fp32 累加; decode 用 NTT = 1, 寄存器少
-template <int TYPE, int NTT> __device__ __forceinline__ void gemv_row(const uint8_t* wr, int k, const __half* x, int t0, int T, float* acc) {
-    int lane = threadIdx.x & 31, nsb = k / 256;
+__device__ __forceinline__ void scale_min_k4_bl(uint4 hd, int j, float& d1, float& m1) { // 同 scale_min_k4, 无分支: hd = 超块前 16 字节 (d, dmin, scales[12]), 4 个子块的 6bit 值按字节并行解出再选
+    uint32_t s = j < 4 ? hd.y & 0x3F3F3F3Fu : (hd.w & 0x0F0F0F0Fu) | ((hd.y >> 2) & 0x30303030u);
+    uint32_t m = j < 4 ? hd.z & 0x3F3F3F3Fu : ((hd.w >> 4) & 0x0F0F0F0Fu) | ((hd.z >> 2) & 0x30303030u);
+    int b = (j & 3) * 8;
+    d1 = h2f((uint16_t)hd.x) * (float)((s >> b) & 0xFF);
+    m1 = h2f((uint16_t)(hd.x >> 16)) * (float)((m >> b) & 0xFF);
+}
+
+// 一个 warp 算权重的一行 wr 与 token t0..t0+NTT-1 的点积 (x 是 fp16), 结果 warp 归约后每个 lane 都有; 要求 k 是 1024 的倍数
+// 每个 lane 负责一个 32 元素子块 (lane & 7 是超块内第几个子块), warp 每轮 4 个超块; 权重每 NTT 个 token 解一次; xp: x 是 xperm 布局 (decode)
+// q4_k/q5_k/q6_k: 量化值 (整数, half 精确) 直接与 x 乘, scale/min 提到子块外: sum x·(d1·q - m1) = d1·sum(x·q) - m1·sum(x); 每 4 项 (half2 一半) 转 fp32, 防溢出
+// q8_0/f32: q 最大 127, 提出 scale 会溢出, 仍是 w = q·d 再乘 x, 每 8 个乘积 half 累加后转 fp32 (与改动前相同)
+template <int TYPE, int NTT> __device__ __forceinline__ void gemv_row(const uint8_t* wr, int k, const __half* x, int t0, int T, bool xp, float* acc) {
+    constexpr bool FAC = TYPE == T_Q4_K || TYPE == T_Q5_K || TYPE == T_Q6_K;
+    int lane = threadIdx.x & 31, j = lane & 7, nsb = k / 256;
 #pragma unroll
     for (int t = 0; t < NTT; t++) acc[t] = 0;
-#pragma unroll 4
-    for (int sb = 0; sb < nsb; sb++) {
-        half2 w[4];
-        dq8h<TYPE>(wr, sb, lane, w);
+#pragma unroll 2
+    for (int sb = lane >> 3; sb < nsb; sb += 4) {
+        half2 w[16]; // 本子块 32 个元素: FAC 时是量化值 q (q6_k 是 q - 32), 否则是 q·d
+        float d1 = 0, m1 = 0; // q4_k/q5_k: d1, m1; q6_k: 前 16 个 / 后 16 个的 d·scale
+        if constexpr (TYPE == T_F32) {
+            const float4* p = (const float4*)(wr + ((size_t)sb * 256 + j * 32) * 4);
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float4 a = p[i];
+                w[2 * i] = __floats2half2_rn(a.x, a.y), w[2 * i + 1] = __floats2half2_rn(a.z, a.w);
+            }
+        } else if constexpr (TYPE == T_Q8_0) {
+            const uint8_t* b = q8_grp(wr, sb);
+            half2 d = __half2half2(__ushort_as_half(ld16(b + 256 + j * 2)));
+            uint4 qa = *(const uint4*)(b + j * 16), qb = *(const uint4*)(b + 128 + j * 16); // 前 16 个 / 后 16 个
+            uint32_t q[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+            const half2 off = __float2half2_rn(1152.0f); // int8 异或 0x80 后是 q+128
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                b4h(q[i] ^ 0x80808080u, off, w + 2 * i);
+                w[2 * i] = __hmul2(w[2 * i], d), w[2 * i + 1] = __hmul2(w[2 * i + 1], d);
+            }
+        } else if constexpr (TYPE == T_Q4_K || TYPE == T_Q5_K) {
+            const uint8_t* b = wr + (size_t)sb * (TYPE == T_Q4_K ? 144 : 176);
+            uint4 hd = *(const uint4*)b;
+            scale_min_k4_bl(hd, j, d1, m1);
+            const uint4* qp = (const uint4*)(b + (TYPE == T_Q4_K ? 16 : 48) + 32 * (j >> 1)); // 子块 2g/2g+1 共用 32 字节: 低/高 4 位
+            uint4 qa = qp[0], qb = qp[1];
+            uint32_t q[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+            int sh = (j & 1) * 4;
+            const half2 off = __float2half2_rn(1024.0f);
+            if constexpr (TYPE == T_Q5_K) { // 第 5 位: qh[l] 的 bit j
+                const uint4* hp = (const uint4*)(b + 16);
+                uint4 ha = hp[0], hb = hp[1];
+                uint32_t h[8] = {ha.x, ha.y, ha.z, ha.w, hb.x, hb.y, hb.z, hb.w};
+#pragma unroll
+                for (int i = 0; i < 8; i++) b4h(((q[i] >> sh) & 0x0F0F0F0Fu) | (((h[i] >> j) & 0x01010101u) << 4), off, w + 2 * i);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; i++) b4h((q[i] >> sh) & 0x0F0F0F0Fu, off, w + 2 * i);
+            }
+        } else if constexpr (TYPE == T_Q6_K) { // 子块 j = 4n + s: 元素 128n + 32s + l, ql[64n + 32(s&1) + l] 取 (s>=2 ? 高 : 低) 4 位, qh[32n + l] 取 bit 2s..2s+1, scale = scales[2j + l/16]
+            const uint8_t* b = q6_sb(wr, sb);
+            int n = j >> 2, s = j & 3;
+            uint32_t ql[8], qh[8];
+            const uint2* pl = (const uint2*)(b + 64 * n + 32 * (s & 1)); // 行起点只保证 8 字节对齐
+            const uint2* ph = (const uint2*)(b + 128 + 32 * n);
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                uint2 a = pl[i], c = ph[i];
+                ql[2 * i] = a.x, ql[2 * i + 1] = a.y, qh[2 * i] = c.x, qh[2 * i + 1] = c.y;
+            }
+            uint16_t sc = ld16(b + 192 + 2 * j);
+            float d = h2f(q6_d(wr, sb));
+            d1 = d * (float)(int8_t)(sc & 0xFF), m1 = d * (float)(int8_t)(sc >> 8);
+            int sh = s >= 2 ? 4 : 0;
+            const half2 off = __float2half2_rn(1056.0f); // 6bit 值减 32
+#pragma unroll
+            for (int i = 0; i < 8; i++) b4h(((ql[i] >> sh) & 0x0F0F0F0Fu) | (((qh[i] >> (2 * s)) & 0x03030303u) << 4), off, w + 2 * i);
+        }
 #pragma unroll
         for (int t = 0; t < NTT; t++) {
             if (t0 + t >= T) break;
-            uint4 xv = *(const uint4*)(x + (size_t)(t0 + t) * k + sb * 256 + lane * 8);
-            half2 s = __hmul2(w[0], *(half2*)&xv.x);
-            s = __hfma2(w[1], *(half2*)&xv.y, s);
-            s = __hfma2(w[2], *(half2*)&xv.z, s);
-            s = __hfma2(w[3], *(half2*)&xv.w, s);
-            acc[t] += __half2float(__hadd(__low2half(s), __high2half(s)));
+            const uint4* xa = (const uint4*)(x + (size_t)(t0 + t) * k + (xp ? (sb >> 2) * 1024 + lane * 8 : sb * 256 + j * 32)); // xperm 布局: 第 i 条指令读连续 512 字节
+            int xs = xp ? 32 : 1; // 相邻 8 个元素之间的 uint4 跨度
+            half2 xv[16];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                uint4 v = xa[i * xs];
+                xv[4 * i] = *(half2*)&v.x, xv[4 * i + 1] = *(half2*)&v.y, xv[4 * i + 2] = *(half2*)&v.z, xv[4 * i + 3] = *(half2*)&v.w;
+            }
+            float ps[4]; // 每 8 个元素的部分和
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                half2 s2 = __hmul2(w[4 * c], xv[4 * c]);
+                s2 = __hfma2(w[4 * c + 1], xv[4 * c + 1], s2);
+                s2 = __hfma2(w[4 * c + 2], xv[4 * c + 2], s2);
+                s2 = __hfma2(w[4 * c + 3], xv[4 * c + 3], s2);
+                if constexpr (FAC) ps[c] = __low2float(s2) + __high2float(s2);
+                else ps[c] = __half2float(__hadd(__low2half(s2), __high2half(s2)));
+            }
+            if constexpr (TYPE == T_Q6_K) {
+                acc[t] += d1 * (ps[0] + ps[1]) + m1 * (ps[2] + ps[3]);
+            } else if constexpr (FAC) {
+                half2 sx = __hadd2(xv[0], xv[1]);
+#pragma unroll
+                for (int i = 2; i < 16; i++) sx = __hadd2(sx, xv[i]);
+                acc[t] += d1 * ((ps[0] + ps[1]) + (ps[2] + ps[3])) - m1 * (__low2float(sx) + __high2float(sx));
+            } else {
+                acc[t] += (ps[0] + ps[1]) + (ps[2] + ps[3]);
+            }
         }
     }
 #pragma unroll
     for (int t = 0; t < NTT; t++) acc[t] = warp_sum(acc[t]);
 }
 
-template <int NTT> __device__ __forceinline__ void gemv_row_rt(int type, const uint8_t* wr, int k, const __half* x, int t0, int T, float* acc) { // 运行时按量化类型分发 (同一 warp 内一致)
+template <int NTT> __device__ __forceinline__ void gemv_row_rt(int type, const uint8_t* wr, int k, const __half* x, int t0, int T, bool xp, float* acc) { // 运行时按量化类型分发 (同一 warp 内一致)
     switch (type) {
-    case T_F32: gemv_row<T_F32, NTT>(wr, k, x, t0, T, acc); break;
-    case T_Q8_0: gemv_row<T_Q8_0, NTT>(wr, k, x, t0, T, acc); break;
-    case T_Q4_K: gemv_row<T_Q4_K, NTT>(wr, k, x, t0, T, acc); break;
-    case T_Q5_K: gemv_row<T_Q5_K, NTT>(wr, k, x, t0, T, acc); break;
-    default: gemv_row<T_Q6_K, NTT>(wr, k, x, t0, T, acc); break;
+    case T_F32: gemv_row<T_F32, NTT>(wr, k, x, t0, T, xp, acc); break;
+    case T_Q8_0: gemv_row<T_Q8_0, NTT>(wr, k, x, t0, T, xp, acc); break;
+    case T_Q4_K: gemv_row<T_Q4_K, NTT>(wr, k, x, t0, T, xp, acc); break;
+    case T_Q5_K: gemv_row<T_Q5_K, NTT>(wr, k, x, t0, T, xp, acc); break;
+    default: gemv_row<T_Q6_K, NTT>(wr, k, x, t0, T, xp, acc); break;
     }
 }
 
@@ -307,6 +404,7 @@ struct MmGroup { // decode GEMV 的一组矩阵 (共享输入 x 和 k), 与 host
     uint64_t w[4], rb[4], y[4];
     int n[4], type[4];
     int cnt, glu; // glu (k_gemv_glu): 矩阵 0/1 是 ffn gate/up, 行按矩阵 0 分配, y[0] = silu(gate)·up (fp16); 否则 (k_gemv) 行按 cnt 个矩阵依次拼接, 输出 fp32
+    int xp; // x 是 xperm 布局 (decode); glu 时输出 y[0] 也写成 xperm 布局
 };
 
 // decode (T < 16) 的矩阵乘: grid 总行数/2, block 64 = 2 个 warp, 每个 warp 一行; 一组矩阵一次 launch, 块小使各 SM 负载均衡
@@ -317,14 +415,15 @@ template <bool GLU, int NTT> __device__ __forceinline__ void gemv_body(const MmG
     if (row >= g.n[m]) return;
     for (int t0 = 0; t0 < T; t0 += NTT) {
         float acc[NTT];
-        gemv_row_rt<NTT>(g.type[m], (const uint8_t*)g.w[m] + (size_t)row * g.rb[m], k, x, t0, T, acc);
+        gemv_row_rt<NTT>(g.type[m], (const uint8_t*)g.w[m] + (size_t)row * g.rb[m], k, x, t0, T, g.xp, acc);
         if constexpr (GLU) {
             float au[NTT];
-            gemv_row_rt<NTT>(g.type[1], (const uint8_t*)g.w[1] + (size_t)row * g.rb[1], k, x, t0, T, au);
+            gemv_row_rt<NTT>(g.type[1], (const uint8_t*)g.w[1] + (size_t)row * g.rb[1], k, x, t0, T, g.xp, au);
+            int orow = g.xp ? xperm(row) : row; // 输出是 down 的输入
             if (lane == 0)
 #pragma unroll
                 for (int t = 0; t < NTT; t++)
-                    if (t0 + t < T) ((__half*)g.y[0])[(size_t)(t0 + t) * g.n[0] + row] = __float2half_rn(silu(acc[t]) * au[t]);
+                    if (t0 + t < T) ((__half*)g.y[0])[(size_t)(t0 + t) * g.n[0] + orow] = __float2half_rn(silu(acc[t]) * au[t]);
         } else if (lane == 0) {
 #pragma unroll
             for (int t = 0; t < NTT; t++)
@@ -335,8 +434,8 @@ template <bool GLU, int NTT> __device__ __forceinline__ void gemv_body(const MmG
 
 extern "C" __global__ void __launch_bounds__(64) k_gemv(MmGroup g, int k, const __half* x, int T) { gemv_body<false, NT>(g, k, x, T); }
 extern "C" __global__ void __launch_bounds__(64) k_gemv_glu(MmGroup g, int k, const __half* x, int T) { gemv_body<true, NT>(g, k, x, T); }
-extern "C" __global__ void __launch_bounds__(64) k_gemv1(MmGroup g, int k, const __half* x, int T) { gemv_body<false, 1>(g, k, x, T); }
-extern "C" __global__ void __launch_bounds__(64) k_gemv1_glu(MmGroup g, int k, const __half* x, int T) { gemv_body<true, 1>(g, k, x, T); }
+extern "C" __global__ void __launch_bounds__(64, 18) k_gemv1(MmGroup g, int k, const __half* x, int T) { gemv_body<false, 1>(g, k, x, T); } // 每 SM 18 个 block (寄存器 <= 56): n = 5120 的 2560 个 block 在 156 SM 上一波放下
+extern "C" __global__ void __launch_bounds__(64, 16) k_gemv1_glu(MmGroup g, int k, const __half* x, int T) { gemv_body<true, 1>(g, k, x, T); }
 
 // x += add (add 可为空); y = rmsnorm(x) * w (fp16, 作为 matmul 输入); hidden 非空时保存最后一个 token 的 x. grid T, block 1024, 每线程 5 个元素
 extern "C" __global__ void __launch_bounds__(1024) k_add_norm(float* x, const float* add, const float* w, __half* y, float* hidden, int T) {
@@ -360,7 +459,7 @@ extern "C" __global__ void __launch_bounds__(1024) k_add_norm(float* x, const fl
 #pragma unroll
     for (int i = 0; i < D / 1024; i++) {
         int c = threadIdx.x + i * 1024;
-        y[(size_t)t * D + c] = __float2half_rn(v[i] * r * w[c]);
+        y[(size_t)t * D + (T == 1 ? xperm(c) : c)] = __float2half_rn(v[i] * r * w[c]); // decode 时写成 GEMV 用的 xperm 布局
         if (hidden && t == T - 1) hidden[c] = v[i];
     }
 }
@@ -499,7 +598,7 @@ extern "C" __global__ void __launch_bounds__(128) k_dn_post(const float* of, con
     int t = blockIdx.x, h = blockIdx.y, j = threadIdx.x;
     size_t idx = (size_t)t * V_DIM + h * LHD + j;
     float o = of[idx], on = block_sum<128>(o * o, red);
-    out[idx] = __float2half_rn(o * (1.0f / sqrtf(on / LHD + EPS)) * ssm_norm[j] * silu(z[idx]));
+    out[gridDim.x == 1 ? xperm(h * LHD + j) : idx] = __float2half_rn(o * (1.0f / sqrtf(on / LHD + EPS)) * ssm_norm[j] * silu(z[idx])); // T = 1 (decode) 时写成 xperm 布局
 }
 
 // KV cache 是 q8_0 (同 llama.cpp): 每行 (token) 1024 个 int8 [ctx][1024], 每 32 维一个 fp16 scale [ctx][32] (4 个头 x 8 块), 分开存放保证 16 字节对齐
@@ -800,5 +899,24 @@ extern "C" __global__ void __launch_bounds__(256) k_attn_merge(const float* qg, 
         L += ml.y * f;
         o += po[((size_t)s * N_HEAD + h) * HD + i] * f;
     }
-    att[h * HD + i] = __float2half_rn(o / L * sigmoid(qg[h * HD * 2 + HD + i]));
+    att[xperm(h * HD + i)] = __float2half_rn(o / L * sigmoid(qg[h * HD * 2 + HD + i])); // 只用于 decode, 写成 xperm 布局
+}
+
+// q8_0 / q6_k 权重上传后按行原地重排 (布局见 q8_grp / q6_sb), grid 行数, block 256, 动态 smem = 每行字节数
+extern "C" __global__ void __launch_bounds__(256) k_repack(uint8_t* W, uint64_t rb, int type) {
+    extern __shared__ uint8_t old[];
+    uint8_t* row = W + (size_t)blockIdx.x * rb;
+    for (int p = threadIdx.x; p < (int)rb; p += 256) old[p] = row[p];
+    __syncthreads();
+    for (int p = threadIdx.x; p < (int)rb; p += 256) {
+        int src;
+        if (type == T_Q8_0) { // 原: 每块 [d(2)][qs(32)]
+            int g = p / 272, r = p % 272;
+            src = r < 256 ? (g * 8 + (r & 127) / 16) * 34 + 2 + (r / 128) * 16 + (r & 15) : (g * 8 + (r - 256) / 2) * 34 + (r & 1);
+        } else { // q6_k, 原: 每超块 [ql(128) qh(64) scales(16)][d(2)]
+            int g = p / 840, r = p % 840;
+            src = r < 832 ? (g * 4 + r / 208) * 210 + r % 208 : (g * 4 + (r - 832) / 2) * 210 + 208 + (r & 1);
+        }
+        row[p] = old[src];
+    }
 }
