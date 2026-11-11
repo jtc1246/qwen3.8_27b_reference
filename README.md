@@ -7,6 +7,7 @@
 - [docs/model.md](docs/model.md): 模型结构、计算公式、GGUF 格式与 Q4_K_M 量化方式
 - [docs/cpu_impl.md](docs/cpu_impl.md): C++ 实现细节
 - [docs/cuda_impl.md](docs/cuda_impl.md): CUDA 实现 (`qwen_cuda/`, 只依赖驱动的 driver API) 与 CPU 版的差异、验证和性能
+- [docs/benchmark.md](docs/benchmark.md): 与 llama.cpp、vLLM 的速度对比 (环境、版本、方法), 以及 llama.cpp 激活量化的精度实测
 
 ## 环境准备
 
