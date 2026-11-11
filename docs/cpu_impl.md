@@ -94,7 +94,7 @@ EPS = 1e-6, THETA = 1e7
 
 `qwen_eval` 把输入按 CHUNK = 64 切块, 依次调用 `eval_chunk`, 只有最后一块计算 logits。每块:
 
-1. **embedding**: 对每个 token, 如果 `embd_mask[t]` 为 1 就拷贝调用方给的 `embd[t]` (图片), 否则把 `token_embd` 的第 token 行 (q4_k) 反量化成 fp32
+1. **embedding**: 对每个 token, 如果 `embd_mask[t]` 为 1 就按顺序拷贝调用方给的 `embd` 的下一行 (图片), 否则把 `token_embd` 的第 token 行 (q4_k) 反量化成 fp32
 2. **位置**: 有 `pos3` 就用调用方给的 (t, h, w); 没有则三个位置都是 `G_next_pos + t`
 3. **64 层循环**, 每层:
    - 对每个 token 做 `attn_norm` (GGUF 里已经是 1+w, 直接 `x / rms · w`)
@@ -155,7 +155,7 @@ KV cache 和所有中间结果都是 fp32 (HF 参考实现里 KV 是 bf16)。
 | 函数 | 说明 |
 |---|---|
 | `int qwen_init(const char* gguf_path, int n_threads, int max_ctx)` | 加载并分配全部内存; 0 成功, -1 文件或架构错误; 形状/参数不符时直接退出进程。重复调用直接返回 0 |
-| `int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3)` | 追加 n 个 token 到当前序列并计算最后一个的 logits。`embd` `[n][5120]`、`embd_mask` `[n]`、`pos3` `[n][3]` 都可为 NULL。返回 0 成功, -1 未初始化或 n ≤ 0, -2 超出 max_ctx, -3 token id 越界 (mask 为 1 的位置不检查) |
+| `int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3)` | 追加 n 个 token 到当前序列并计算最后一个的 logits。`embd` `[embd_mask 中 1 的个数][5120]` (只含图片位置, 按位置顺序)、`embd_mask` `[n]`、`pos3` `[n][3]` 都可为 NULL。返回 0 成功, -1 未初始化或 n ≤ 0, -2 超出 max_ctx, -3 token id 越界 (mask 为 1 的位置不检查) |
 | `int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist)` | 从当前 logits 采样一个 token id |
 | `void qwen_seed(uint64_t seed)` | 设置采样随机数状态 |
 | `void qwen_reset()` | 清零 DeltaNet 的递推和卷积状态, `n_past = next_pos = 0`。KV cache 不需要清零 (按 n_past 覆盖写) |

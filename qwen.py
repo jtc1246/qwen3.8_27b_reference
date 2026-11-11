@@ -44,7 +44,7 @@ def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm
 
 
 def eval_tokens(tokens, embd=None, embd_mask=None, pos3=None):
-    # embd: 可选, [n, 5120] float32 连续内存 (例如 numpy 数组), 对应 embd_mask 为 1 的位置替换 token embedding (图片)
+    # embd: 可选, [embd_mask 中 1 的个数, 5120] float32 连续内存 (例如 numpy 数组), 按位置顺序依次替换 embd_mask 为 1 的位置的 token embedding (图片)
     # pos3: 可选, [n, 3] int32 的 MRoPE 位置 (t, h, w); 为空时默认接着上次的位置递增
     n = len(tokens)
     arr = (ctypes.c_int * n)(*tokens)

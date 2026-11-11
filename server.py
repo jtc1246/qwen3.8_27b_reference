@@ -218,7 +218,7 @@ def vision_embeds(p): # 锁内执行: 命中缓存的图片直接取, 其余图�
     return np.concatenate(embs), len(p["hashes"]) - len(miss)
 
 
-def run_vision(p): # 锁内执行: 视觉塔前向 (带缓存), 生成 embedding / mask / 3D 位置
+def run_vision(p): # 锁内执行: 视觉塔前向 (带缓存), 生成图片 token 的 embedding (只含图片位置, 按顺序) / mask / 3D 位置
     if p["out"] is None:
         return None, None, None
     ids = p["ids"]
@@ -228,10 +228,8 @@ def run_vision(p): # 锁内执行: 视觉塔前向 (带缓存), 生成 embedding
     log(f"ℹ️ 视觉塔 {p['n_images']} 张图 (缓存命中 {hit}), {int(mask.sum())} 个图片 token, {time.time() - t0:.2f}s, 缓存 {len(G_img_cache)} 张 {G_img_cache_bytes / 1048576:.0f}MB")
     if int(mask.sum()) != emb.shape[0]:
         raise RuntimeError(f"❌ 图片 token 数 {int(mask.sum())} 与视觉输出 {emb.shape[0]} 不一致")
-    embd = np.zeros((len(ids), 5120), dtype=np.float32) # (n, 5120)
-    embd[mask.astype(bool)] = emb
     pos3 = rope_positions(ids, p["out"]["image_grid_thw"].tolist()) # (n, 3)
-    return embd, mask, pos3
+    return np.ascontiguousarray(emb, dtype=np.float32), mask, pos3 # emb: (图片 token 数, 5120)
 
 
 def generate_engine(p): # cuda 引擎模式的生成器: 视觉塔 (G_lock 内) -> 等槽位 (python FIFO) -> prefill (C++ 里 FIFO) -> 逐个返回 token; 中途关闭 (客户端断开) 时取消
@@ -279,31 +277,30 @@ def generate_tokens(p): # 生成器, 逐个返回 token id; cpu 在锁内执行,
 class Decoder: # 增量解码, 遇到 </think> 切换到正文; 多字节字符未完整时暂缓输出
     def __init__(self, thinking):
         self.in_reasoning = thinking
-        self.seg = []
-        self.emitted = ""
+        self.seg = [] # 还没拼成完整字符的 token
         self.reasoning = ""
         self.content = ""
 
-    def push(self, tok): # 返回 (字段名, 新增文本) 或 None
+    def push(self, tok): # 返回 (字段名, 新增文本): 每个 token 都返回一次, 没有新增文本 (停止 token、</think>、字符不完整、开头换行) 时是空串
+        field = "reasoning_content" if self.in_reasoning else "content"
+        if tok in qwen.EOS_IDS:
+            return field, ""
         if self.in_reasoning and tok == THINK_END:
             self.in_reasoning = False
-            self.seg, self.emitted = [], ""
-            return None
+            self.seg = []
+            return field, ""
         self.seg.append(tok)
-        text = G_proc.tokenizer.decode(self.seg, skip_special_tokens=False)
-        if text.endswith("�"):
-            return None
-        if not self.in_reasoning: # 正文段每次都去掉开头的换行 (</think> 后的 \n\n), 保证增量偏移一致
-            text = text.lstrip("\n")
-        new = text[len(self.emitted):]
-        self.emitted = text
-        if not new:
-            return None
+        new = G_proc.tokenizer.decode(self.seg, skip_special_tokens=False)
+        if new.endswith("�"): # 多字节字符还不完整, 等后面的 token
+            return field, ""
+        self.seg = [] # 已是完整字符: 丢掉已解码的 token, 之后单独 decode 再拼接与整段 decode 相同 (ByteLevel decoder, 不清理空格)
+        if not self.in_reasoning and not self.content: # 去掉正文开头的换行 (</think> 后的 \n\n)
+            new = new.lstrip("\n")
         if self.in_reasoning:
             self.reasoning += new
-            return "reasoning_content", new
-        self.content += new
-        return "content", new
+        else:
+            self.content += new
+        return field, new
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -390,8 +387,7 @@ class Handler(BaseHTTPRequestHandler):
         for tok in generate_tokens(p):
             n_out += 1
             last = tok
-            if tok not in qwen.EOS_IDS:
-                dec.push(tok)
+            dec.push(tok)
         msg = {"role": "assistant", "content": dec.content}
         if p["thinking"]:
             msg["reasoning_content"] = dec.reasoning.strip()
@@ -408,13 +404,10 @@ class Handler(BaseHTTPRequestHandler):
         last = None
         gen = generate_tokens(p)
         try:
-            for tok in gen:
+            for tok in gen: # 每个输出 token (含停止 token) 发一次, 没有新增文本时发空串
                 last = tok
-                if tok in qwen.EOS_IDS:
-                    continue
-                r = dec.push(tok)
-                if r:
-                    self.write_sse({**base, "choices": [{"index": 0, "delta": {r[0]: r[1]}, "finish_reason": None}]})
+                field, new = dec.push(tok)
+                self.write_sse({**base, "choices": [{"index": 0, "delta": {field: new}, "finish_reason": None}]})
         finally:
             gen.close() # 客户端断开时也会走到这里, 结束生成并释放锁
         self.write_sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop" if last in qwen.EOS_IDS else "length"}]})
@@ -433,7 +426,7 @@ def main():
     p.add_argument("--threads", type=int, default=16, help="cpu 后端的推理线程数, 以及 torch (CPU 上的视觉塔、预处理) 的线程数")
     p.add_argument("--device", type=int, default=0, help="cuda 后端使用的 GPU 编号")
     p.add_argument("--ctx", type=int, default=None, help="最大上下文 (prompt + 输出), 默认 cpu 32768, cuda 262144; cuda 是每个槽的上下文, 启动时分配全部槽的 KV")
-    p.add_argument("--dec-sm", type=int, default=None, help="cuda: prefill 和 decode 同时运行时 decode 分区的 SM 数 (其余给 prefill), 默认 78")
+    p.add_argument("--dec-ratio", type=float, default=0.31, help="cuda: prefill 和 decode 同时运行时 decode 分区占的 SM 比例 (其余给 prefill), 取最近的可用值 (偶数个, 两边都至少 8 个), 本卡 156 SM 时 0.31 为 48 个")
     p.add_argument("--max-image-pixels", type=int, default=1048576, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 0 表示用官方默认 16777216")
     p.add_argument("--model-name", default="qwen3.8-27b", help="模型名前缀, 对外返回的名称是 {model-name}-{type}; 请求里的 model 不校验")
     p.add_argument("--image-cache-mb", type=int, default=4096, help="视觉塔输出缓存上限 (MB, 只在内存, LRU 淘汰), 0 表示不缓存")
@@ -447,7 +440,9 @@ def main():
         if not torch.cuda.is_available():
             raise RuntimeError(f"❌ --type cuda 需要 CUDA 版 torch, 当前 torch {torch.__version__} 不支持 CUDA")
         G_dev = f"cuda:{G_args.device}"
-    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, G_args.dec_sm)
+        n_sm = torch.cuda.get_device_properties(G_args.device).multi_processor_count
+        dec_sm = min(max(round(n_sm * G_args.dec_ratio / 2) * 2, 8), n_sm - 8) # green context 按 2 个 SM 分, 每个分区至少 8 个
+    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None)
     if G_args.type == "cuda":
         G_pool = SlotPool(qwen.nseq())
         qwen.engine_start()

@@ -114,8 +114,9 @@ python 代码在仓库根目录, 与具体后端无关; 各后端 (`qwen_cpu/`�
   - 默认采样参数与官方推荐一致 (思考 / 非思考两套), `temperature` 只覆盖温度; 思考内容在 `reasoning_content` 字段返回
   - tokenizer、chat 模板、图片预处理用 transformers 的官方 processor, 视觉塔用 transformers 的模块加载官方权重
   - 启动时先加载完所有内容再开始监听; 流式请求的客户端断开会立即停止生成
+  - 流式: 开头一个 role chunk, 之后每个输出 token (含结尾的停止 token) 正好一个 chunk, 没有新增文本 (停止 token、`</think>`、多字节字符还不完整、正文开头的换行) 时发空串, 最后一个 chunk 带 finish_reason
   - cpu: 推理是单序列, 并发请求排队串行处理, 不会报错
-  - cuda: 最多 4 个请求同时进行, 更多的按到达顺序排队; 输入 (prefill) 按到达顺序逐个算, 输出 (decode) 所有请求每步一起算; prefill 和 decode 同时运行时按 SM 分区 (`--dec-sm`, decode 默认 78 个, 其余给 prefill), 只有一种时用整卡。同一请求 (固定 seed) 单独跑和并发跑的输出完全相同
+  - cuda: 最多 4 个请求同时进行, 更多的按到达顺序排队; 输入 (prefill) 按到达顺序逐个算, 输出 (decode) 所有请求每步一起算; prefill 和 decode 同时运行时按 SM 分区 (`--dec-ratio`, decode 默认占 0.31, 本卡 156 SM 时为 48 个, 其余给 prefill), 只有一种时用整卡。同一请求 (固定 seed) 单独跑和并发跑的输出完全相同
   - 图片默认最多 1048576 像素 (约 1024 token), `--max-image-pixels 0` 恢复官方默认
   - 视觉塔 fp32, `--type cuda` 时在 GPU 上, 否则在 CPU 上
   - 图片缓存: 视觉塔的输出按图片原始字节 (base64 解码后 / http 下载的内容) 的 sha256 缓存, 只在内存里, 不写文件; 一个请求里命中的图片直接用缓存, 未命中的图片一起过视觉塔再按图片拆开存入。按 LRU 淘汰, 上限 `--image-cache-mb` (默认 4096MB, 每张 1024 token 的图约 20MB), 0 表示不缓存。图片预处理 (resize、切 patch) 每次仍会执行, 因为需要它确定图片 token 数

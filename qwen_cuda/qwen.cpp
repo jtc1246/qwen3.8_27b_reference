@@ -356,7 +356,7 @@ void decode_step(const int* slots, const int* toks, int B) { // 槽 slots[b] 输
     Cu::d2h(G_dlogits, G_e.logits, (size_t)B * VOCAB * 4, st);
 }
 
-void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask, const int* pos3, bool need_logits) { // prefill 槽 G_pf_slot 的一个 chunk, 走当前 stream
+void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask, const int* pos3, bool need_logits) { // prefill 槽 G_pf_slot 的一个 chunk, 走当前 stream; embd: 本 chunk 第一个图片行 (只含 mask 为 1 的行)
     Slot& S = G_slots[G_pf_slot];
     for (int t = 0; t < T; t++)
         for (int j = 0; j < 3; j++) G_pos[t * 3 + j] = pos3 ? pos3[t * 3 + j] : S.next_pos + t;
@@ -366,7 +366,17 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
     CUdeviceptr d_mask = 0, d_embd = 0;
     if (mask) {
         Cu::h2d(G_d_mask, mask, T);
-        Cu::h2d(G_d_embd, embd, (size_t)T * D * 4);
+        for (int t = 0, j = 0; t < T;) { // 连续的图片行一次拷到 G_d_embd ([T][5120]) 的对应行, k_embed 按 mask 读第 t 行
+            if (!mask[t]) {
+                t++;
+                continue;
+            }
+            int t1 = t;
+            while (t1 < T && mask[t1]) t1++;
+            Cu::h2d(G_d_embd + (size_t)t * D * 4, embd + (size_t)j * D, (size_t)(t1 - t) * D * 4);
+            j += t1 - t;
+            t = t1;
+        }
         d_mask = G_d_mask;
         d_embd = G_d_embd;
     }
@@ -386,14 +396,15 @@ void reset_slot(int sq) { // 清空槽 sq 的 DeltaNet / conv 状态 (当前 str
 void prefill(int sq, const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3, bool fresh) { // 在调用线程上逐 chunk prefill 槽 sq, 返回时 G_logits 已就绪; fresh: 先清空槽
     G_pf_busy.store(1);
     G_pf_slot = sq;
-    for (int i = 0; i < n; i += CHUNK) {
+    for (int i = 0, r = 0; i < n; i += CHUNK) { // r: 之前各 chunk 的图片行数
         int sid = G_n_dec.load() ? Cu::ST_PF_PART : Cu::ST_PF; // 每个 chunk 重新选: 有 decode 在跑时只用 prefill 分区
         if (i && sid != G_pf_sid) Cu::ck(cuStreamSynchronize(Cu::G_sts[G_pf_sid]), "cuStreamSynchronize"); // 换 stream 前等上一个 chunk 算完
         if (!i || sid != G_pf_sid) Cu::use(sid);
         G_pf_sid = sid;
         if (!i && fresh) reset_slot(sq);
         int T = std::min(CHUNK, n - i);
-        eval_chunk(tokens + i, T, embd ? embd + (size_t)i * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+        eval_chunk(tokens + i, T, embd ? embd + (size_t)r * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+        for (int t = i; embd_mask && t < i + T; t++) r += embd_mask[t];
     }
     G_pf_busy.store(0);
 }
@@ -617,7 +628,7 @@ int qwen_init(const char* path, int device, int max_ctx) { // max_ctx: 每个槽
     return 0;
 }
 
-int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3) { // 直接模式 (槽 0, 不能与引擎模式同时用); embd/embd_mask/pos3 可为空, embd: [n][5120], pos3: [n][3] (t,h,w)
+int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3) { // 直接模式 (槽 0, 不能与引擎模式同时用); embd/embd_mask/pos3 可为空, embd: [embd_mask 中 1 的个数][5120] (按位置顺序), pos3: [n][3] (t,h,w)
     if (!G_inited || n <= 0) return -1;
     Slot& S = G_slots[0];
     if (S.n_past + n > G_max_ctx) {

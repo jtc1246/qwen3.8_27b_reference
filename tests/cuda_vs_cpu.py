@@ -67,7 +67,7 @@ def main():
     toks = rng.integers(0, 248000, n).tolist()
     mask = np.zeros(n, np.uint8) # [80]
     mask[10:50] = 1
-    embd = (rng.standard_normal((n, 5120)) * 0.02).astype(np.float32) # [80, 5120]
+    embd = np.ascontiguousarray((rng.standard_normal((n, 5120)) * 0.02).astype(np.float32)[mask == 1]) # [40, 5120], 只传 mask 为 1 的位置 (先生成 [80, 5120], 随机数与之前一致)
     pos3 = np.zeros((n, 3), np.int32) # [80, 3]
     pos3[:10] = np.arange(10)[:, None]
     pos3[10:50, 0] = 10

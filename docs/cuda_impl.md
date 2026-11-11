@@ -73,7 +73,7 @@ lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, �
 
 ## 4. 其他
 
-- 4 个非阻塞 stream (不与同进程 torch 的 legacy stream 隐式同步): prefill 整卡 / prefill 分区 / decode 整卡 / decode 分区; 整卡的在 primary context (与同进程 torch 共用), 分区的在两个 green context (`cuDevSmResourceSplit`, SM 不相交, 默认 decode 78 个、prefill 其余 78 个, `qwen_set_dec_sm` 在 init 前设置)。kernel 用 `cuLibraryLoadData` 加载 (与 context 无关, launch 时按 stream 所属的 context 执行), 显存在 primary context 分配, 各 context 都能访问; pinned 内存用 `CU_MEMHOSTALLOC_PORTABLE`
+- 4 个非阻塞 stream (不与同进程 torch 的 legacy stream 隐式同步): prefill 整卡 / prefill 分区 / decode 整卡 / decode 分区; 整卡的在 primary context (与同进程 torch 共用), 分区的在两个 green context (`cuDevSmResourceSplit`, SM 不相交, decode 分区的 SM 数用 `qwen_set_dec_sm` 在 init 前设置; server.py 用 `--dec-ratio` 比例换算 (默认 0.31, 取最近的偶数个且两边都至少 8 个), 本卡为 decode 48 个、prefill 108 个)。kernel 用 `cuLibraryLoadData` 加载 (与 context 无关, launch 时按 stream 所属的 context 执行), 显存在 primary context 分配, 各 context 都能访问; pinned 内存用 `CU_MEMHOSTALLOC_PORTABLE`
 - decode 每步 B (1~4) 个槽各 1 个 token 拼成 T = B 一起算: 读一遍权重给 B 个 token 用。整卡 / 分区 × B = 1..4 共 8 个 CUDA Graph 在初始化时全部捕获, 之后每步只拷 token / 位置 / n_past / 槽号再重放; n_past 放在显存里, `k_attn_dec_b` 的 grid 固定为 4 × ATT_SPLIT × B, 多余的段直接退出。直接模式的 T = 1 decode 也走这里 (B = 1)
 - CUDA context 是每线程的, prefill / decode 选 stream 时同时 `cuCtxSetCurrent` (server.py 会从不同的 HTTP 线程调用)
 - CUDA 出错直接打印并 `_Exit(1)`
@@ -133,11 +133,11 @@ prefill 与 decode 同时跑 (prefill 4096 token, 括号内是相对各自单独
 
 | decode 分区 SM 数 | 1 个 decode: prefill / decode tok/s | 3 个 decode: prefill / decode 合计 tok/s |
 |---|---|---|
-| 48 | 1261 (53%) / 52.6 (80%) | 1354 (56%) / 64.4 (43%) |
-| 78 (默认) | 671 (28%) / 62.7 (95%) | 967 (40%) / 102 (68%) |
+| 48 (默认) | 1261 (53%) / 52.6 (80%) | 1354 (56%) / 64.4 (43%) |
+| 78 | 671 (28%) / 62.7 (95%) | 967 (40%) / 102 (68%) |
 | 108 | 367 (15%) / 63.5 (96%) | 546 (23%) / 120 (80%) |
 
-decode 每 token 最大间隔: 78 时 1 个 decode 约 17ms, 3 个约 30ms; 48 时 3 个约 47ms。只有 decode 时 B = 1 的 decode 基本吃满显存带宽, 分区后 prefill 被拖得很重 (显存带宽 / L2 争用)。
+表中 SM 数对应比例约 0.31 / 0.5 / 0.69。decode 每 token 最大间隔: 78 时 1 个 decode 约 17ms, 3 个约 30ms; 48 时 3 个约 47ms。只有 decode 时 B = 1 的 decode 基本吃满显存带宽, 分区后 prefill 被拖得很重 (显存带宽 / L2 争用)。
 
 不足 16 个 token 的 prompt 走 GEMV (T < 16), 16 个以上走 tensor core GEMM, 后者在 token 少时 block 数少, 16~100 个 token 的 prefill 都要约 110ms (改动前就是这样)。
 

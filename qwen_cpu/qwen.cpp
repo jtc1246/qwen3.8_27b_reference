@@ -260,11 +260,11 @@ void full_attn(Layer& L, int T) {
     Ops::matmul(L.wo, G_att, T, G_out);
 }
 
-void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask, const int* pos3, bool need_logits) {
-    for (int t = 0; t < T; t++) {
+void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask, const int* pos3, bool need_logits) { // embd: 本 chunk 第一个图片行 (只含 mask 为 1 的行)
+    for (int t = 0, j = 0; t < T; t++) {
         float* x = G_x + (size_t)t * D;
         if (mask && mask[t])
-            memcpy(x, embd + (size_t)t * D, D * sizeof(float));
+            memcpy(x, embd + (size_t)j++ * D, D * sizeof(float));
         else
             Quants::dequant_row(G_tok_embd.type, G_tok_embd.data + (size_t)tokens[t] * G_tok_embd.rb, x, D);
         for (int j = 0; j < 3; j++) {
@@ -409,7 +409,7 @@ int qwen_init(const char* path, int n_threads, int max_ctx) {
     return 0;
 }
 
-int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3) { // embd/embd_mask/pos3 可为空, embd: [n][5120], pos3: [n][3] (t,h,w)
+int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3) { // embd/embd_mask/pos3 可为空, embd: [embd_mask 中 1 的个数][5120] (按位置顺序), pos3: [n][3] (t,h,w)
     if (!G_inited || n <= 0) return -1;
     if (G_n_past + n > G_max_ctx) {
         fprintf(stderr, "❌ 超出最大上下文 %d (已有 %d, 新增 %d)\n", G_max_ctx, G_n_past, n);
@@ -421,9 +421,10 @@ int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_m
             return -3;
         }
     }
-    for (int i = 0; i < n; i += CHUNK) {
+    for (int i = 0, r = 0; i < n; i += CHUNK) { // r: 之前各 chunk 的图片行数
         int T = std::min(CHUNK, n - i);
-        eval_chunk(tokens + i, T, embd ? embd + (size_t)i * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+        eval_chunk(tokens + i, T, embd ? embd + (size_t)r * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+        for (int t = i; embd_mask && t < i + T; t++) r += embd_mask[t];
     }
     return 0;
 }
