@@ -1,6 +1,8 @@
 // Qwen3.8-27B (qwen35 架构) CUDA 推理, 输入 GGUF (Q4_K_M), 通过 extern "C" 给 python ctypes 调用
 // host 端只用 CUDA driver API (libcuda.so.1), kernel 编译成 fatbin 嵌在 so 里; 接口与 qwen_cpu 一致 (qwen_init 第二个参数改为 GPU 编号)
+// 另有引擎模式 (qwen_prefill / qwen_next / qwen_decode_loop): 4 个序列槽, prefill 按 FIFO 逐个算, decode 所有序列每步一起算, 两者同时运行时用两个 green context 分 SM
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -27,6 +29,10 @@ const int LK = 16, LV = 48, LHD = 128;
 const int KEY_DIM = LK * LHD, V_DIM = LV * LHD, QKV_DIM = 2 * KEY_DIM + V_DIM;
 const int Q_DIM = N_HEAD * HD * 2, KV_DIM = N_KV * HD, ATT_DIM = N_HEAD * HD;
 const int CHUNK = 1024; // prefill 每批处理的 token 数
+const int NSEQ = 4; // 序列槽数: 最多 4 个请求同时进行 (prefill + decode), 启动时全部分配
+const int N_REC = 48; // DeltaNet 层数
+const size_t SS_FLOATS = (size_t)LV * LHD * LHD, CS_FLOATS = (size_t)QKV_DIM * 3; // 每层 DeltaNet 状态 [48][128][128] / conv 状态 [10240][3]
+const size_t SLOT_FLOATS = N_REC * (SS_FLOATS + CS_FLOATS); // 每槽状态连续存放: [48 层 DeltaNet][48 层 conv], 共 149.6MiB
 const int ATT_SPLIT = 78; // decode 注意力沿序列最多切的段数, 与 kernels.cu 一致
 const int FA_SMEM = (64 + 4 * 32) * (HD + 8) * 2; // k_attn_pf 的动态 smem: sq [64][264] + sk/sv [2][32][264] (fp16), 101376 字节
 const float THETA = 1e7f;
@@ -57,7 +63,7 @@ CUdeviceptr G_dbase = 0;
 Layer G_layers[N_LAYER];
 Weight G_tok_embd, G_output;
 CUdeviceptr G_output_norm = 0;
-int G_max_ctx = 0, G_n_past = 0, G_next_pos = 0;
+int G_max_ctx = 0, G_dec_sm = 78; // G_max_ctx: 每槽上下文; G_dec_sm: prefill 和 decode 同时运行时 decode 分区的 SM 数
 bool G_inited = false;
 uint64_t G_rng = 0x853c49e6748fea9bULL;
 struct MmGroup { // 与 kernels.cu 的 MmGroup 布局一致
@@ -68,16 +74,55 @@ struct MmGroup { // 与 kernels.cu 的 MmGroup 布局一致
 };
 
 CUfunction G_k_gemv, G_k_gemv_glu, G_k_gemv1, G_k_gemv1_glu, G_k_gemm[16], G_k_dq[16], G_k_embed[16], G_k_add_norm, G_k_silu_mul, G_k_dn_prep, G_k_dn_rec, G_k_dn_post, G_k_qk_rope, G_k_attn_pf, G_k_attn_dec, G_k_attn_merge, G_k_repack;
-bool G_xperm = false; // 当前 forward 是 T = 1: GEMV 的输入 (xn/o/att/h) 是 xperm 布局
+CUfunction G_k_dn_prep_b, G_k_dn_rec_b, G_k_qk_rope_b, G_k_attn_dec_b, G_k_attn_merge_b;
+bool G_xperm = false; // 当前 forward 是 T < 16: GEMV 的输入 (xn/o/att/h) 是 xperm 布局; 只在 prefill 线程和初始化时用
 CUdeviceptr G_d_x, G_d_xn, G_d_out, G_d_qkv, G_d_z, G_d_a, G_d_b, G_d_o, G_d_qg, G_d_k, G_d_v, G_d_att, G_d_g, G_d_u, G_d_h; // matmul 的输入 xn/o/att/h 是 fp16, 其余 fp32
-CUdeviceptr G_d_logits, G_d_hidden, G_d_tok, G_d_mask, G_d_embd, G_d_pos, G_d_inv_freq, G_d_conv_all, G_d_ssm_all, G_d_po, G_d_pml, G_d_cv, G_d_qk, G_d_of, G_d_np; // cv/qk/of: DeltaNet 预处理后的 qkv、q·k、未归一化输出 (fp32); np: n_past (int)
-CUgraphExec G_graph = nullptr; // decode (T = 1) 的 CUDA Graph
-float* G_logits = nullptr; // pinned host 内存
+CUdeviceptr G_d_logits, G_d_hidden, G_d_tok, G_d_mask, G_d_embd, G_d_pos, G_d_inv_freq, G_d_state, G_d_po, G_d_pml, G_d_cv, G_d_qk, G_d_of, G_d_np; // cv/qk/of: DeltaNet 预处理后的 qkv、q·k、未归一化输出 (fp32); np: n_past (int)
+// G_d_*: prefill 的激活缓冲 (CHUNK 个 token); G_d_state: 各槽状态 [NSEQ][SLOT_FLOATS]
+struct DecBuf { // decode (每步 B <= NSEQ 个 token) 的激活缓冲, 与 prefill 分开 (两者同时运行)
+    CUdeviceptr x, xn, out, qkv, z, a, b, o, qg, k, v, att, h, cv, qk, of, po, pml, logits, hidden;
+    CUdeviceptr in; // int: tok [NSEQ], pos [NSEQ][3], np [NSEQ], slot [NSEQ]
+} G_e;
+CUgraphExec G_bgraph[2][NSEQ + 1] = {}; // 多序列 decode 的 CUDA Graph, [整卡 / 分区][B], 初始化时全部捕获
+float* G_logits = nullptr; // pinned host 内存, prefill 的 logits [VOCAB]
+float* G_dlogits = nullptr; // pinned, decode 的 logits [NSEQ][VOCAB]
+float* G_cur_logits = nullptr; // 直接模式 (qwen_eval) 最近一次的 logits
+CUdeviceptr G_cur_hidden = 0;
 vector<float> G_hidden;
 int G_pos[CHUNK * 3];
-vector<float> G_work;
-vector<int> G_idx;
-vector<uint8_t> G_seen;
+
+// 引擎模式: python 每个请求一个线程调用 qwen_prefill (按 ticket FIFO, 同时只有一个在算) + qwen_next, 另一个 python 线程跑 qwen_decode_loop
+// 等待都用 futex 直接 syscall; 并发路径上不分配内存 (musl 没有自己创建的线程时 malloc 不加锁, 这里的线程都是 python 的)
+struct Slot {
+    int n_past = 0, next_pos = 0; // 同一时刻只有 prefill 线程或 decode 线程在用
+    std::atomic<int> state{0}; // 1: decode 中, 由 decode 循环推进
+    std::atomic<int> cancel{0};
+    std::atomic<int> n_out{0}, done{0}; // 已生成 token 数; done: 0 进行中, 1 遇到停止 token, 2 达到长度上限, 3 取消
+    std::atomic<uint32_t> ver{0}; // 产生 token 或结束时 +1, qwen_next 在上面等
+    int rd = 0; // qwen_next 已读到的位置
+    int* out = nullptr; // 生成的 token [max_ctx], 也是 presence penalty 的历史
+    int max_new = 0, n_stop = 0, stop[8] = {}, top_k = 0;
+    float temp = 0, top_p = 1, min_p = 0, pp = 0;
+    uint64_t rng = 0;
+    float* work = nullptr; // 采样临时空间, 各 VOCAB 个
+    int* idx = nullptr;
+    uint8_t* seen = nullptr;
+    double* p = nullptr;
+};
+Slot G_slots[NSEQ]; // 直接模式 (qwen_eval / qwen_sample / qwen_reset) 用槽 0
+std::atomic<uint32_t> G_pf_turn{0}; // 当前可以 prefill 的 ticket
+std::atomic<uint32_t> G_dec_wake{0}; // 有槽进入 decode 时 +1
+std::atomic<int> G_n_dec{0}, G_pf_busy{0}; // decode 中的槽数, 是否有 prefill 在算: 两者都有时各用自己的分区, 否则用整卡
+int G_pf_slot = 0, G_pf_sid = 0; // 当前 prefill 的槽和 stream
+
+long futex(void* addr, int op, uint32_t val) { // 直接 syscall, 不经过 libc (musl 的 errno 在 glibc 线程里不可用)
+    long r;
+    register void* tmo __asm__("r10") = nullptr;
+    __asm__ volatile("syscall" : "=a"(r) : "0"(202L), "D"(addr), "S"((long)op), "d"((long)val), "r"(tmo) : "rcx", "r11", "memory");
+    return r;
+}
+void fwait(std::atomic<uint32_t>& a, uint32_t old) { futex(&a, 128, old); } // FUTEX_WAIT_PRIVATE: 值仍是 old 才睡眠, 调用方循环检查
+void fwake(std::atomic<uint32_t>& a) { futex(&a, 129, 0x7fffffff); } // FUTEX_WAKE_PRIVATE
 
 inline CUdeviceptr fp(CUdeviceptr base, size_t n_floats) { return base + n_floats * sizeof(float); } // 设备指针按 float 偏移
 
@@ -174,7 +219,7 @@ void gemv(const Weight* const* ws, const CUdeviceptr* ys, int cnt, bool glu, CUd
     }
     g.cnt = glu ? 1 : cnt;
     g.glu = glu;
-    g.xp = T == 1 && G_xperm;
+    g.xp = T < 16 && G_xperm;
     if (glu) rows = ws[0]->n;
     CUfunction f = T == 1 ? (glu ? G_k_gemv1_glu : G_k_gemv1) : (glu ? G_k_gemv_glu : G_k_gemv);
     Cu::launch(f, (rows + 1) / 2, 1, 64, g, ws[0]->k, x, T);
@@ -189,13 +234,25 @@ void matmul(const Weight& w, CUdeviceptr x, int T, CUdeviceptr y) { // token 数
     Cu::launch(G_k_gemm[w.type], (T + 63) / 64, (w.n + 63) / 64, 128, w.data, w.rb, w.k, w.n, x, T, y);
 }
 
+Layer seq_layer(int l, int sq) { // 第 l 层, 状态和 KV 指向槽 sq
+    Layer L = G_layers[l];
+    if (L.recr) {
+        L.conv_state = fp(L.conv_state, sq * SLOT_FLOATS);
+        L.ssm_state = fp(L.ssm_state, sq * SLOT_FLOATS);
+    } else {
+        size_t r = (size_t)sq * G_max_ctx;
+        L.k_cache += r * KV_DIM, L.v_cache += r * KV_DIM, L.k_scale += r * 64, L.v_scale += r * 64;
+    }
+    return L;
+}
+
 void add_norm(CUdeviceptr add, CUdeviceptr w, CUdeviceptr hidden, int T) { Cu::launch(G_k_add_norm, T, 1, 1024, G_d_x, add, w, G_d_xn, hidden, T); }
 
-void forward(int T, CUdeviceptr d_mask, CUdeviceptr d_embd, bool need_logits) { // 一个 chunk 的全部 kernel (输入已在显存: token、位置、n_past); 只 launch, 不同步, 可被 CUDA Graph 捕获
-    G_xperm = T == 1; // T = 1 时各 kernel 把 GEMV 输入写成 xperm 布局; T > 1 时只有末尾 lm_head 走 GEMV, 输入是正常布局
+void forward(int T, CUdeviceptr d_mask, CUdeviceptr d_embd, bool need_logits) { // prefill 槽 G_pf_slot 的一个 chunk 的全部 kernel (输入已在显存: token、位置、n_past); 只 launch, 不同步
+    G_xperm = T < 16; // T < 16 时各 kernel 把 GEMV 输入写成 xperm 布局; 否则只有末尾 lm_head 走 GEMV, 输入是正常布局
     Cu::launch(G_k_embed[G_tok_embd.type], T, 1, 256, G_tok_embd.data, G_tok_embd.rb, G_d_tok, d_mask, d_embd, G_d_x);
     for (int l = 0; l < N_LAYER; l++) {
-        Layer& L = G_layers[l];
+        Layer L = seq_layer(l, G_pf_slot);
         add_norm(l ? G_d_out : 0, L.attn_norm, fp(G_d_hidden, (size_t)l * D), T); // 先加上一层 FFN 的残差, 同时保存上一层输出
         if (L.recr) {
             if (T < 16) {
@@ -227,7 +284,7 @@ void forward(int T, CUdeviceptr d_mask, CUdeviceptr d_embd, bool need_logits) { 
                 Cu::launch(G_k_attn_dec, N_KV, ATT_SPLIT, 128, G_d_qg, L.k_cache, L.v_cache, L.k_scale, L.v_scale, G_d_po, G_d_pml, G_d_np);
                 Cu::launch(G_k_attn_merge, N_HEAD, 1, 256, G_d_qg, G_d_po, G_d_pml, G_d_np, G_d_att);
             } else {
-                Cu::launch_s(G_k_attn_pf, (T + 63) / 64, N_HEAD, 128, FA_SMEM, G_d_qg, L.k_cache, L.v_cache, L.k_scale, L.v_scale, G_d_att, G_n_past, T);
+                Cu::launch_s(G_k_attn_pf, (T + 63) / 64, N_HEAD, 128, FA_SMEM, G_d_qg, L.k_cache, L.v_cache, L.k_scale, L.v_scale, G_d_att, G_slots[G_pf_slot].n_past, T);
             }
             matmul(L.wo, G_d_att, T, G_d_out);
         }
@@ -247,12 +304,65 @@ void forward(int T, CUdeviceptr d_mask, CUdeviceptr d_embd, bool need_logits) { 
     if (need_logits) matmul(G_output, G_d_xn + (size_t)(T - 1) * D * 2, 1, G_d_logits);
 }
 
-void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask, const int* pos3, bool need_logits) {
+void forward_batch(int B) { // 多序列 decode: B 个槽各 1 个 token (输入在 G_e.in), logits [B][VOCAB]; 只在初始化时被捕获成 CUDA Graph
+    G_xperm = true;
+    uint64_t ctx = (uint64_t)G_max_ctx, ss = SLOT_FLOATS;
+    CUdeviceptr tok = G_e.in, pos = G_e.in + NSEQ * 4, np = G_e.in + NSEQ * 16, slot = G_e.in + NSEQ * 20;
+    Cu::launch(G_k_embed[G_tok_embd.type], B, 1, 256, G_tok_embd.data, G_tok_embd.rb, tok, (CUdeviceptr)0, (CUdeviceptr)0, G_e.x);
+    for (int l = 0; l < N_LAYER; l++) {
+        Layer& L = G_layers[l]; // 槽 0 的指针, 批量 kernel 按 slot 偏移
+        Cu::launch(G_k_add_norm, B, 1, 1024, G_e.x, l ? G_e.out : (CUdeviceptr)0, L.attn_norm, G_e.xn, fp(G_e.hidden, (size_t)l * D), B);
+        if (L.recr) {
+            const Weight* ws[4] = {&L.qkv, &L.gate_z, &L.alpha, &L.beta};
+            CUdeviceptr ys[4] = {G_e.qkv, G_e.z, G_e.a, G_e.b};
+            gemv(ws, ys, 4, false, G_e.xn, B);
+            Cu::launch(G_k_dn_prep_b, B, LK, 128, G_e.qkv, L.conv_state, L.conv_w, G_e.cv, G_e.a, G_e.b, L.ssm_a, L.dt_bias, G_e.qk, slot, ss);
+            Cu::launch3(G_k_dn_rec_b, LV, 4, B, 128, G_e.qkv, L.conv_state, G_e.cv, G_e.a, G_e.b, G_e.qk, L.ssm_state, G_e.of, slot, ss);
+            Cu::launch(G_k_dn_post, B, LV, 128, G_e.of, G_e.z, L.ssm_norm, G_e.o);
+            matmul(L.ssm_out, G_e.o, B, G_e.out);
+        } else {
+            const Weight* ws[3] = {&L.wq, &L.wk, &L.wv};
+            CUdeviceptr ys[3] = {G_e.qg, G_e.k, G_e.v};
+            gemv(ws, ys, 3, false, G_e.xn, B);
+            Cu::launch(G_k_qk_rope_b, B, N_HEAD + N_KV, 256, G_e.qg, G_e.k, G_e.v, L.q_norm, L.k_norm, pos, G_d_inv_freq, L.k_cache, L.v_cache, L.k_scale, L.v_scale, np, slot, ctx);
+            Cu::launch3(G_k_attn_dec_b, N_KV, ATT_SPLIT, B, 128, G_e.qg, L.k_cache, L.v_cache, L.k_scale, L.v_scale, G_e.po, G_e.pml, np, slot, ctx);
+            Cu::launch(G_k_attn_merge_b, N_HEAD, B, 256, G_e.qg, G_e.po, G_e.pml, np, G_e.att);
+            matmul(L.wo, G_e.att, B, G_e.out);
+        }
+        Cu::launch(G_k_add_norm, B, 1, 1024, G_e.x, G_e.out, L.post_norm, G_e.xn, (CUdeviceptr)0, B);
+        const Weight* wg[2] = {&L.ffn_gate, &L.ffn_up};
+        gemv(wg, &G_e.h, 2, true, G_e.xn, B);
+        matmul(L.ffn_down, G_e.h, B, G_e.out);
+    }
+    Cu::launch(G_k_add_norm, B, 1, 1024, G_e.x, G_e.out, G_output_norm, G_e.xn, fp(G_e.hidden, (size_t)N_LAYER * D), B);
+    matmul(G_output, G_e.xn, B, G_e.logits);
+}
+
+void decode_step(const int* slots, const int* toks, int B) { // 槽 slots[b] 输入 toks[b], 一起算一步 (重放 CUDA Graph), logits 到 G_dlogits [B][VOCAB]; 有 prefill 在算时用 decode 分区, 否则整卡
+    int part = G_pf_busy.load() ? 1 : 0, sid = part ? Cu::ST_DEC_PART : Cu::ST_DEC;
+    CUstream st = Cu::G_sts[sid];
+    Cu::ck(cuCtxSetCurrent(Cu::G_ctxs[sid]), "cuCtxSetCurrent");
+    int in[NSEQ * 6] = {};
+    for (int b = 0; b < B; b++) {
+        Slot& S = G_slots[slots[b]];
+        in[b] = toks[b];
+        in[NSEQ + b * 3] = in[NSEQ + b * 3 + 1] = in[NSEQ + b * 3 + 2] = S.next_pos;
+        in[NSEQ * 4 + b] = S.n_past;
+        in[NSEQ * 5 + b] = slots[b];
+    }
+    Cu::h2d(G_e.in, in, sizeof(in), st);
+    Cu::ck(cuGraphLaunch(G_bgraph[part][B], st), "cuGraphLaunch");
+    for (int b = 0; b < B; b++) G_slots[slots[b]].n_past++, G_slots[slots[b]].next_pos++;
+    Cu::d2h(G_dlogits, G_e.logits, (size_t)B * VOCAB * 4, st);
+}
+
+void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask, const int* pos3, bool need_logits) { // prefill 槽 G_pf_slot 的一个 chunk, 走当前 stream
+    Slot& S = G_slots[G_pf_slot];
     for (int t = 0; t < T; t++)
-        for (int j = 0; j < 3; j++) G_pos[t * 3 + j] = pos3 ? pos3[t * 3 + j] : G_next_pos + t;
+        for (int j = 0; j < 3; j++) G_pos[t * 3 + j] = pos3 ? pos3[t * 3 + j] : S.next_pos + t;
     Cu::h2d(G_d_tok, tokens, (size_t)T * 4);
     Cu::h2d(G_d_pos, G_pos, (size_t)T * 3 * 4);
-    Cu::h2d(G_d_np, &G_n_past, 4);
+    Cu::h2d(G_d_np, &S.n_past, 4);
     CUdeviceptr d_mask = 0, d_embd = 0;
     if (mask) {
         Cu::h2d(G_d_mask, mask, T);
@@ -260,28 +370,46 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
         d_mask = G_d_mask;
         d_embd = G_d_embd;
     }
-    if (T == 1 && !mask && need_logits) { // 普通 decode: 第一次捕获成 CUDA Graph, 之后直接重放 (kernel 参数都不随 token 变化)
-        if (!G_graph) {
-            CUgraph g;
-            Cu::ck(cuStreamBeginCapture(Cu::G_stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL), "cuStreamBeginCapture");
-            forward(T, 0, 0, true);
-            Cu::ck(cuStreamEndCapture(Cu::G_stream, &g), "cuStreamEndCapture");
-            Cu::ck(cuGraphInstantiate(&G_graph, g, 0), "cuGraphInstantiate");
-            Cu::ck(cuGraphDestroy(g), "cuGraphDestroy");
-        }
-        Cu::ck(cuGraphLaunch(G_graph, Cu::G_stream), "cuGraphLaunch");
-    } else {
-        forward(T, d_mask, d_embd, need_logits);
-    }
-    int mx = G_next_pos - 1;
+    forward(T, d_mask, d_embd, need_logits);
+    int mx = S.next_pos - 1;
     for (int i = 0; i < T * 3; i++) mx = std::max(mx, G_pos[i]);
-    G_next_pos = mx + 1; // 后续默认位置接在最大位置之后, 与 HF get_rope_index 一致
-    G_n_past += T;
+    S.next_pos = mx + 1; // 后续默认位置接在最大位置之后, 与 HF get_rope_index 一致
+    S.n_past += T;
     if (need_logits) Cu::d2h(G_logits, G_d_logits, (size_t)VOCAB * 4);
 }
 
-uint64_t rng_next() { // splitmix64
-    uint64_t z = (G_rng += 0x9e3779b97f4a7c15ULL);
+void reset_slot(int sq) { // 清空槽 sq 的 DeltaNet / conv 状态 (当前 stream, 异步); KV 不用清
+    Cu::ck(cuMemsetD8Async(fp(G_d_state, sq * SLOT_FLOATS), 0, SLOT_FLOATS * 4, Cu::G_stream), "cuMemsetD8Async");
+    G_slots[sq].n_past = G_slots[sq].next_pos = 0;
+}
+
+void prefill(int sq, const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3, bool fresh) { // 在调用线程上逐 chunk prefill 槽 sq, 返回时 G_logits 已就绪; fresh: 先清空槽
+    G_pf_busy.store(1);
+    G_pf_slot = sq;
+    for (int i = 0; i < n; i += CHUNK) {
+        int sid = G_n_dec.load() ? Cu::ST_PF_PART : Cu::ST_PF; // 每个 chunk 重新选: 有 decode 在跑时只用 prefill 分区
+        if (i && sid != G_pf_sid) Cu::ck(cuStreamSynchronize(Cu::G_sts[G_pf_sid]), "cuStreamSynchronize"); // 换 stream 前等上一个 chunk 算完
+        if (!i || sid != G_pf_sid) Cu::use(sid);
+        G_pf_sid = sid;
+        if (!i && fresh) reset_slot(sq);
+        int T = std::min(CHUNK, n - i);
+        eval_chunk(tokens + i, T, embd ? embd + (size_t)i * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+    }
+    G_pf_busy.store(0);
+}
+
+int check_tokens(const int* tokens, int n, const uint8_t* embd_mask) {
+    for (int i = 0; i < n; i++) {
+        if ((!embd_mask || !embd_mask[i]) && (tokens[i] < 0 || tokens[i] >= VOCAB)) {
+            fprintf(stderr, "❌ token id 越界: %d\n", tokens[i]);
+            return -3;
+        }
+    }
+    return 0;
+}
+
+uint64_t rng_next(uint64_t& st) { // splitmix64
+    uint64_t z = (st += 0x9e3779b97f4a7c15ULL);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
     return z ^ (z >> 31);
@@ -298,13 +426,16 @@ uint16_t f2h_exact(float f) { // 只用于自测: f 必须能被 fp16 精确表�
 
 extern "C" {
 
-int qwen_init(const char* path, int device, int max_ctx) {
+void qwen_set_dec_sm(int n) { G_dec_sm = n; } // 在 qwen_init 之前调用: prefill 和 decode 同时运行时 decode 分区的 SM 数 (其余给 prefill)
+int qwen_nseq() { return NSEQ; }
+
+int qwen_init(const char* path, int device, int max_ctx) { // max_ctx: 每个槽的上下文, NSEQ 个槽的 KV 全部预先分配
     if (G_inited) {
         fprintf(stderr, "⚠️ 模型已经加载过\n");
         return 0;
     }
     auto t0 = std::chrono::steady_clock::now();
-    Cu::init(device, qwen_fatbin);
+    Cu::init(device, qwen_fatbin, G_dec_sm);
     const char* tnames[] = {"f32", "", "", "", "", "", "", "", "q8_0", "", "", "", "q4_k", "q5_k", "q6_k"};
     for (int t = 0; t < 15; t++) {
         if (!tnames[t][0]) continue;
@@ -323,9 +454,14 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_k_dn_post = Cu::func("k_dn_post");
     G_k_qk_rope = Cu::func("k_qk_rope");
     G_k_attn_pf = Cu::func("k_attn_pf");
-    Cu::ck(cuFuncSetAttribute(G_k_attn_pf, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, FA_SMEM), "cuFuncSetAttribute");
+    Cu::ck(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, FA_SMEM, (CUkernel)G_k_attn_pf, Cu::G_dev), "cuKernelSetAttribute");
     G_k_attn_dec = Cu::func("k_attn_dec");
     G_k_attn_merge = Cu::func("k_attn_merge");
+    G_k_dn_prep_b = Cu::func("k_dn_prep_b");
+    G_k_dn_rec_b = Cu::func("k_dn_rec_b");
+    G_k_qk_rope_b = Cu::func("k_qk_rope_b");
+    G_k_attn_dec_b = Cu::func("k_attn_dec_b");
+    G_k_attn_merge_b = Cu::func("k_attn_merge_b");
     G_k_repack = Cu::func("k_repack");
     if (!Gguf::open(G_file, path)) return -1;
     if (G_file.kv_str["general.architecture"] != "qwen35") {
@@ -357,9 +493,8 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_tok_embd = get_w("token_embd.weight", D, VOCAB);
     G_output = get_w("output.weight", D, VOCAB);
     G_output_norm = get_f("output_norm.weight", D);
-    G_d_conv_all = Cu::alloc((size_t)N_LAYER * QKV_DIM * 3 * 4);
-    G_d_ssm_all = Cu::alloc((size_t)N_LAYER * LV * LHD * LHD * 4);
-    for (int l = 0; l < N_LAYER; l++) {
+    G_d_state = Cu::alloc(NSEQ * SLOT_FLOATS * 4);
+    for (int l = 0, rl = 0; l < N_LAYER; l++) { // rl: 第几个 DeltaNet 层
         Layer& L = G_layers[l];
         string p = "blk." + std::to_string(l) + ".";
         L.recr = (l + 1) % 4 != 0;
@@ -378,8 +513,9 @@ int qwen_init(const char* path, int device, int max_ctx) {
             L.dt_bias = get_f(p + "ssm_dt.bias", LV);
             L.conv_w = get_f(p + "ssm_conv1d.weight", (int64_t)QKV_DIM * 4);
             L.ssm_norm = get_f(p + "ssm_norm.weight", LHD);
-            L.conv_state = fp(G_d_conv_all, (size_t)l * QKV_DIM * 3);
-            L.ssm_state = fp(G_d_ssm_all, (size_t)l * LV * LHD * LHD);
+            L.ssm_state = fp(G_d_state, rl * SS_FLOATS); // 槽 0, 槽 s 再加 s * SLOT_FLOATS
+            L.conv_state = fp(G_d_state, N_REC * SS_FLOATS + rl * CS_FLOATS);
+            rl++;
             continue;
         }
         L.wq = get_w(p + "attn_q.weight", D, Q_DIM);
@@ -388,10 +524,10 @@ int qwen_init(const char* path, int device, int max_ctx) {
         L.wo = get_w(p + "attn_output.weight", ATT_DIM, D);
         L.q_norm = get_f(p + "attn_q_norm.weight", HD);
         L.k_norm = get_f(p + "attn_k_norm.weight", HD);
-        L.k_cache = Cu::alloc((size_t)max_ctx * KV_DIM);
-        L.v_cache = Cu::alloc((size_t)max_ctx * KV_DIM);
-        L.k_scale = Cu::alloc((size_t)max_ctx * 32 * 2);
-        L.v_scale = Cu::alloc((size_t)max_ctx * 32 * 2);
+        L.k_cache = Cu::alloc((size_t)NSEQ * max_ctx * KV_DIM); // [槽][max_ctx][1024]
+        L.v_cache = Cu::alloc((size_t)NSEQ * max_ctx * KV_DIM);
+        L.k_scale = Cu::alloc((size_t)NSEQ * max_ctx * 32 * 2);
+        L.v_scale = Cu::alloc((size_t)NSEQ * max_ctx * 32 * 2);
     }
     float inv_freq[ROT / 2];
     for (int i = 0; i < ROT / 2; i++) inv_freq[i] = 1.0f / powf(THETA, (float)(2 * i) / ROT); // 与 HF 一致用 fp32 计算
@@ -424,57 +560,105 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_d_np = Cu::alloc(4);
     G_d_po = Cu::alloc((size_t)ATT_SPLIT * ATT_DIM * 4);
     G_d_pml = Cu::alloc((size_t)ATT_SPLIT * N_HEAD * 8);
-    Cu::ck(cuMemAllocHost((void**)&G_logits, (size_t)VOCAB * 4), "cuMemAllocHost");
+    G_e.x = Cu::alloc((size_t)NSEQ * D * 4);
+    G_e.xn = Cu::alloc((size_t)NSEQ * D * 2);
+    G_e.out = Cu::alloc((size_t)NSEQ * D * 4);
+    G_e.qkv = Cu::alloc((size_t)NSEQ * QKV_DIM * 4);
+    G_e.z = Cu::alloc((size_t)NSEQ * V_DIM * 4);
+    G_e.a = Cu::alloc((size_t)NSEQ * LV * 4);
+    G_e.b = Cu::alloc((size_t)NSEQ * LV * 4);
+    G_e.o = Cu::alloc((size_t)NSEQ * V_DIM * 2);
+    G_e.qg = Cu::alloc((size_t)NSEQ * Q_DIM * 4);
+    G_e.k = Cu::alloc((size_t)NSEQ * KV_DIM * 4);
+    G_e.v = Cu::alloc((size_t)NSEQ * KV_DIM * 4);
+    G_e.att = Cu::alloc((size_t)NSEQ * ATT_DIM * 2);
+    G_e.h = Cu::alloc((size_t)NSEQ * FF * 2);
+    G_e.cv = Cu::alloc((size_t)NSEQ * QKV_DIM * 4);
+    G_e.qk = Cu::alloc((size_t)NSEQ * LK * 4);
+    G_e.of = Cu::alloc((size_t)NSEQ * V_DIM * 4);
+    G_e.po = Cu::alloc((size_t)NSEQ * ATT_SPLIT * ATT_DIM * 4);
+    G_e.pml = Cu::alloc((size_t)NSEQ * ATT_SPLIT * N_HEAD * 8);
+    G_e.logits = Cu::alloc((size_t)NSEQ * VOCAB * 4);
+    G_e.hidden = Cu::alloc((size_t)(N_LAYER + 1) * D * 4);
+    G_e.in = Cu::alloc(NSEQ * 6 * 4);
+    Cu::ck(cuMemHostAlloc((void**)&G_logits, (size_t)VOCAB * 4, CU_MEMHOSTALLOC_PORTABLE), "cuMemHostAlloc"); // PORTABLE: 在 green context 的 stream 上也按 pinned 处理
+    Cu::ck(cuMemHostAlloc((void**)&G_dlogits, (size_t)NSEQ * VOCAB * 4, CU_MEMHOSTALLOC_PORTABLE), "cuMemHostAlloc");
     memset(G_logits, 0, (size_t)VOCAB * 4);
+    memset(G_dlogits, 0, (size_t)NSEQ * VOCAB * 4);
+    G_cur_logits = G_logits;
+    G_cur_hidden = G_d_hidden;
     G_hidden.resize((size_t)(N_LAYER + 1) * D);
-    G_work.resize(VOCAB);
-    G_idx.resize(VOCAB);
-    G_seen.resize(VOCAB);
+    for (Slot& S : G_slots) {
+        S.out = new int[max_ctx];
+        S.work = new float[VOCAB];
+        S.idx = new int[VOCAB];
+        S.seen = new uint8_t[VOCAB]();
+        S.p = new double[VOCAB];
+    }
+    Cu::ck(cuStreamSynchronize(Cu::G_stream), "cuStreamSynchronize");
+    for (int part = 0; part < 2; part++) { // decode 的 CUDA Graph: 整卡 / 分区 x B = 1..NSEQ, 全部在这里捕获 (之后 decode 线程只重放, 不 launch)
+        Cu::use(part ? Cu::ST_DEC_PART : Cu::ST_DEC);
+        for (int B = 1; B <= NSEQ; B++) {
+            CUgraph g;
+            Cu::ck(cuStreamBeginCapture(Cu::G_stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL), "cuStreamBeginCapture");
+            forward_batch(B);
+            Cu::ck(cuStreamEndCapture(Cu::G_stream, &g), "cuStreamEndCapture");
+            Cu::ck(cuGraphInstantiate(&G_bgraph[part][B], g, 0), "cuGraphInstantiate");
+            Cu::ck(cuGraphDestroy(g), "cuGraphDestroy");
+        }
+    }
+    Cu::use(Cu::ST_PF);
     G_inited = true;
     size_t free_b = 0, total_b = 0;
     Cu::ck(cuStreamSynchronize(Cu::G_stream), "cuStreamSynchronize");
     Cu::ck(cuMemGetInfo(&free_b, &total_b), "cuMemGetInfo");
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "✅ 模型初始化完成, 最大上下文 %d, 显存已用 %.2f / %.2f GB, 耗时 %.1fs\n", max_ctx, (total_b - free_b) / 1073741824.0, total_b / 1073741824.0, sec);
+    fprintf(stderr, "✅ 模型初始化完成, %d 个槽, 每槽最大上下文 %d, 显存已用 %.2f / %.2f GB, 耗时 %.1fs\n", NSEQ, max_ctx, (total_b - free_b) / 1073741824.0, total_b / 1073741824.0, sec);
     return 0;
 }
 
-int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3) { // embd/embd_mask/pos3 可为空, embd: [n][5120], pos3: [n][3] (t,h,w)
+int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3) { // 直接模式 (槽 0, 不能与引擎模式同时用); embd/embd_mask/pos3 可为空, embd: [n][5120], pos3: [n][3] (t,h,w)
     if (!G_inited || n <= 0) return -1;
-    if (G_n_past + n > G_max_ctx) {
-        fprintf(stderr, "❌ 超出最大上下文 %d (已有 %d, 新增 %d)\n", G_max_ctx, G_n_past, n);
+    Slot& S = G_slots[0];
+    if (S.n_past + n > G_max_ctx) {
+        fprintf(stderr, "❌ 超出最大上下文 %d (已有 %d, 新增 %d)\n", G_max_ctx, S.n_past, n);
         return -2;
     }
-    for (int i = 0; i < n; i++) {
-        if ((!embd_mask || !embd_mask[i]) && (tokens[i] < 0 || tokens[i] >= VOCAB)) {
-            fprintf(stderr, "❌ token id 越界: %d\n", tokens[i]);
-            return -3;
-        }
+    if (check_tokens(tokens, n, embd_mask)) return -3;
+    if (n == 1 && !embd_mask && !pos3) { // 普通 decode: 走多序列 decode 的 CUDA Graph (B = 1)
+        int sq = 0;
+        decode_step(&sq, tokens, 1);
+        G_cur_logits = G_dlogits;
+        G_cur_hidden = G_e.hidden;
+        return 0;
     }
-    Cu::bind();
-    for (int i = 0; i < n; i += CHUNK) {
-        int T = std::min(CHUNK, n - i);
-        eval_chunk(tokens + i, T, embd ? embd + (size_t)i * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
-    }
+    prefill(0, tokens, n, embd, embd_mask, pos3, false);
+    G_cur_logits = G_logits;
+    G_cur_hidden = G_d_hidden;
     return 0;
 }
 
-int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist) {
-    float* l = G_logits; // 只读; 有 presence penalty 时才拷贝一份再改
+} // extern "C"
+
+namespace {
+
+int sample_impl(const float* logits, Slot& S, float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, uint64_t& rng) { // 临时空间用槽 S 的
+    const float* l = logits; // 只读; 有 presence penalty 时才拷贝一份再改
     if (presence_penalty != 0 && hist) {
-        l = G_work.data();
-        memcpy(l, G_logits, VOCAB * sizeof(float));
+        float* w = S.work;
+        memcpy(w, logits, VOCAB * sizeof(float));
+        l = w;
         for (int i = 0; i < n_hist; i++) {
             int t = hist[i];
-            if (t < 0 || t >= VOCAB || G_seen[t]) continue;
-            G_seen[t] = 1;
-            l[t] -= presence_penalty;
+            if (t < 0 || t >= VOCAB || S.seen[t]) continue;
+            S.seen[t] = 1;
+            w[t] -= presence_penalty;
         }
         for (int i = 0; i < n_hist; i++)
-            if (hist[i] >= 0 && hist[i] < VOCAB) G_seen[hist[i]] = 0;
+            if (hist[i] >= 0 && hist[i] < VOCAB) S.seen[hist[i]] = 0;
     }
     if (temperature <= 0) return (int)(std::max_element(l, l + VOCAB) - l);
-    int* idx = G_idx.data();
+    int* idx = S.idx;
     int n = (top_k > 0 && top_k < VOCAB) ? top_k : VOCAB;
     if (n <= 256) { // top_k 较小: 单遍扫描, 维护按 logit 降序的前 n 个 (多数元素只和当前第 n 大比较一次)
         int cnt = 0;
@@ -491,7 +675,7 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
         if (n < VOCAB) std::nth_element(idx, idx + n, idx + VOCAB, cmp);
         std::sort(idx, idx + n, cmp);
     }
-    vector<double> p(n);
+    double* p = S.p;
     double sum = 0;
     for (int i = 0; i < n; i++) {
         p[i] = std::exp((double)(l[idx[i]] - l[idx[0]]) / temperature);
@@ -512,7 +696,7 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
     }
     double tot = 0;
     for (int i = 0; i < keep; i++) tot += p[i];
-    double r = (rng_next() >> 11) * (1.0 / 9007199254740992.0) * tot;
+    double r = (rng_next(rng) >> 11) * (1.0 / 9007199254740992.0) * tot;
     for (int i = 0; i < keep; i++) {
         r -= p[i];
         if (r <= 0) return idx[i];
@@ -520,27 +704,146 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
     return idx[keep - 1];
 }
 
-void qwen_seed(uint64_t seed) { G_rng = seed; }
+} // namespace
 
-void qwen_reset() {
-    Cu::bind();
-    Cu::ck(cuMemsetD8Async(G_d_conv_all, 0, (size_t)N_LAYER * QKV_DIM * 3 * 4, Cu::G_stream), "cuMemsetD8Async");
-    Cu::ck(cuMemsetD8Async(G_d_ssm_all, 0, (size_t)N_LAYER * LV * LHD * LHD * 4, Cu::G_stream), "cuMemsetD8Async");
-    G_n_past = 0;
-    G_next_pos = 0;
+extern "C" {
+
+int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist) { // 直接模式: 从最近一次 qwen_eval 的 logits 采样
+    return sample_impl(G_cur_logits, G_slots[0], temperature, top_k, top_p, min_p, presence_penalty, hist, n_hist, G_rng);
 }
 
-int qwen_n_past() { return G_n_past; }
-float* qwen_logits() { return G_logits; }
+void qwen_seed(uint64_t seed) { G_rng = seed; } // 直接模式
+
+void qwen_reset() { // 直接模式: 清空槽 0
+    Cu::use(Cu::ST_PF);
+    reset_slot(0);
+    Cu::ck(cuStreamSynchronize(Cu::G_stream), "cuStreamSynchronize"); // 之后的 decode 走另一个 stream
+}
+
+int qwen_n_past() { return G_slots[0].n_past; }
+float* qwen_logits() { return G_cur_logits; }
 
 float* qwen_hidden() { // [65][5120], 0 是 embedding, i 是第 i 层输出, 都只保存最后一个 token
-    Cu::bind();
-    Cu::d2h(G_hidden.data(), G_d_hidden, G_hidden.size() * 4);
+    Cu::use(Cu::ST_PF);
+    Cu::d2h(G_hidden.data(), G_cur_hidden, G_hidden.size() * 4);
     return G_hidden.data();
 }
 
+int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3, float temperature, int top_k, float top_p, float min_p, float presence_penalty, uint64_t seed, int max_new, const int* stop, int n_stop) {
+    // 引擎模式: 按 ticket 顺序 (FIFO, 从 0 开始连续) 等前面的输入算完, 在调用线程上 prefill 槽 sq, 采样出第一个 token 后交给 decode 循环; 0 成功
+    // 失败也会让出 prefill (ticket 不能跳过); 成功后用 qwen_next 取 token
+    for (uint32_t t; (t = G_pf_turn.load()) != (uint32_t)ticket;) fwait(G_pf_turn, t);
+    auto t0 = std::chrono::steady_clock::now();
+    int ret = 0;
+    if (!G_inited || sq < 0 || sq >= NSEQ || G_slots[sq].state.load() || n <= 0 || n >= G_max_ctx || max_new < 1 || n_stop < 0 || n_stop > 8) {
+        fprintf(stderr, "❌ qwen_prefill 参数错误: 槽 %d, prompt %d (每槽上下文 %d), max_new %d, 停止 token %d 个\n", sq, n, G_max_ctx, max_new, n_stop);
+        ret = -1;
+    } else if (check_tokens(tokens, n, embd_mask)) {
+        ret = -3;
+    } else {
+        Slot& S = G_slots[sq];
+        S.temp = temperature, S.top_k = top_k, S.top_p = top_p, S.min_p = min_p, S.pp = presence_penalty, S.rng = seed;
+        S.max_new = max_new, S.n_stop = n_stop;
+        for (int i = 0; i < n_stop; i++) S.stop[i] = stop[i];
+        S.rd = 0;
+        S.n_out.store(0);
+        S.done.store(0);
+        S.cancel.store(0);
+        bool part = G_n_dec.load() > 0;
+        prefill(sq, tokens, n, embd, embd_mask, pos3, true);
+        int tok = sample_impl(G_logits, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, nullptr, 0, S.rng);
+        S.out[0] = tok;
+        S.n_out.store(1);
+        int fin = 0;
+        for (int i = 0; i < n_stop; i++) fin |= tok == stop[i];
+        if (!fin && (max_new <= 1 || S.n_past >= G_max_ctx)) fin = 2;
+        if (fin) {
+            S.done.store(fin);
+        } else {
+            G_n_dec.fetch_add(1);
+            S.state.store(1);
+            G_dec_wake.fetch_add(1);
+            fwake(G_dec_wake);
+        }
+        S.ver.fetch_add(1);
+        fwake(S.ver);
+        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "ℹ️ 槽 %d prefill %d tokens, %.2fs, %.1f tok/s (开始时%s)\n", sq, n, sec, n / sec, part ? "有 decode 在跑, 用 prefill 分区" : "整卡");
+    }
+    G_pf_turn.fetch_add(1);
+    fwake(G_pf_turn);
+    return ret;
+}
+
+int qwen_next(int sq, int* buf, int cap) { // 引擎模式: 等槽 sq 的新 token, 最多拷 cap 个到 buf, 返回个数; 已结束且全部读完返回 0
+    Slot& S = G_slots[sq];
+    while (true) {
+        uint32_t v = S.ver.load();
+        int d = S.done.load(), n = S.n_out.load(); // 先读 done 再读 n_out: done 是在最后一个 token 之后写的
+        if (n > S.rd) {
+            int c = std::min(cap, n - S.rd);
+            memcpy(buf, S.out + S.rd, (size_t)c * 4);
+            S.rd += c;
+            return c;
+        }
+        if (d) return 0;
+        fwait(S.ver, v);
+    }
+}
+
+void qwen_cancel(int sq) { G_slots[sq].cancel.store(1); } // 引擎模式: 让 decode 循环结束槽 sq, 之后仍要用 qwen_next 读到 0 才能复用该槽
+
+void qwen_decode_loop() { // 引擎模式: decode 循环, 由一个 python 线程调用, 不返回; 每步把所有 decode 中的槽各 1 个 token 一起算 (进度对齐)
+    auto finish = [](Slot& S, int why) {
+        S.state.store(0);
+        G_n_dec.fetch_sub(1);
+        S.done.store(why);
+        S.ver.fetch_add(1);
+        fwake(S.ver);
+    };
+    while (true) {
+        uint32_t w = G_dec_wake.load();
+        int slots[NSEQ], toks[NSEQ], B = 0;
+        for (int s = 0; s < NSEQ; s++) {
+            Slot& S = G_slots[s];
+            if (!S.state.load()) continue;
+            if (S.cancel.load()) {
+                finish(S, 3);
+                continue;
+            }
+            if (S.n_past >= G_max_ctx) {
+                finish(S, 2);
+                continue;
+            }
+            slots[B] = s;
+            toks[B++] = S.out[S.n_out.load() - 1];
+        }
+        if (!B) {
+            fwait(G_dec_wake, w);
+            continue;
+        }
+        decode_step(slots, toks, B);
+        for (int b = 0; b < B; b++) {
+            Slot& S = G_slots[slots[b]];
+            int n = S.n_out.load();
+            int tok = sample_impl(G_dlogits + (size_t)b * VOCAB, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, S.out, n, S.rng);
+            S.out[n] = tok;
+            S.n_out.store(n + 1);
+            bool stop = false;
+            for (int i = 0; i < S.n_stop; i++) stop |= tok == S.stop[i];
+            if (stop || n + 1 >= S.max_new) {
+                finish(S, stop ? 1 : 2);
+                continue;
+            }
+            S.ver.fetch_add(1);
+            fwake(S.ver);
+        }
+    }
+}
+
 int qwen_selftest() { // GPU 反量化 vs 标量参考, GPU matmul (T=13 走 GEMV, 覆盖 8 + 5 两组; T=100 走 tensor core GEMM, 覆盖不满 64 的 tile) vs double 逐行点积, 返回失败项数; 会覆盖激活缓冲
-    Cu::bind();
+    Cu::use(Cu::ST_PF);
+    G_xperm = false; // 测试输入是正常布局
     int fails = 0;
     const char* names[] = {"blk.0.attn_qkv.weight", "blk.0.ffn_gate.weight", "blk.51.ffn_down.weight", "blk.0.ffn_up.weight", "blk.0.ssm_alpha.weight", "output.weight"};
     for (const char* name : names) {
@@ -570,7 +873,7 @@ int qwen_selftest() { // GPU 反量化 vs 标量参考, GPU matmul (T=13 走 GEM
             vector<float> x((size_t)T * k), y((size_t)T * n);
             vector<uint16_t> xh(x.size());
             for (size_t i = 0; i < x.size(); i++) { // matmul 输入是 fp16, 取 [-1, 1] 内 1/1024 的整数倍, fp16 可精确表示
-                x[i] = (float)((int)(rng_next() % 2049) - 1024) / 1024.0f;
+                x[i] = (float)((int)(rng_next(G_rng) % 2049) - 1024) / 1024.0f;
                 xh[i] = f2h_exact(x[i]);
             }
             Cu::h2d(G_d_g, xh.data(), xh.size() * 2);

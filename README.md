@@ -84,7 +84,7 @@ python -u server.py --type cuda --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --hf-dir
 python -u tests/test_server.py --base http://127.0.0.1:8000/v1
 ```
 
-`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数) 或 `cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。
+`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数) 或 `cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。`--ctx` 默认 cpu 32768, cuda 262144 (cuda 是每个槽的上下文, 启动时分配 4 个槽的 KV, 约 52GB 显存)。
 
 ### 多后端路由
 
@@ -106,14 +106,16 @@ python -u tests/smoke_test.py --type cuda --gguf /path/to/Qwen3.8-27B-Q4_K_M.ggu
 
 python 代码在仓库根目录, 与具体后端无关; 各后端 (`qwen_cpu/`、`qwen_cuda/`) 只有 C++ 库, C 接口相同。
 
-- `qwen.py`: C++ 库的 ctypes 封装。`load(gguf, backend, n_threads, device, max_ctx)` 按 `backend` 选择 `LIBS` 里的 so (新增后端只需在 `LIBS` 加一项); 输入 token 序列 (可附带图片 embedding 和 3D 位置), `generate()` 逐个返回采样出的 token id。一个模块实例只加载一个后端, 需要同时用两个时用 importlib 把 `qwen.py` 加载成两个模块 (见 `tests/cuda_vs_cpu.py`)
+- `qwen.py`: C++ 库的 ctypes 封装。`load(gguf, backend, n_threads, device, max_ctx)` 按 `backend` 选择 `LIBS` 里的 so (新增后端只需在 `LIBS` 加一项); 输入 token 序列 (可附带图片 embedding 和 3D 位置), `generate()` 逐个返回采样出的 token id。一个模块实例只加载一个后端, 需要同时用两个时用 importlib 把 `qwen.py` 加载成两个模块 (见 `tests/cuda_vs_cpu.py`)。cuda 另有引擎模式 `engine_*` (server.py 用), 与 `eval_tokens` 等不能混用
 - `server.py`: OpenAI 兼容服务 (单个后端)
   - 接口: `POST /v1/chat/completions` (支持 `stream`), `GET /v1/models`, `GET /health`
   - 模型名: `{--model-name}-{--type}`, 默认 `qwen3.8-27b-cpu` / `qwen3.8-27b-cuda`, 只用于 `/v1/models` 和响应里的 `model` 字段, 请求里的 `model` 不校验。`/v1/models` 返回 `{"object": "list", "data": [{"id": "qwen3.8-27b-cuda", "object": "model", "created": <请求时的时间戳>, "owned_by": "local"}]}`
   - 支持的参数: `messages` (system/user/assistant, 文本 + `image_url` 图片, 支持 data URL 和 http URL), `temperature`, `seed`, 思考控制 (`enable_thinking` 或 `chat_template_kwargs.enable_thinking`; `reasoning_effort`: none/minimal 关闭思考, low/medium/high/xhigh), 其余参数忽略
   - 默认采样参数与官方推荐一致 (思考 / 非思考两套), `temperature` 只覆盖温度; 思考内容在 `reasoning_content` 字段返回
   - tokenizer、chat 模板、图片预处理用 transformers 的官方 processor, 视觉塔用 transformers 的模块加载官方权重
-  - 启动时先加载完所有内容再开始监听; 推理是单序列, 并发请求排队串行处理, 不会报错; 流式请求的客户端断开会立即停止生成
+  - 启动时先加载完所有内容再开始监听; 流式请求的客户端断开会立即停止生成
+  - cpu: 推理是单序列, 并发请求排队串行处理, 不会报错
+  - cuda: 最多 4 个请求同时进行, 更多的按到达顺序排队; 输入 (prefill) 按到达顺序逐个算, 输出 (decode) 所有请求每步一起算; prefill 和 decode 同时运行时按 SM 分区 (`--dec-sm`, decode 默认 78 个, 其余给 prefill), 只有一种时用整卡。同一请求 (固定 seed) 单独跑和并发跑的输出完全相同
   - 图片默认最多 1048576 像素 (约 1024 token), `--max-image-pixels 0` 恢复官方默认
   - 视觉塔 fp32, `--type cuda` 时在 GPU 上, 否则在 CPU 上
   - 图片缓存: 视觉塔的输出按图片原始字节 (base64 解码后 / http 下载的内容) 的 sha256 缓存, 只在内存里, 不写文件; 一个请求里命中的图片直接用缓存, 未命中的图片一起过视觉塔再按图片拆开存入。按 LRU 淘汰, 上限 `--image-cache-mb` (默认 4096MB, 每张 1024 token 的图约 20MB), 0 表示不缓存。图片预处理 (resize、切 patch) 每次仍会执行, 因为需要它确定图片 token 数

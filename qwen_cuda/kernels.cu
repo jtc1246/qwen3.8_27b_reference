@@ -459,7 +459,7 @@ extern "C" __global__ void __launch_bounds__(1024) k_add_norm(float* x, const fl
 #pragma unroll
     for (int i = 0; i < D / 1024; i++) {
         int c = threadIdx.x + i * 1024;
-        y[(size_t)t * D + (T == 1 ? xperm(c) : c)] = __float2half_rn(v[i] * r * w[c]); // decode 时写成 GEMV 用的 xperm 布局
+        y[(size_t)t * D + (T < 16 ? xperm(c) : c)] = __float2half_rn(v[i] * r * w[c]); // T < 16 (走 GEMV) 时写成 xperm 布局
         if (hidden && t == T - 1) hidden[c] = v[i];
     }
 }
@@ -471,9 +471,9 @@ extern "C" __global__ void k_silu_mul(const float* g, const float* u, __half* h,
 
 // DeltaNet 预处理 (各 token 独立, 并行): 因果 depthwise conv1d (k=4) + SiLU, q/k 的 L2 归一化 (q 再乘 1/sqrt(128)), q·k, beta = sigmoid(b), decay = exp(ssm_a * softplus(a + dt_bias))
 // grid (T, 16 个 qk 头), block 128; qkv: matmul 原始输出 [T][10240], cstate: conv 状态 [10240][3] (旧的在前, 此处只读); 输出 cv [T][10240], qk [T][16]; a/b [T][48] 原地改成 decay/beta
-extern "C" __global__ void __launch_bounds__(128) k_dn_prep(const float* qkv, const float* cstate, const float* cw, float* cv, float* a, float* b, const float* ssm_a, const float* dt_bias, float* qk, int T) {
+__device__ __forceinline__ void dn_prep_body(const float* qkv, const float* cstate, const float* cw, float* cv, float* a, float* b, const float* ssm_a, const float* dt_bias, float* qk, int t) {
     __shared__ float red[4];
-    int t = blockIdx.x, kh = blockIdx.y, j = threadIdx.x;
+    int kh = blockIdx.y, j = threadIdx.x;
     auto conv = [&](int c) { // 第 t 个 token 的输入序号 t-3..t, 负的取 conv 状态
         float o = 0;
 #pragma unroll
@@ -503,6 +503,14 @@ extern "C" __global__ void __launch_bounds__(128) k_dn_prep(const float* qkv, co
     }
 }
 
+extern "C" __global__ void __launch_bounds__(128) k_dn_prep(const float* qkv, const float* cstate, const float* cw, float* cv, float* a, float* b, const float* ssm_a, const float* dt_bias, float* qk, int T) { dn_prep_body(qkv, cstate, cw, cv, a, b, ssm_a, dt_bias, qk, blockIdx.x); }
+
+// 多序列 decode: grid (B, 16), token t 属于槽 slot[t]; ss: 每槽状态的 float 个数 (conv / DeltaNet 状态按槽偏移)
+extern "C" __global__ void __launch_bounds__(128) k_dn_prep_b(const float* qkv, const float* cstate, const float* cw, float* cv, float* a, float* b, const float* ssm_a, const float* dt_bias, float* qk, const int* slot, uint64_t ss) {
+    int t = blockIdx.x;
+    dn_prep_body(qkv + (size_t)t * QKV_DIM, cstate + slot[t] * ss, cw, cv + (size_t)t * QKV_DIM, a + t * LV, b + t * LV, ssm_a, dt_bias, qk + t * LK, 0);
+}
+
 constexpr int DN_TT = 16, DN_KS = 36; // k_dn_rec 每批预取的 token 数; k/q 每个 32 行的行段在 smem 中占 36 个 float (防 bank 冲突)
 
 __device__ __forceinline__ void cp_async(void* dst, const void* src, int bytes) { // global -> smem 异步拷贝 (4 / 16 字节)
@@ -515,7 +523,7 @@ __device__ __forceinline__ void cp_async(void* dst, const void* src, int bytes) 
 // lane = 4 * 列 + 行段 r, 线程在寄存器里持有 S[32r .. 32r+31][j]; 每个 token (S 为旧状态):
 // a = kᵀS, b = qᵀS (4 个行段 shuffle 求和), delta = (v - decay·a)·beta, o = decay·b + (q·k)·delta, S = decay·S + k·delta; o (未归一化) 写 of [T][6144]
 // 每批 16 个 token 的 k/q/v/标量用 cp.async 预取到 smem (双缓冲); 开头顺便更新 conv 状态 (k_dn_prep 已读完旧状态): 新状态 = 输入序号 T-3..T-1 的原始 qkv
-extern "C" __global__ void __launch_bounds__(128) k_dn_rec(const float* qkv, float* cstate, const float* cv, const float* a, const float* b, const float* qk, float* state, float* of, int T) {
+__device__ __forceinline__ void dn_rec_body(const float* qkv, float* cstate, const float* cv, const float* a, const float* b, const float* qk, float* state, float* of, int T) {
     __shared__ __align__(16) float sk[2][DN_TT][4 * DN_KS], sq[2][DN_TT][4 * DN_KS], sv[2][DN_TT][32], sc[2][DN_TT][4]; // sc: beta, decay, q·k
     int gt = (blockIdx.y * gridDim.x + blockIdx.x) * 128 + threadIdx.x;
     if (gt < QKV_DIM) {
@@ -592,13 +600,20 @@ extern "C" __global__ void __launch_bounds__(128) k_dn_rec(const float* qkv, flo
     for (int i = 0; i < 32; i++) S[(r * 32 + i) * LHD + j] = s[i];
 }
 
+extern "C" __global__ void __launch_bounds__(128) k_dn_rec(const float* qkv, float* cstate, const float* cv, const float* a, const float* b, const float* qk, float* state, float* of, int T) { dn_rec_body(qkv, cstate, cv, a, b, qk, state, of, T); }
+
+extern "C" __global__ void __launch_bounds__(128) k_dn_rec_b(const float* qkv, float* cstate, const float* cv, const float* a, const float* b, const float* qk, float* state, float* of, const int* slot, uint64_t ss) { // grid (48, 4, B), 其余同 k_dn_prep_b
+    int t = blockIdx.z;
+    dn_rec_body(qkv + (size_t)t * QKV_DIM, cstate + slot[t] * ss, cv + (size_t)t * QKV_DIM, a + t * LV, b + t * LV, qk + t * LK, state + slot[t] * ss, of + (size_t)t * V_DIM, 1);
+}
+
 // DeltaNet 输出的门控 RMSNorm: out = rmsnorm(o) * ssm_norm * silu(z), fp16 (ssm_out 的输入). grid (T, 48), block 128
 extern "C" __global__ void __launch_bounds__(128) k_dn_post(const float* of, const float* z, const float* ssm_norm, __half* out) {
     __shared__ float red[4];
     int t = blockIdx.x, h = blockIdx.y, j = threadIdx.x;
     size_t idx = (size_t)t * V_DIM + h * LHD + j;
     float o = of[idx], on = block_sum<128>(o * o, red);
-    out[gridDim.x == 1 ? xperm(h * LHD + j) : idx] = __float2half_rn(o * (1.0f / sqrtf(on / LHD + EPS)) * ssm_norm[j] * silu(z[idx])); // T = 1 (decode) 时写成 xperm 布局
+    out[gridDim.x < 16 ? (size_t)t * V_DIM + xperm(h * LHD + j) : idx] = __float2half_rn(o * (1.0f / sqrtf(on / LHD + EPS)) * ssm_norm[j] * silu(z[idx])); // T < 16 时写成 xperm 布局
 }
 
 // KV cache 是 q8_0 (同 llama.cpp): 每行 (token) 1024 个 int8 [ctx][1024], 每 32 维一个 fp16 scale [ctx][32] (4 个头 x 8 块), 分开存放保证 16 字节对齐
@@ -619,9 +634,9 @@ __device__ __forceinline__ uint4 kv_dq8(uint2 q, half2 d) { // 8 个 int8 乘 sc
 }
 
 // q/k 的 RMSNorm + 交错 MRoPE, 并把 k、v 写入 KV cache (q8_0). grid (T, 24 + 4), block 256; y < 24 是 q 头, 其余是 k 头
-extern "C" __global__ void __launch_bounds__(256) k_qk_rope(float* qg, const float* k, const float* v, const float* q_norm, const float* k_norm, const int* pos3, const float* inv_freq, int8_t* kc, int8_t* vc, __half* ks, __half* vs, const int* np) { // np: 显存里的 n_past (CUDA Graph 重放时会变)
+__device__ __forceinline__ void qk_rope_body(float* qg, const float* k, const float* v, const float* q_norm, const float* k_norm, const int* pos3, const float* inv_freq, int8_t* kc, int8_t* vc, __half* ks, __half* vs, const int* np, int t) { // np: 显存里的 n_past (CUDA Graph 重放时会变)
     __shared__ float sh[HD], red[8];
-    int t = blockIdx.x, hh = blockIdx.y, i = threadIdx.x;
+    int hh = blockIdx.y, i = threadIdx.x;
     bool is_q = hh < N_HEAD;
     const float* p = is_q ? qg + (size_t)t * Q_DIM + hh * HD * 2 : k + (size_t)t * KV_DIM + (hh - N_HEAD) * HD; // q_proj 每个头是 [q(256), gate(256)]
     float xv = p[i];
@@ -644,6 +659,15 @@ extern "C" __global__ void __launch_bounds__(256) k_qk_rope(float* qg, const flo
     size_t row = (size_t)(*np + t), dst = row * KV_DIM + kh * HD + i, ds = row * 32 + kh * 8 + i / 32;
     kv_q8_store(y, kc + dst, ks + ds);
     kv_q8_store(v[(size_t)t * KV_DIM + kh * HD + i], vc + dst, vs + ds);
+}
+
+extern "C" __global__ void __launch_bounds__(256) k_qk_rope(float* qg, const float* k, const float* v, const float* q_norm, const float* k_norm, const int* pos3, const float* inv_freq, int8_t* kc, int8_t* vc, __half* ks, __half* vs, const int* np) { qk_rope_body(qg, k, v, q_norm, k_norm, pos3, inv_freq, kc, vc, ks, vs, np, blockIdx.x); }
+
+// 多序列 decode: grid (B, 28), token t 属于槽 slot[t], np[t] 是该槽的 n_past; ctx: 每槽 KV 行数 (KV 按槽偏移)
+extern "C" __global__ void __launch_bounds__(256) k_qk_rope_b(float* qg, const float* k, const float* v, const float* q_norm, const float* k_norm, const int* pos3, const float* inv_freq, int8_t* kc, int8_t* vc, __half* ks, __half* vs, const int* np, const int* slot, uint64_t ctx) {
+    int t = blockIdx.x;
+    size_t s = slot[t];
+    qk_rope_body(qg + (size_t)t * Q_DIM, k + (size_t)t * KV_DIM, v + (size_t)t * KV_DIM, q_norm, k_norm, pos3 + t * 3, inv_freq, kc + s * ctx * KV_DIM, vc + s * ctx * KV_DIM, ks + s * ctx * 32, vs + s * ctx * 32, np + t, 0);
 }
 
 constexpr int FA_Q = 64, FA_K = 32, FS = HD + 8; // prefill flash attention: 每 block 64 个 query, 每次 32 个 key, smem 行跨度 (half)
@@ -768,11 +792,11 @@ extern "C" __global__ void __launch_bounds__(128) k_attn_pf(const float* qg, con
         int dim = d * 8 + t * 2;
         if (tok0 < T) {
             const float* gp = qg + (size_t)tok0 * Q_DIM + h * HD * 2 + HD + dim;
-            *(half2*)&att[(size_t)tok0 * ATT_DIM + h * HD + dim] = __floats2half2_rn(o[d][0] / l0 * sigmoid(gp[0]), o[d][1] / l0 * sigmoid(gp[1]));
+            *(half2*)&att[(size_t)tok0 * ATT_DIM + (T < 16 ? xperm(h * HD + dim) : h * HD + dim)] = __floats2half2_rn(o[d][0] / l0 * sigmoid(gp[0]), o[d][1] / l0 * sigmoid(gp[1]));
         }
         if (tok1 < T) {
             const float* gp = qg + (size_t)tok1 * Q_DIM + h * HD * 2 + HD + dim;
-            *(half2*)&att[(size_t)tok1 * ATT_DIM + h * HD + dim] = __floats2half2_rn(o[d][2] / l1 * sigmoid(gp[0]), o[d][3] / l1 * sigmoid(gp[1]));
+            *(half2*)&att[(size_t)tok1 * ATT_DIM + (T < 16 ? xperm(h * HD + dim) : h * HD + dim)] = __floats2half2_rn(o[d][2] / l1 * sigmoid(gp[0]), o[d][3] / l1 * sigmoid(gp[1]));
         }
     }
 }
@@ -786,7 +810,7 @@ __device__ __forceinline__ void att_split(int n, int& kps, int& ns) { kps = (max
 // S = Q·Kᵀ: A 的 16 行中前 6 行是 q 头, 其余为 0; head 维重排: 第 c 个 32 维块里 lane (g, t) 读 K/V 第 g 行的 [c*32 + 8t, +8), int8 8 字节连续, 乘该块 scale 反量化成 fp16
 // O += P·V: P 由 S 的累加器直接转 fp16 作为 A; V 的 B fragment 由 movmatrix 转置得到, 结果中 lane (g, t) 持有 q 头 g 的维度 [c*32 + 8t, +8)
 // 输出未归一化的 po [nsplit][24][256] 和 pml [nsplit][24] = (max, sum), 由 k_attn_merge 合并
-extern "C" __global__ void __launch_bounds__(128) k_attn_dec(const float* qg, const int8_t* kc, const int8_t* vc, const __half* ks, const __half* vs, float* po, float2* pml, const int* np) {
+__device__ __forceinline__ void attn_dec_body(const float* qg, const int8_t* kc, const int8_t* vc, const __half* ks, const __half* vs, float* po, float2* pml, const int* np) {
     constexpr int G = N_HEAD / N_KV;
     __shared__ float sm[4][G], sl[4][G], so[4][G][HD];
     int kvh = blockIdx.x, sp = blockIdx.y, lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3, n = *np + 1, kps, ns;
@@ -887,8 +911,16 @@ extern "C" __global__ void __launch_bounds__(128) k_attn_dec(const float* qg, co
     }
 }
 
+extern "C" __global__ void __launch_bounds__(128) k_attn_dec(const float* qg, const int8_t* kc, const int8_t* vc, const __half* ks, const __half* vs, float* po, float2* pml, const int* np) { attn_dec_body(qg, kc, vc, ks, vs, po, pml, np); }
+
+extern "C" __global__ void __launch_bounds__(128) k_attn_dec_b(const float* qg, const int8_t* kc, const int8_t* vc, const __half* ks, const __half* vs, float* po, float2* pml, const int* np, const int* slot, uint64_t ctx) { // grid (4, ATT_SPLIT, B), 其余同 k_qk_rope_b
+    int t = blockIdx.z;
+    size_t s = slot[t];
+    attn_dec_body(qg + (size_t)t * Q_DIM, kc + s * ctx * KV_DIM, vc + s * ctx * KV_DIM, ks + s * ctx * 32, vs + s * ctx * 32, po + (size_t)t * ATT_SPLIT * ATT_DIM, pml + (size_t)t * ATT_SPLIT * N_HEAD, np + t);
+}
+
 // 合并 k_attn_dec 各段: grid 24 (q 头), block 256 (维度); att = o / L * sigmoid(gate), 写 fp16
-extern "C" __global__ void __launch_bounds__(256) k_attn_merge(const float* qg, const float* po, const float2* pml, const int* np, __half* att) {
+__device__ __forceinline__ void attn_merge_body(const float* qg, const float* po, const float2* pml, const int* np, __half* att) {
     int h = blockIdx.x, i = threadIdx.x, kps, nsplit;
     att_split(*np + 1, kps, nsplit);
     float M = -INFINITY, L = 0, o = 0;
@@ -900,6 +932,13 @@ extern "C" __global__ void __launch_bounds__(256) k_attn_merge(const float* qg, 
         o += po[((size_t)s * N_HEAD + h) * HD + i] * f;
     }
     att[xperm(h * HD + i)] = __float2half_rn(o / L * sigmoid(qg[h * HD * 2 + HD + i])); // 只用于 decode, 写成 xperm 布局
+}
+
+extern "C" __global__ void __launch_bounds__(256) k_attn_merge(const float* qg, const float* po, const float2* pml, const int* np, __half* att) { attn_merge_body(qg, po, pml, np, att); }
+
+extern "C" __global__ void __launch_bounds__(256) k_attn_merge_b(const float* qg, const float* po, const float2* pml, const int* np, __half* att) { // grid (24, B)
+    int t = blockIdx.y;
+    attn_merge_body(qg + (size_t)t * Q_DIM, po + (size_t)t * ATT_SPLIT * ATT_DIM, pml + (size_t)t * ATT_SPLIT * N_HEAD, np + t, att + (size_t)t * ATT_DIM);
 }
 
 // q8_0 / q6_k 权重上传后按行原地重排 (布局见 q8_grp / q6_sb), grid 行数, block 256, 动态 smem = 每行字节数

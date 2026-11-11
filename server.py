@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # OpenAI 兼容 chat completions 服务: 支持图片、system、temperature、seed、thinking 控制, 其余参数忽略
-# C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
+# cpu: C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
+# cuda: 引擎模式, 最多 qwen.nseq() (4) 个请求同时进行: 超出的在 python 按到达顺序排队; prefill 在 C++ 里按顺序逐个算, decode 所有序列每步一起算, 两者同时跑时按 SM 分区
 # --type 选择后端 (qwen.LIBS), cuda 时视觉塔也在 GPU 上; 视觉塔输出按图片原始字节的 sha256 缓存在内存 (LRU)
-import os, sys, io, json, time, uuid, base64, random, hashlib, argparse, threading, urllib.request
-from collections import OrderedDict
+import os, sys, io, json, time, uuid, base64, random, ctypes, hashlib, argparse, threading, contextlib, urllib.request
+from collections import OrderedDict, deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import numpy as np
 import torch
@@ -27,13 +28,45 @@ G_vis = None
 G_dev = "cpu" # 视觉塔所在的 torch device
 G_img_cache = OrderedDict() # sha256 -> 该图的视觉输出 (n_tok, 5120) float32, 只在 G_lock 内访问
 G_img_cache_bytes = 0
-G_lock = threading.Lock()
+G_lock = threading.Lock() # cpu: 整个推理; cuda: 只用于视觉塔和图片缓存
 G_queue_lock = threading.Lock()
 G_waiting = 0
+G_pool = None # cuda 的 SlotPool
 
 
 class BadRequest(Exception):
     pass
+
+
+class SlotPool: # cuda 引擎的槽位: 最多 n 个请求同时进入 C++, 其余按到达顺序 (FIFO) 在这里等; 分配时按顺序发 ticket, C++ 按 ticket 顺序逐个 prefill
+    def __init__(self, n):
+        self.lock = threading.Lock()
+        self.free = list(range(n))
+        self.waiters = deque() # [Event, (槽, ticket)]
+        self.ticket = 0
+
+    def take(self, slot): # 锁内调用
+        self.ticket += 1
+        return slot, self.ticket - 1
+
+    def acquire(self, rid): # 返回 (槽, ticket)
+        with self.lock:
+            if self.free and not self.waiters:
+                return self.take(self.free.pop(0))
+            w = [threading.Event(), None]
+            self.waiters.append(w)
+            log(f"⏳ {rid} 槽位已满, 排队等待, 前面 {len(self.waiters) - 1} 个请求")
+        w[0].wait()
+        return w[1]
+
+    def release(self, slot):
+        with self.lock:
+            if not self.waiters:
+                self.free.append(slot)
+                return
+            w = self.waiters.popleft()
+            w[1] = self.take(slot)
+            w[0].set()
 
 
 def log(msg):
@@ -201,9 +234,42 @@ def run_vision(p): # 锁内执行: 视觉塔前向 (带缓存), 生成 embedding
     return embd, mask, pos3
 
 
-def generate_tokens(p): # 锁内执行的生成器, 逐个返回 token id
+def generate_engine(p): # cuda 引擎模式的生成器: 视觉塔 (G_lock 内) -> 等槽位 (python FIFO) -> prefill (C++ 里 FIFO) -> 逐个返回 token; 中途关闭 (客户端断开) 时取消
+    with G_lock:
+        embd, mask, pos3 = run_vision(p)
+    seed = p["seed"] if p["seed"] is not None else random.getrandbits(63)
+    args = qwen.engine_args(p["ids"], embd, mask, pos3, seed=seed, max_new=G_args.ctx - len(p["ids"]), **p["sampling"]) # 拿到槽位前准备好, 之后不能再出错
+    slot, ticket = G_pool.acquire(p["rid"])
+    buf = (ctypes.c_int * 256)()
+    started, done = False, False
+    try:
+        t0 = time.time()
+        qwen.engine_prefill(slot, ticket, args)
+        started = True
+        t1, n = time.time(), 0
+        log(f"ℹ️ {p['rid']} 槽 {slot}: 拿到槽位到第一个 token {t1 - t0:.2f}s (含等待前面的 prefill)")
+        while True:
+            toks = qwen.engine_next(slot, buf)
+            if not toks:
+                break
+            n += len(toks)
+            yield from toks
+        done = True
+        log(f"ℹ️ {p['rid']} 槽 {slot}: 生成 {n} tokens, decode {time.time() - t1:.2f}s, {(n - 1) / max(time.time() - t1, 1e-9):.2f} tok/s")
+    finally:
+        if started and not done:
+            qwen.engine_cancel(slot)
+            while qwen.engine_next(slot, buf): # 读到结束, 之后槽才能复用
+                pass
+        G_pool.release(slot)
+
+
+def generate_tokens(p): # 生成器, 逐个返回 token id; cpu 在锁内执行, cuda 走引擎模式
     if len(p["ids"]) >= G_args.ctx:
         raise BadRequest(f"prompt 长度 {len(p['ids'])} 超出上下文 {G_args.ctx}")
+    if G_args.type == "cuda":
+        yield from generate_engine(p)
+        return
     embd, mask, pos3 = run_vision(p)
     qwen.reset()
     qwen.seed(p["seed"] if p["seed"] is not None else random.getrandbits(63))
@@ -281,10 +347,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         stream = bool(body.get("stream"))
         rid = f"chatcmpl-{uuid.uuid4().hex}"
+        p["rid"] = rid[-8:]
         with G_queue_lock:
             G_waiting += 1
             ahead = G_waiting - 1
-        if ahead > 0:
+        if ahead > 0 and G_args.type != "cuda": # cuda 的排队在 SlotPool 里打印
             log(f"⏳ {rid[-8:]} 排队等待, 前面 {ahead} 个请求")
         if stream: # 先回响应头, 客户端排队期间也不会超时报错
             self.send_response(200)
@@ -292,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
         try:
-            with G_lock:
+            with G_lock if G_args.type != "cuda" else contextlib.nullcontext():
                 log(f"ℹ️ {rid[-8:]} 开始: prompt {len(p['ids'])} tokens, 图片 {p['n_images']}, thinking={p['thinking']}, {p['sampling']}, seed={p['seed']}")
                 if stream:
                     self.handle_stream(p, rid)
@@ -356,7 +423,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global G_args, G_proc, G_vis, G_dev
+    global G_args, G_proc, G_vis, G_dev, G_pool
     p = argparse.ArgumentParser(description="Qwen3.8-27B OpenAI 兼容服务")
     p.add_argument("--gguf", required=True, help="Q4_K_M GGUF 路径")
     p.add_argument("--hf-dir", required=True, help="官方 HF 仓库目录: tokenizer/processor 配置 + 含 model.visual.* 的 safetensors 分片")
@@ -365,19 +432,25 @@ def main():
     p.add_argument("--type", default="cpu", choices=list(qwen.LIBS), help="推理后端; cuda 时文本主干和视觉塔都在 GPU 上")
     p.add_argument("--threads", type=int, default=16, help="cpu 后端的推理线程数, 以及 torch (CPU 上的视觉塔、预处理) 的线程数")
     p.add_argument("--device", type=int, default=0, help="cuda 后端使用的 GPU 编号")
-    p.add_argument("--ctx", type=int, default=32768, help="最大上下文 (prompt + 输出)")
+    p.add_argument("--ctx", type=int, default=None, help="最大上下文 (prompt + 输出), 默认 cpu 32768, cuda 262144; cuda 是每个槽的上下文, 启动时分配全部槽的 KV")
+    p.add_argument("--dec-sm", type=int, default=None, help="cuda: prefill 和 decode 同时运行时 decode 分区的 SM 数 (其余给 prefill), 默认 78")
     p.add_argument("--max-image-pixels", type=int, default=1048576, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 0 表示用官方默认 16777216")
     p.add_argument("--model-name", default="qwen3.8-27b", help="模型名前缀, 对外返回的名称是 {model-name}-{type}; 请求里的 model 不校验")
     p.add_argument("--image-cache-mb", type=int, default=4096, help="视觉塔输出缓存上限 (MB, 只在内存, LRU 淘汰), 0 表示不缓存")
     G_args = p.parse_args()
     G_args.model_name = f"{G_args.model_name}-{G_args.type}"
+    if G_args.ctx is None:
+        G_args.ctx = 262144 if G_args.type == "cuda" else 32768
     t0 = time.time()
     torch.set_num_threads(G_args.threads)
     if G_args.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError(f"❌ --type cuda 需要 CUDA 版 torch, 当前 torch {torch.__version__} 不支持 CUDA")
         G_dev = f"cuda:{G_args.device}"
-    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx)
+    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, G_args.dec_sm)
+    if G_args.type == "cuda":
+        G_pool = SlotPool(qwen.nseq())
+        qwen.engine_start()
     G_proc = AutoProcessor.from_pretrained(G_args.hf_dir)
     log("✅ processor / tokenizer 加载完成")
     G_vis = load_vision(G_args.hf_dir)

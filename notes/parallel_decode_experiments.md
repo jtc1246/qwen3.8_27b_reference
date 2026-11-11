@@ -164,3 +164,12 @@ B = 1 走批量路径与正式版单序列性能相同 (只计 `qwen_eval`): 4K 
 - `gemv_opt/`: `green_patch.py` (正式代码加 green context 的测试副本), `gemv_bench2.py`, `xtest/` (x 连续读测速), 各步日志
 - `pd_concurrent2/`: `test_patch.py` (green / 优先级 / 共享权重), `pd_test2.py`
 - `batch_dec/`: `batch_patch.py`, `check_batch.py`, `bench_batch.py`
+
+## 13. 并行合入正式代码 (引擎模式, 未提交)
+
+- 第 10 节的多序列 decode 合进正式代码, 单序列 decode 路径删掉 (直接模式的 T = 1 也走 B = 1 的批量 graph); 4 个槽启动时全部分配, 每槽状态改成 `[槽][48 层 DeltaNet][48 层 conv]` 连续 (149.6MiB, 以后整块写盘方便), 改回 `[层][槽]` 测过 B = 4 速度没区别
+- prefill / decode 同时跑: 两个 green context + primary context, 4 个 stream (prefill / decode × 整卡 / 分区); 两者都有时才用分区, 否则整卡; kernel 改用 `cuLibraryLoadData` (`CUkernel` 与 context 无关)
+- 线程: python 每个请求一个线程调 `qwen_prefill` (按 ticket FIFO) + `qwen_next`, 一个 python 线程跑 `qwen_decode_loop`。不在 C++ 里创建线程, 等待用直接 `syscall` 的 futex: musl 静态 so 在 glibc 线程里, musl 的 errno / `pthread_self()` 指向 glibc 的 TCB (errno 偏移 52 正好落在 glibc 的 pointer_guard 上), musl 没创建过线程时 malloc 不加锁, 所以并发路径不调可能写 errno 的 libc 函数、不分配内存
+- 验证 (`tests/par_engine/`): `check_direct.py` 直接模式与 HEAD 逐位一致 (prefill 长度 1/2/5/15/16/17/300/1025/2100、多段、图片 embedding, 各 6 步 decode); `check_engine.py` 3 轮 10 个并发请求 (贪心 / seed 采样 + presence penalty / max_new = 1 / 取消 / 槽复用) 与单序列逐 token 一致; `test_server_par.py` 6 个流式并发 (2 个排队, 1 个中途断开), 同 seed 单独与并发输出一致; `test_server.py` 直连和经 router 全过
+- 速度见 `docs/cuda_impl.md` 第 6 节。B = 4 稳定跑时每步从 20.3ms 慢慢升到 22.4ms: GPU 85°C 时 SM 时钟 2422 → 约 1930MHz (throttle reasons 为 0), 不是代码问题
+- 短 prefill: T = 16~100 都约 110ms (GEMM block 数少), 改动前就是这样; T = 8~15 走 xperm GEMV 后比原来快 (15 token 82 → 50ms)
