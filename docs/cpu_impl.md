@@ -15,6 +15,7 @@
 | `quants.h` | 量化块结构体, 标量参考反量化 (`Quants::Ref`), AVX-512 反量化 (`dequant_row`) |
 | `ops.h` | `Weight` 结构、矩阵乘 `matmul`、`dot`、`rmsnorm`、`silu`/`sigmoid`/`softplus` |
 | `pool.h` | 线程池 `Pool::run` |
+| `cache.h` | 前缀缓存 (第 9.1 节): 与 `qwen_cuda/cache.h` 相同, 只改了 include guard 和 KV 布局的写法 (每 token 每层各块的字节数改成 `Cache::init` 传入) |
 | `CMakeLists.txt` / `compile.sh` | 构建 |
 
 - 所有辅助模块写在 `.h` 里并用匿名 namespace 包裹, 只有 `qwen.cpp` 一个编译单元, 对外只暴露 `extern "C"` 函数
@@ -162,9 +163,22 @@ KV cache 和所有中间结果都是 fp32 (HF 参考实现里 KV 是 bf16)。
 | `int qwen_n_past()` | 当前序列长度 |
 | `float* qwen_logits()` | 最后一次 eval 的 logits, 248320 个 |
 | `float* qwen_hidden()` | `[65][5120]`: 0 是 embedding, i 是第 i 层输出, 都是最后一个 token |
+| `int qwen_cache_init(const char* dir, int quant_threads)` | 启用前缀缓存 (9.1 节), 在 `qwen_init` 之后调用一次; 0 成功 |
+| `int qwen_prefill_cached(tokens, n, embd, embd_mask, pos3, n_pts, pts_pos, pts_hash, pts_key, pts_role, tail, n_tail, tail_role)` | 带前缀缓存的 prefill: 先清空状态, 查找加载命中的缓存点, prefill 剩余部分, 等 prompt 的缓存写完才返回; 缓存点参数与 cuda 版 `qwen_prefill` 相同; 返回命中的 token 数, < 0 失败 |
+| `int qwen_cache_finish(const int* out, int n_out, int ended)` | `qwen_prefill_cached` 之后生成结束时调用: 以 im_end token 结束 (ended 且最后一个是 248046) 时先把它算进 KV / 状态, 再写输出缓存点; 否则丢掉输出缓存; 返回时已写完 |
+| `int qwen_cache_stats(int sq, int* out)` | 与 cuda 接口相同 (sq 必须是 0): [命中的输入 token 数, 输入新写入的 KV token 数, 输入新写入的 state 数, 输出写入的 state 数] |
 | `int qwen_selftest()` | 对 q8_0 / q4_k / q5_k / q6_k / f32 各取一个真实 tensor, 比较 AVX-512 反量化与标量参考 (要求逐位一致), 以及 T = 5 的 matmul 与 double 点积 (相对误差 < 1e-5), 返回失败项数 |
 
 全局只有一个序列状态, 所有函数都不是线程安全的, 调用方需要串行调用。
+
+### 9.1 前缀缓存
+
+`server.py --type cpu --cache-dir <目录>` 启用 (通过 router 时是 `<根目录>/cpu`)。目录结构、缓存点 (每个 im_end token 之后)、key、metadata、查找、写盘线程、量化线程都和 cuda 版相同 (docs/cuda_impl.md 4.2 节), 区别:
+
+- **每个缓存点都写**: 命中之后的每个缓存点都写 kvcache 和 state, 输出缓存点也一定写 state, 没有 2048 / 512 的规则 (cpu 本来就慢, 每个点都能命中最省; prefill 因此在每个缓存点处切开 chunk, 对 cpu 没有性能影响)。已经有效存在的缓存点不重写。读取时不假设 state 一定存在: 从后往前找第一个自身有 state 文件、之前所有点都有效的缓存点
+- **格式**: KV 是 fp32, kvcache.bin 每段 `[16 层][K n×4096 字节 | V n×4096 字节]` (每 token 128KB, 是 cuda 的 4 倍); state.bin 把各层状态拼成与 cuda 槽状态相同的 `[48 层 DeltaNet][48 层 conv]`, 量化格式也相同, 压缩版在 CPU 上用线程池解码 (与编码端逐位相同)。metadata 的模型标识带 `cpu_f32` 后缀, cpu 和 cuda 的缓存点互相视为无效 (误用同一目录也不会读错格式)
+- **流程** (都在调用的 python 线程, 单序列): `qwen.generate(..., cache=...)` 用 `qwen_prefill_cached` 代替 `qwen_eval`, 返回时 prompt 的缓存已写完 (之后才出第一个 token); decode 时 `qwen_eval` 每 256 个 token 交出一段 KV; 生成结束 (包括客户端断开、生成器被关闭) 时 `qwen_cache_finish`: 以 im_end token 结束就再算一步把它写进去并生成输出缓存点, 否则删除临时文件, 返回时已写完 (客户端收到结束时输出部分已可用)
+- **验证** (`/root/local_llm/tests/prefix_cache_cpu/`, 不入库): 未量化 state 命中后第一个输出 token 的 logits 与不用缓存逐位相同, 多轮命中上一轮输出缓存点也逐位相同; 量化后命中 logits 相对差 1.9e-3, top1 一致; 每个缓存点都有 state, usage 统计与目录一致; `tests/test_server.py` 开缓存连跑两次全过; 流式中途断开后 tmp 为空
 
 ## 10. 精度
 

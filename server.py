@@ -404,7 +404,9 @@ def generate_tokens(p): # 生成器, 逐个返回 token id; cpu 在锁内执行,
     embd, mask, pos3 = run_vision(p)
     qwen.reset()
     qwen.seed(p["seed"] if p["seed"] is not None else random.getrandbits(63))
-    yield from qwen.generate(p["ids"], G_args.ctx - len(p["ids"]), embd=embd, embd_mask=mask, pos3=pos3, **p["sampling"])
+    yield from qwen.generate(p["ids"], G_args.ctx - len(p["ids"]), embd=embd, embd_mask=mask, pos3=pos3, cache=p["cache"], **p["sampling"])
+    if p["cache"] is not None:
+        p["cache_stats"] = qwen.cache_stats() # 缓存已全部写完
 
 
 class Decoder: # 增量解码 (按字节, 标准库 utf-8 增量解码器), 遇到 </think> 切换到正文; 文本原样, 不去掉任何字符

@@ -7,7 +7,7 @@ from array import array
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LIBS = {"cpu": "qwen_cpu/cmake_build/libqwen.so", "cuda": "qwen_cuda/cmake_build/libqwen_cuda.so"}
-CACHE_BACKENDS = ("cuda",) # 支持前缀缓存 (qwen_cache_init) 的后端
+CACHE_BACKENDS = ("cpu", "cuda") # 支持前缀缓存 (qwen_cache_init) 的后端
 EOS_IDS = (248046, 248044) # <|im_end|>, <|endoftext|>
 IM_START, IM_END, IMAGE_TOKEN = 248045, 248046, 248056
 G_lib = None
@@ -21,7 +21,7 @@ def log(msg):
 def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm=None, cache_dir=None, cache_threads=8):
     # backend: LIBS 的 key; n_threads 只对 cpu 有效, device (GPU 编号) 只对 cuda 有效
     # cuda: max_ctx 是每个槽的上下文 (qwen_nseq() 个槽的 KV 全部预先分配); dec_sm: prefill 和 decode 同时运行时 decode 分区的 SM 数, None 用 C++ 默认值
-    # cache_dir: 前缀缓存目录 (只有 cuda, 调用方已检查并加锁, 其中 tmp/ 已清空), cache_threads: 后台量化 state 的线程数
+    # cache_dir: 前缀缓存目录 (CACHE_BACKENDS 里的后端, 调用方已检查并加锁, 其中 tmp/ 已清空), cache_threads: 后台量化 state 的线程数
     global G_lib, G_backend
     if G_lib is not None:
         return G_lib
@@ -34,6 +34,11 @@ def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm
     lib.qwen_seed.argtypes = [ctypes.c_uint64]
     lib.qwen_logits.restype = ctypes.POINTER(ctypes.c_float)
     lib.qwen_hidden.restype = ctypes.POINTER(ctypes.c_float)
+    if backend == "cpu": # 前缀缓存 (直接模式): qwen_prefill_cached 代替 eval_tokens, 结束时 qwen_cache_finish
+        lib.qwen_cache_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.qwen_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        lib.qwen_prefill_cached.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.qwen_cache_finish.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
     if backend == "cuda":
         lib.qwen_prefill.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
@@ -92,20 +97,47 @@ def n_past():
     return G_lib.qwen_n_past()
 
 
-def generate(prompt_tokens, max_new_tokens=512, stop_ids=EOS_IDS, embd=None, embd_mask=None, pos3=None, **sample_kwargs):
+def prefill_cached(tokens, embd, embd_mask, pos3, cache): # 只有 cpu: 清空状态, 查找加载前缀缓存, prefill 剩余部分, 返回时 prompt 的缓存已写完; 返回命中的 token 数; cache 是 cache_plan 的返回值
+    n = len(tokens)
+    pos, hs, ks, roles, tail, tail_role = cache
+    m = max(1, len(pos))
+    r = G_lib.qwen_prefill_cached((ctypes.c_int * n)(*tokens), n, embd.ctypes.data if embd is not None else None, embd_mask.ctypes.data if embd_mask is not None else None, pos3.ctypes.data if pos3 is not None else None,
+                                  len(pos), (ctypes.c_int * m)(*pos), hs, ks, (ctypes.c_int * m)(*roles), tail, len(tail), tail_role)
+    if r < 0:
+        raise RuntimeError(f"❌ qwen_prefill_cached 失败, 返回 {r}")
+    return r
+
+
+def cache_stats(): # 直接模式 (cpu), 生成结束之后: 同 engine_cache_stats, 序列固定是 0
+    out = (ctypes.c_int * 4)()
+    G_lib.qwen_cache_stats(0, out)
+    return tuple(out)
+
+
+def generate(prompt_tokens, max_new_tokens=512, stop_ids=EOS_IDS, embd=None, embd_mask=None, pos3=None, cache=None, **sample_kwargs):
     # 生成器: 逐个返回新 token id; 调用方负责在新对话前 reset(); embd/embd_mask/pos3 含义同 eval_tokens
+    # cache: cache_plan 的返回值 (只有 cpu), 用 prefill_cached 代替 eval_tokens; 结束 (含中途关闭) 时 qwen_cache_finish: 以 im_end 结束则写输出缓存点, 否则丢掉, 返回前已写完
     t0 = time.time()
-    eval_tokens(prompt_tokens, embd, embd_mask, pos3)
+    hit = 0
+    if cache is None:
+        eval_tokens(prompt_tokens, embd, embd_mask, pos3)
+    else:
+        hit = prefill_cached(prompt_tokens, embd, embd_mask, pos3, cache)
     t1 = time.time()
-    log(f"ℹ️ prefill {len(prompt_tokens)} tokens, {t1 - t0:.2f}s, {len(prompt_tokens) / (t1 - t0):.2f} tok/s")
-    out = []
-    for _ in range(max_new_tokens):
-        tok = sample(hist=out, **sample_kwargs)
-        out.append(tok)
-        yield tok
-        if tok in stop_ids:
-            break
-        eval_tokens([tok])
+    log(f"ℹ️ prefill {len(prompt_tokens)} tokens (缓存命中 {hit}, 计算 {len(prompt_tokens) - hit}), {t1 - t0:.2f}s, {(len(prompt_tokens) - hit) / (t1 - t0):.2f} tok/s")
+    out, ended = [], False
+    try:
+        for _ in range(max_new_tokens):
+            tok = sample(hist=out, **sample_kwargs)
+            out.append(tok)
+            ended = tok in stop_ids
+            yield tok
+            if ended:
+                break
+            eval_tokens([tok])
+    finally:
+        if cache is not None:
+            G_lib.qwen_cache_finish((ctypes.c_int * max(1, len(out)))(*out), len(out), int(ended))
     t2 = time.time()
     log(f"ℹ️ decode {len(out)} tokens, {t2 - t1:.2f}s, {len(out) / max(t2 - t1, 1e-9):.2f} tok/s")
 

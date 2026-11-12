@@ -1,17 +1,20 @@
 // Qwen3.8-27B (qwen35 架构) 纯 CPU 推理, 输入 GGUF (Q4_K_M), 通过 extern "C" 给 python ctypes 调用
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 #include "gguf.h"
 #include "ops.h"
 #include "pool.h"
 #include "quants.h"
+#include "cache.h"
 
 using std::string;
 using std::vector;
@@ -315,6 +318,258 @@ uint64_t rng_next() { // splitmix64
     return z ^ (z >> 31);
 }
 
+// ---------------- 前缀缓存 (文件格式和线程见 cache.h) ----------------
+// 与 cuda 版不同: 每个缓存点都写 kvcache 和 state (没有 2048/512 的规则), prefill 在每个要写的缓存点处切开; KV 是 fp32
+// 调用都在 python 线程 (单序列): qwen_prefill_cached 查找加载、prefill、等 prompt 的缓存写完; decode 时 qwen_eval 每 FLUSH 个 token 交出一段 KV; qwen_cache_finish 结束
+
+const int IM_END = 248046;
+const int N_REC = 48; // DeltaNet 层数
+const size_t SS_FLOATS = (size_t)LV * LHD * LHD, CS_FLOATS = (size_t)QKV_DIM * 3; // 每层 DeltaNet 状态 / conv 状态
+const size_t STATE_FLOATS = N_REC * (SS_FLOATS + CS_FLOATS); // 写盘时拼成 [48 层 DeltaNet][48 层 conv], 与 cuda 的槽状态布局相同
+const size_t KV_PARTS[2] = {KV_DIM * 4, KV_DIM * 4}; // 每 token 每层: K fp32, V fp32
+static_assert(N_LAYER / 4 == Cache::N_ATT, "全注意力层数与 cache.h 不一致");
+char G_model_id[600] = {}; // GGUF 文件名 + 字节数 + 后端格式, 写入缓存 metadata (与 cuda 的不同, 两者的缓存点互相视为无效)
+Cache::Plan* G_plan = nullptr; // qwen_cache_init 之后才有
+std::atomic<int> G_cpend{0}, G_cpf{0}; // 未完成的写入数 / 其中 prompt 的
+std::atomic<uint32_t> G_cver{0}; // 写盘线程完成一项时 +1 并唤醒
+char* G_mbuf = nullptr; // 读 metadata 的缓冲
+int* G_segbuf = nullptr;
+uint8_t* G_lbuf = nullptr; // 读缓存文件的缓冲 (按需扩大)
+size_t G_lcap = 0;
+float* G_sbuf = nullptr; // 压缩 state 解码后的 [STATE_FLOATS]
+
+void state_get(float* dst) { // 各层状态拼成 [48 层 DeltaNet][48 层 conv]
+    for (int l = 0, r = 0; l < N_LAYER; l++) {
+        if (!G_layers[l].recr) continue;
+        memcpy(dst + r * SS_FLOATS, G_layers[l].ssm_state, SS_FLOATS * 4);
+        memcpy(dst + N_REC * SS_FLOATS + r * CS_FLOATS, G_layers[l].conv_state, CS_FLOATS * 4);
+        r++;
+    }
+}
+
+void state_set(const float* src) {
+    for (int l = 0, r = 0; l < N_LAYER; l++) {
+        if (!G_layers[l].recr) continue;
+        memcpy(G_layers[l].ssm_state, src + r * SS_FLOATS, SS_FLOATS * 4);
+        memcpy(G_layers[l].conv_state, src + N_REC * SS_FLOATS + r * CS_FLOATS, CS_FLOATS * 4);
+        r++;
+    }
+}
+
+void kv_get(int a, int b, uint8_t* dst) { // KV 行 [a, b) 拷到 dst (布局见 Cache::gather_seg)
+    size_t n = b - a;
+    for (int l = 3; l < N_LAYER; l += 4) { // 全注意力层
+        memcpy(dst, G_layers[l].k_cache + (size_t)a * KV_DIM, n * KV_DIM * 4);
+        memcpy(dst + n * KV_DIM * 4, G_layers[l].v_cache + (size_t)a * KV_DIM, n * KV_DIM * 4);
+        dst += n * KV_DIM * 8;
+    }
+}
+
+void kv_set(int a, int n, const uint8_t* src) { // kvcache.bin 的一段 (n 个 token) 写回 KV 行 [a, a + n)
+    for (int l = 3; l < N_LAYER; l += 4) {
+        memcpy(G_layers[l].k_cache + (size_t)a * KV_DIM, src, (size_t)n * KV_DIM * 4);
+        memcpy(G_layers[l].v_cache + (size_t)a * KV_DIM, src + (size_t)n * KV_DIM * 4, (size_t)n * KV_DIM * 4);
+        src += (size_t)n * KV_DIM * 8;
+    }
+}
+
+uint8_t* lbuf(size_t n) {
+    if (n > G_lcap) {
+        Sys::unmap(G_lbuf, G_lcap);
+        G_lcap = std::max(n, (size_t)256 << 20);
+        G_lbuf = (uint8_t*)Sys::amap(G_lcap);
+    }
+    return G_lbuf;
+}
+
+int64_t read_file(const char* path) { // 整个文件 (direct IO) 读进 G_lbuf, 返回字节数, 失败 -1
+    int fd = Sys::open(path, Sys::O_RD | Sys::O_DIRECT_);
+    if (fd < 0) return -1;
+    int64_t sz = Sys::fsize(fd);
+    bool ok = sz > 0 && sz % Cache::AL == 0 && Sys::read_all(fd, lbuf(sz), sz, 0);
+    Sys::close(fd);
+    return ok ? sz : -1;
+}
+
+bool load_state(const char* dir, size_t& bytes) { // 先看 state.bin.compressed (多线程解码), 再看 state.bin; 量化线程可能刚好在替换, 最后再试一次压缩版
+    char p[2400];
+    for (int k = 0; k < 3; k++) {
+        bool comp = k != 1;
+        snprintf(p, sizeof(p), comp ? "%s/state.bin.compressed" : "%s/state.bin", dir);
+        int64_t sz = read_file(p);
+        if (sz < 0) continue;
+        bytes += sz;
+        if (!comp) {
+            if (sz != (int64_t)(STATE_FLOATS * 4)) return false;
+            state_set((const float*)G_lbuf);
+            return true;
+        }
+        uint64_t hdr[2];
+        memcpy(hdr, G_lbuf + 8, 16);
+        if (memcmp(G_lbuf, "QSC1", 4) || hdr[0] != STATE_FLOATS || (int64_t)Codec::comp_bytes(hdr[0], hdr[1]) != sz) return false;
+        const uint8_t* c = G_lbuf;
+        size_t n = hdr[0], nb = n / Codec::QK, step = 4096;
+        Pool::run((int)((nb + step - 1) / step), [&](int item, int) { // 与 Codec::decode_cpu 相同, 按块分给线程池
+            const float* amax = (const float*)(c + Codec::off_amax());
+            const uint8_t* idx = c + Codec::off_idx(n);
+            const int8_t* code = (const int8_t*)(c + Codec::off_code(n));
+            for (size_t i = item * step; i < std::min(nb, (item + 1) * step); i++) Codec::decode_block(amax[i], Codec::oct(idx[i]) / 127.0f, code + i * Codec::QK, G_sbuf + i * Codec::QK);
+        });
+        const uint32_t* zi = (const uint32_t*)(c + Codec::off_zero(n));
+        for (size_t i = 0; i < hdr[1]; i++) G_sbuf[zi[i]] = 0;
+        state_set(G_sbuf);
+        return true;
+    }
+    return false;
+}
+
+Cache::Item* new_item(int kind) { // 新建一项, 未完成写入数 +1
+    Cache::Item* it = (Cache::Item*)Sys::amap(sizeof(Cache::Item)); // 已清零
+    it->kind = kind, it->slot = 0, it->P = G_plan;
+    it->pend = &G_cpend, it->ver = &G_cver;
+    G_cpend.fetch_add(1);
+    return it;
+}
+
+void wait_zero(std::atomic<int>& c) { // 等写盘线程把计数清零
+    while (true) {
+        uint32_t v = G_cver.load();
+        if (!c.load()) return;
+        Sys::wait(&G_cver, v);
+    }
+}
+
+void qwen_reset_impl();
+
+int cache_load(int n) { // 状态已清空: 查找 + 加载命中的缓存点 (从后往前找第一个自身有 state、之前所有点都有效的; 不假设 state 一定存在), 决定之后哪些缓存点写入; 返回命中位置 (token 数), 未命中 0
+    Cache::Plan& P = *G_plan;
+    auto t0 = std::chrono::steady_clock::now();
+    char dir[2300], p[2400];
+    int bad = P.n_pts; // 第一个无效的缓存点, 命中只能在它之前
+    for (int i = 0; i < P.n_pts; i++) {
+        Cache::key_dir(P.key[i], dir);
+        Cache::Meta m;
+        P.exist[i] = Cache::meta_read(dir, m, G_segbuf, G_mbuf) && m.start == (i ? P.pos[i - 1] : 0) && m.end == P.pos[i];
+        if (!P.exist[i]) {
+            bad = std::min(bad, i);
+            P.st[i] = 0;
+            continue;
+        }
+        P.npos[i] = m.next_pos;
+        snprintf(p, sizeof(p), "%s/state.bin.compressed", dir);
+        P.st[i] = !Sys::access(p);
+        snprintf(p, sizeof(p), "%s/state.bin", dir);
+        P.st[i] |= !Sys::access(p); // 这里 st 暂时表示 "磁盘上有 state"
+    }
+    int hit = -1;
+    for (int i = bad - 1; i >= 0 && hit < 0; i--) // 最后一个 token 必须重算 (要它的 logits)
+        if (P.st[i] && P.pos[i] < n) hit = i;
+    size_t bytes = 0;
+    for (int j = 0; j <= hit; j++) { // 依次读各缓存点的 kvcache.bin
+        Cache::key_dir(P.key[j], dir);
+        Cache::Meta m;
+        snprintf(p, sizeof(p), "%s/kvcache.bin", dir);
+        int64_t sz = Cache::meta_read(dir, m, G_segbuf, G_mbuf) ? read_file(p) : -1;
+        size_t need = 0;
+        for (int k = 0; k < m.n_segs; k++) need += Cache::seg_bytes(G_segbuf[k]);
+        if (sz < 0 || (size_t)sz != need) {
+            fprintf(stderr, "⚠️ 缓存点 %s 读取失败, 不使用缓存\n", dir);
+            hit = -1;
+            break;
+        }
+        bytes += sz;
+        for (int k = 0, a = m.start, off = 0; k < m.n_segs; k++) {
+            kv_set(a, G_segbuf[k], G_lbuf + off);
+            a += G_segbuf[k];
+            off += Cache::seg_bytes(G_segbuf[k]);
+        }
+    }
+    if (hit >= 0) {
+        Cache::key_dir(P.key[hit], dir);
+        if (!load_state(dir, bytes)) {
+            fprintf(stderr, "⚠️ 缓存点 %s 的 state 读取失败, 不使用缓存\n", dir);
+            hit = -1;
+        }
+    }
+    if (hit < 0) {
+        qwen_reset_impl(); // 可能已经写了一部分
+        bytes = 0;
+    } else {
+        for (int j = 0; j <= hit; j++) { // 命中: 更新所用缓存点 metadata 的 mtime (清理按它判断)
+            Cache::key_dir(P.key[j], dir);
+            snprintf(p, sizeof(p), "%s/metadata.txt", dir);
+            Sys::touch(p);
+        }
+        G_n_past = P.pos[hit];
+        G_next_pos = P.npos[hit];
+    }
+    for (int i = 0; i < P.n_pts; i++) P.st[i] = i > hit && !P.exist[i]; // 命中之后的缓存点全部写 (kvcache + state), 已有效存在的不重写
+    P.hit = hit, P.pf_next = hit + 1;
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (hit >= 0) fprintf(stderr, "ℹ️ 前缀缓存命中 %d / %d tokens (第 %d / %d 个缓存点), 读取 %.1fMB, %.3fs\n", G_n_past, n, hit + 1, P.n_pts, bytes / 1048576.0, sec);
+    else fprintf(stderr, "ℹ️ 前缀缓存未命中 (%d 个缓存点), %.3fs\n", P.n_pts, sec);
+    return G_n_past;
+}
+
+void pf_flush(int p1, bool state) { // 缓存点 [pf_next, p1) 的 KV (以及 p1 - 1 的 state) 拷出, 交给写盘线程
+    Cache::Plan& P = *G_plan;
+    int p0 = P.pf_next;
+    bool any = state;
+    for (int j = p0; j < p1; j++) any |= !P.exist[j];
+    P.pf_next = std::max(p0, p1);
+    if (p1 <= p0 || !any) return;
+    Cache::Item* it = new_item(Cache::K_PF);
+    it->p0 = p0, it->p1 = p1, it->a = p0 ? P.pos[p0 - 1] : 0, it->b = P.pos[p1 - 1];
+    it->kv_cap = Cache::al((size_t)(it->b - it->a) * Cache::G_tok_bytes);
+    it->kv = (uint8_t*)Sys::amap(it->kv_cap);
+    kv_get(it->a, it->b, it->kv);
+    if (state) {
+        it->state = (uint8_t*)Sys::amap(STATE_FLOATS * 4);
+        state_get((float*)it->state);
+    }
+    it->pend_pf = &G_cpf;
+    G_cpf.fetch_add(1);
+    Cache::push(it);
+}
+
+void out_flush(bool fin, const int* out, int n_out) { // 输出的 KV 每 FLUSH 个 token 交给写盘线程一段; fin: 最后一段 + 输出缓存点 (key、state 一定写); out: 全部输出 token (含 im_end), 只在 fin 时用
+    Cache::Plan& P = *G_plan;
+    int a = P.out_flushed, b = G_n_past;
+    if (!fin && b - a < Cache::FLUSH) return;
+    Cache::Item* it = new_item(fin ? Cache::K_FIN : Cache::K_SEG);
+    it->a = a, it->b = b, it->off = P.out_off;
+    if (b > a) {
+        it->kv_cap = Cache::al((size_t)(b - a) * Cache::G_tok_bytes);
+        it->kv = (uint8_t*)Sys::amap(it->kv_cap);
+        kv_get(a, b, it->kv);
+        P.segs[P.n_segs++] = b - a;
+        P.out_off += Cache::seg_bytes(b - a);
+    }
+    P.out_flushed = b;
+    if (fin) {
+        uint8_t h[32];
+        Sha::Ctx c = P.out_sha; // 输出段 = prompt 末尾 (已输入) + 全部输出 token (含 im_end)
+        Sha::update(c, out, (size_t)n_out * 4);
+        Sha::final(c, h);
+        Sha::init(c);
+        for (int i = 0; i < P.n_pts; i++) Sha::update(c, P.hash[i], 32);
+        Sha::update(c, h, 32);
+        Sha::final(c, it->key);
+        it->npos = G_next_pos;
+        it->state = (uint8_t*)Sys::amap(STATE_FLOATS * 4);
+        state_get((float*)it->state);
+        P.out_on = 0;
+    }
+    Cache::push(it);
+}
+
+void out_abort() { // 输出没有以 im_end 结束 (长度上限 / 其他停止 token / 客户端断开): 不生成输出缓存点, 删除已写的临时文件
+    if (!G_plan || !G_plan->out_on) return;
+    G_plan->out_on = 0;
+    if (G_plan->n_segs) Cache::push(new_item(Cache::K_ABORT));
+    wait_zero(G_cpend); // 写盘线程处理时要读 G_plan (临时目录编号), 下一个请求会立刻覆盖它
+}
+
 } // namespace
 
 extern "C" {
@@ -326,6 +581,7 @@ int qwen_init(const char* path, int n_threads, int max_ctx) {
     }
     auto t0 = std::chrono::steady_clock::now();
     if (!Gguf::open(G_file, path)) return -1;
+    snprintf(G_model_id, sizeof(G_model_id), "%s %zu cpu_f32", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, G_file.size);
     if (G_file.kv_str["general.architecture"] != "qwen35") {
         fprintf(stderr, "❌ 架构不是 qwen35: %s\n", G_file.kv_str["general.architecture"].c_str());
         return -1;
@@ -426,6 +682,7 @@ int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_m
         eval_chunk(tokens + i, T, embd ? embd + (size_t)r * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
         for (int t = i; embd_mask && t < i + T; t++) r += embd_mask[t];
     }
+    if (G_plan && G_plan->out_on) out_flush(false, nullptr, 0); // qwen_prefill_cached 之后的 decode: 每 FLUSH 个 token 交出一段 KV
     return 0;
 }
 
@@ -481,6 +738,15 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
 void qwen_seed(uint64_t seed) { G_rng = seed; }
 
 void qwen_reset() {
+    out_abort(); // 上一次 qwen_prefill_cached 没有 qwen_cache_finish (异常中断) 时, 丢掉它的输出缓存
+    qwen_reset_impl();
+}
+
+} // extern "C"
+
+namespace {
+
+void qwen_reset_impl() {
     for (int l = 0; l < N_LAYER; l++) {
         Layer& L = G_layers[l];
         if (!L.recr) continue;
@@ -489,6 +755,110 @@ void qwen_reset() {
     }
     G_n_past = 0;
     G_next_pos = 0;
+}
+
+} // namespace
+
+extern "C" {
+
+int qwen_cache_init(const char* dir, int quant_threads) { // 在 qwen_init 之后调用一次: 启用前缀缓存, dir 由 python 检查并加锁, 其中 tmp/ 已清空; 0 成功
+    if (!G_inited || !Cache::init(dir, G_model_id, STATE_FLOATS * 4, G_max_ctx, quant_threads, KV_PARTS, 2)) return -1;
+    G_mbuf = (char*)Sys::amap(Cache::MBUF + 1);
+    G_segbuf = (int*)Sys::amap((size_t)Cache::G_max_segs * 4);
+    G_sbuf = (float*)Sys::amap(STATE_FLOATS * 4);
+    Cache::Plan* P = new (Sys::amap(sizeof(Cache::Plan))) Cache::Plan();
+    const int M = Cache::MAXP;
+    P->pos = (int*)Sys::amap((size_t)M * 4);
+    P->hash = (uint8_t (*)[32])Sys::amap((size_t)M * 32);
+    P->key = (uint8_t (*)[32])Sys::amap((size_t)M * 32);
+    P->role = (int*)Sys::amap((size_t)M * 4);
+    P->npos = (int*)Sys::amap((size_t)M * 4);
+    P->exist = (uint8_t*)Sys::amap(M);
+    P->st = (uint8_t*)Sys::amap(M);
+    P->segs = (int*)Sys::amap((size_t)Cache::G_max_segs * 4);
+    G_plan = P;
+    fprintf(stderr, "✅ 前缀缓存已启用: %s, 量化线程 %d\n", dir, quant_threads);
+    return 0;
+}
+
+int qwen_prefill_cached(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3, int n_pts, const int* pts_pos, const uint8_t* pts_hash, const uint8_t* pts_key, const int* pts_role, const uint8_t* tail, int n_tail, int tail_role) {
+    // 带前缀缓存的 prefill (先清空状态): 参数同 qwen_eval, 缓存点参数同 cuda 版 qwen_prefill; 返回命中的 token 数 (>= 0), 失败 < 0
+    // 返回时 prompt 的缓存已全部写完; 之后用 qwen_sample / qwen_eval 逐个生成, 结束时必须调 qwen_cache_finish
+    if (!G_inited || !G_plan || n <= 0 || n > G_max_ctx || n_pts < 0 || n_pts > Cache::MAXP) {
+        fprintf(stderr, "❌ qwen_prefill_cached 参数错误: prompt %d (最大上下文 %d), 缓存点 %d 个 (上限 %d), 缓存%s启用\n", n, G_max_ctx, n_pts, Cache::MAXP, G_plan ? "已" : "未");
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        if ((!embd_mask || !embd_mask[i]) && (tokens[i] < 0 || tokens[i] >= VOCAB)) {
+            fprintf(stderr, "❌ token id 越界: %d\n", tokens[i]);
+            return -3;
+        }
+    }
+    for (int i = 0; i < n_pts; i++) {
+        if (pts_pos[i] <= (i ? pts_pos[i - 1] : 0) || pts_pos[i] > n) {
+            fprintf(stderr, "❌ 缓存点位置不合法: 第 %d 个 = %d\n", i, pts_pos[i]);
+            return -1;
+        }
+    }
+    qwen_reset();
+    Cache::Plan& P = *G_plan;
+    P.n_pts = n_pts;
+    P.hit = -1, P.w_kv_in = 0, P.w_st_in = 0, P.w_st_out = 0;
+    memcpy(P.pos, pts_pos, (size_t)n_pts * 4);
+    memcpy(P.hash, pts_hash, (size_t)n_pts * 32);
+    memcpy(P.key, pts_key, (size_t)n_pts * 32);
+    memcpy(P.role, pts_role, (size_t)n_pts * 4);
+    Sha::init(P.out_sha);
+    Sha::update(P.out_sha, tail, n_tail);
+    P.out_role = tail_role;
+    auto t0 = std::chrono::steady_clock::now();
+    int i = cache_load(n), hit = i, r = 0, ck = P.hit + 1; // r: 之前的图片行数; ck: 下一个要写的缓存点
+    for (int t = 0; embd_mask && t < i; t++) r += embd_mask[t];
+    while (i < n) {
+        int T = std::min(CHUNK, n - i);
+        while (ck < P.n_pts && !P.st[ck]) ck++;
+        if (ck < P.n_pts) T = std::min(T, P.pos[ck] - i); // chunk 在要写的缓存点处切开
+        eval_chunk(tokens + i, T, embd ? embd + (size_t)r * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+        for (int t = i; embd_mask && t < i + T; t++) r += embd_mask[t];
+        i += T;
+        if (ck < P.n_pts && P.pos[ck] == i) {
+            P.npos[ck] = G_next_pos;
+            pf_flush(++ck, true);
+        }
+    }
+    pf_flush(P.n_pts, false);
+    P.out_on = 1; // 输出缓存点的段从最后一个缓存点开始 (含 prompt 末尾)
+    P.out_start = P.out_flushed = P.n_pts ? P.pos[P.n_pts - 1] : 0;
+    P.out_off = 0, P.n_segs = 0, P.out_id = Cache::G_out_seq.fetch_add(1);
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    auto t1 = std::chrono::steady_clock::now();
+    wait_zero(G_cpf); // prompt 的缓存写完才返回 (之后才出第一个 token)
+    fprintf(stderr, "ℹ️ prefill %d tokens (缓存命中 %d, 计算 %d), %.2fs, %.2f tok/s; 等缓存写完 %.2fs\n", n, hit, n - hit, sec, (n - hit) / sec, std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count());
+    return hit;
+}
+
+int qwen_cache_finish(const int* out, int n_out, int ended) { // qwen_prefill_cached 之后生成结束时调用: out 是全部输出 token; ended: 是否因停止 token 结束
+    // 以 im_end 结束时先把 im_end 算进 KV / 状态, 再生成输出缓存点 (kvcache + state); 否则丢掉输出缓存; 返回时输出的缓存已全部写完
+    if (!G_plan || !G_plan->out_on) return 0;
+    if (ended && n_out > 0 && out[n_out - 1] == IM_END && G_n_past < G_max_ctx) {
+        int r = qwen_eval(&IM_END, 1, nullptr, nullptr, nullptr);
+        if (r) return r;
+        out_flush(true, out, n_out);
+    } else {
+        out_abort();
+    }
+    wait_zero(G_cpend);
+    return 0;
+}
+
+int qwen_cache_stats(int sq, int* out) { // 与 cuda 接口相同, cpu 只有一个序列, sq 必须是 0: [命中的输入 token 数, 输入新写入的 KV token 数, 输入新写入的 state 数, 输出写入的 state 数]
+    if (sq != 0) return -1;
+    bool on = G_plan && G_plan->n_pts >= 0;
+    out[0] = on && G_plan->hit >= 0 ? G_plan->pos[G_plan->hit] : 0;
+    out[1] = on ? G_plan->w_kv_in.load() : 0;
+    out[2] = on ? G_plan->w_st_in.load() : 0;
+    out[3] = on ? G_plan->w_st_out.load() : 0;
+    return 0;
 }
 
 int qwen_n_past() { return G_n_past; }

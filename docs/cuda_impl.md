@@ -90,7 +90,7 @@ lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, �
 
 ### 4.2 前缀缓存 (磁盘)
 
-`server.py --cache-dir <目录>` 启用 (直接使用该目录; 目前只有 cuda 实现, 支持的后端列在 `qwen.CACHE_BACKENDS`)。`router.py --cache-dir <根目录>` 必填: router 只检查根目录 (不存在则创建, 上级必须存在), 给支持缓存的后端传 `<根目录>/<后端名>`, 不支持的不传, 子目录由 server 按下面的规则处理。python 在启动时检查目录 (不存在且上级存在 / 空目录 / 有 `cache.lock`, 否则退出), 对 `cache.lock` (空文件) 加 `flock` (已被占用时从 `/proc/locks` 按 inode 找到持有者的 pid, 打印它和 `/proc/<pid>/cmdline` 后退出, 找不到也如实打印; 通过 router 启动时 router 也随之退出), 清空 `tmp/`, 再调 `qwen_cache_init`。
+`server.py --cache-dir <目录>` 启用 (直接使用该目录; 支持的后端列在 `qwen.CACHE_BACKENDS`, cpu 版的区别见 docs/cpu_impl.md 9.1 节)。`router.py --cache-dir <根目录>` 必填: router 只检查根目录 (不存在则创建, 上级必须存在), 给支持缓存的后端传 `<根目录>/<后端名>`, 不支持的不传, 子目录由 server 按下面的规则处理。python 在启动时检查目录 (不存在且上级存在 / 空目录 / 有 `cache.lock`, 否则退出), 对 `cache.lock` (空文件) 加 `flock` (已被占用时从 `/proc/locks` 按 inode 找到持有者的 pid, 打印它和 `/proc/<pid>/cmdline` 后退出, 找不到也如实打印; 通过 router 启动时 router 也随之退出), 清空 `tmp/`, 再调 `qwen_cache_init`。
 
 - **缓存点**: 每个 im_end token (id 248046) 之后 (system、user、assistant、tool 消息都以它结束), 没有按固定 token 数的缓存点。prompt 末尾的生成提示 (im_start + `assistant\n` + 思考开始 token + ...) 不是消息边界, 它和之后的输出 (thinking + 正文) 一起算作 assistant 段, 输出以 im_end token 结束时才产生缓存点 (以其他停止 token、长度上限或取消结束时不产生, 已写的临时文件删除)。为了让缓存点包含这个 im_end token 本身, 采样到它之后 decode 循环会再算一步把它写进 KV / 状态
 - **key** (python `qwen.cache_plan`): 每段 (两个缓存点之间) 的 token 按 int32 小端序列化, 每张图片 (连续的图片 token) 换成 int32 `[-1, t, h, w]` + 图片原始字节的 sha256, 段的 hash = sha256(序列化); 缓存点的 key = sha256(从头到该点各段 hash 的拼接)。python 把各缓存点的位置、段 hash、key 和最后一个缓存点之后 prompt 的序列化传给 `qwen_prefill`, 输出缓存点的 key 由 C++ 接上输出 token 算出
@@ -102,7 +102,7 @@ lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, �
 - 除 metadata 外的缓存文件读写都用 direct IO (`O_DIRECT`, 缓冲为匿名 mmap, 大小和偏移 4096 对齐), 启动时先测试目录是否支持
 - 线程: 写盘线程和量化线程是本 so 在 `qwen_cache_init` 中创建的 musl 线程, 只做文件 IO 和 CPU 计算, 不调 libcuda; 所有 GPU 拷贝都在 prefill / decode 线程 (python 创建的 glibc 线程) 里做, 这些线程里的文件操作全部直接 syscall, 内存用 mmap, 不用 musl 的 errno / 锁 / FILE
 - **统计**: `qwen_cache_stats` 在请求结束后返回 [命中的输入 token 数, 输入新写入的 KV token 数, 输入新写入的 state 数, 输出写入的 state 数] (写盘线程实际写成功的), server 放进 usage (README)
-- 暂未实现: 清理线程 (缓存目前只增不减)、CPU 后端
+- 暂未实现: 清理线程 (缓存目前只增不减)
 
 ## 5. 验证
 
