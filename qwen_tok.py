@@ -101,13 +101,13 @@ def bpe(word): # 与 HF BPE 相同: 每次合并 (merge 序号, 位置) 最小�
     heapq.heapify(heap)
     while heap:
         r, k = heapq.heappop(heap)
-        if not sym[k] or nxt[k] >= len(sym):
+        if sym[k] is None or nxt[k] >= len(sym): # None: 已被合并进左边
             continue
         q = nxt[k]
         m = G_ranks.get((sym[k], sym[q]))
         if not m or m[0] != r: # 这一对已经变了
             continue
-        sym[k], sym[q] = m[1], ""
+        sym[k], sym[q] = m[1], None
         nxt[k] = nxt[q]
         if nxt[k] < len(sym):
             prv[nxt[k]] = k
@@ -118,7 +118,7 @@ def bpe(word): # 与 HF BPE 相同: 每次合并 (merge 序号, 位置) 最小�
             m2 = G_ranks.get((sym[prv[k]], sym[k]))
             if m2:
                 heapq.heappush(heap, (m2[0], prv[k]))
-    return [G_vocab[t] for t in sym if t]
+    return [G_vocab[t] for t in sym if t is not None]
 
 
 def encode(text): # 正文 -> id (不含任何控制 token)

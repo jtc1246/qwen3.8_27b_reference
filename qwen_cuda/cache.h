@@ -322,7 +322,8 @@ const char* ROLE_NAMES[4] = {"system", "user", "assistant", "tool"};
 
 inline size_t al(size_t x) { return (x + AL - 1) & ~(AL - 1); }
 
-char G_dir[2048] = {}; // 缓存根目录 (已按后端区分), 空表示不启用
+char G_dir[2048] = {}; // 缓存目录
+bool G_on = false; // init 成功后为 true
 char G_model[512] = {}; // 模型标识 (文件名 + 字节数), 写入 metadata, 读取时不一致则视为无效
 size_t G_state_bytes = 0;
 int G_qthreads = 8;
@@ -758,9 +759,9 @@ bool init(const char* dir, const char* model, size_t state_bytes, int max_ctx, i
     Sys::unmap(b, AL);
     if (!ok) {
         fprintf(stderr, "❌ 缓存目录 %s 不支持 direct IO (O_DIRECT)\n", G_dir);
-        G_dir[0] = 0;
         return false;
     }
+    G_on = true;
     std::thread(WriterInternal::writer_main).detach();
     std::thread(WriterInternal::quant_main).detach();
     return true;

@@ -701,9 +701,9 @@ int qwen_init(const char* path, int device, int max_ctx) { // max_ctx: 每个槽
     }
     auto t0 = std::chrono::steady_clock::now();
     Cu::init(device, qwen_fatbin, G_dec_sm);
-    const char* tnames[] = {"f32", "", "", "", "", "", "", "", "q8_0", "", "", "", "q4_k", "q5_k", "q6_k"};
+    const char* tnames[] = {"f32", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "q8_0", nullptr, nullptr, nullptr, "q4_k", "q5_k", "q6_k"}; // nullptr: 不支持的类型
     for (int t = 0; t < 15; t++) {
-        if (!tnames[t][0]) continue;
+        if (!tnames[t]) continue;
         G_k_gemm[t] = Cu::func(("k_gemm_" + string(tnames[t])).c_str());
         G_k_dq[t] = Cu::func(("k_dq_" + string(tnames[t])).c_str());
         G_k_embed[t] = Cu::func(("k_embed_" + string(tnames[t])).c_str());
@@ -1016,7 +1016,7 @@ int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd
         Slot& S = G_slots[sq];
         Cache::Plan* P = S.cp;
         if (P) {
-            P->n_pts = Cache::G_dir[0] ? n_pts : -1;
+            P->n_pts = Cache::G_on ? n_pts : -1;
             P->hit = -1, P->w_kv_in = 0, P->w_st_in = 0, P->w_st_out = 0;
             if (n_pts > Cache::MAXP) {
                 fprintf(stderr, "⚠️ 缓存点 %d 个超过上限 %d, 本请求不用前缀缓存\n", n_pts, Cache::MAXP);

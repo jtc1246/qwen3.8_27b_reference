@@ -45,7 +45,7 @@ def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm
             lib.qwen_set_dec_sm(dec_sm)
     if lib.qwen_init(gguf_path.encode(), n_threads if backend == "cpu" else device, max_ctx) != 0: # 第二个参数: cpu 是线程数, cuda 是 GPU 编号
         raise RuntimeError(f"❌ 模型加载失败: {gguf_path}")
-    if cache_dir and lib.qwen_cache_init(cache_dir.encode(), cache_threads) != 0:
+    if cache_dir is not None and lib.qwen_cache_init(cache_dir.encode(), cache_threads) != 0:
         raise RuntimeError(f"❌ 前缀缓存初始化失败: {cache_dir}")
     G_lib = lib
     G_backend = backend

@@ -3,7 +3,7 @@
 # cpu: C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
 # cuda: 引擎模式, 最多 qwen.nseq() (4) 个请求同时进行: 超出的在 python 按到达顺序排队; prefill 在 C++ 里按顺序逐个算, decode 所有序列每步一起算, 两者同时跑时按 SM 分区
 # --type 选择后端 (qwen.LIBS), cuda 时视觉塔也在 GPU 上; 视觉塔输出按图片原始字节的 sha256 缓存在内存 (LRU)
-import os, re, sys, io, json, time, uuid, codecs, fcntl, shlex, base64, random, ctypes, shutil, hashlib, argparse, threading, contextlib, urllib.request
+import os, re, sys, io, json, time, uuid, codecs, fcntl, shlex, base64, random, ctypes, shutil, hashlib, argparse, threading, contextlib
 from collections import OrderedDict, deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import numpy as np
@@ -92,25 +92,25 @@ def load_vision(hf_dir):
     return vis.eval().to(G_dev)
 
 
-def load_image(url): # 返回 (RGB 图片, 原始字节的 sha256)
-    if url.startswith("data:"):
-        data = base64.b64decode(url.split(",", 1)[1])
-    elif url.startswith("http://") or url.startswith("https://"):
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            data = resp.read()
-    else:
-        raise BadRequest("图片只支持 data URL (base64) 或 http(s) URL")
+def load_image(url): # 只支持 base64 的 data URL (data:<类型>;base64,<数据>), 不支持链接, 不会因为图片产生网络请求; 返回 (RGB 图片, 原始字节的 sha256)
+    head, sep, b64 = url.partition(",")
+    if not head.startswith("data:") or not head.endswith(";base64") or not sep:
+        raise BadRequest(f"图片只支持 base64 的 data URL (data:<类型>;base64,<数据>), 收到的开头是 {url[:64]!r}")
+    try:
+        data = base64.b64decode(b64, validate=True) # 严格解码: 有非 base64 字符直接报错, 不悄悄跳过
+    except ValueError as e:
+        raise BadRequest(f"图片的 base64 数据不合法: {e}")
     return Image.open(io.BytesIO(data)).convert("RGB"), hashlib.sha256(data).hexdigest()
 
 
-REASONING = { # 与 chat_template.jinja 的 reasoning_instructions 相同 (medium 为空)
+REASONING = { # 与 chat_template.jinja 的 reasoning_instructions 相同 (medium 没有指令)
     "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
-    "medium": "",
+    "medium": None,
     "low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
 }
 
 
-def render_content(content, is_system): # 同模板的 render_content, 但不做 trim (正文原样): 返回片段列表, str 是正文 (空串去掉), int 是控制 token id
+def render_content(content, is_system): # 同模板的 render_content, 但不做 trim (正文原样): 返回片段列表, str 是正文, int 是控制 token id
     if isinstance(content, str):
         parts = [content]
     elif content is None:
@@ -123,29 +123,21 @@ def render_content(content, is_system): # 同模板的 render_content, 但不做
                     raise BadRequest("System message cannot contain images.")
                 parts += [qwen_tok.CTL["<|vision_start|>"], qwen_tok.CTL["<|image_pad|>"], qwen_tok.CTL["<|vision_end|>"]]
             else:
-                parts.append(str(it.get("text", "")))
+                parts.append(it["text"]) # convert_messages 已保证是字符串
     else:
         raise BadRequest("Unexpected content type.")
-    return [x for x in parts if x != ""]
-
-
-def flat(parts): # 只用于模板里对正文字符串的判断 (startswith 等)
-    return "".join(x if isinstance(x, str) else "\0" for x in parts)
+    return parts
 
 
 def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinja 的结构 (不含 tools) 直接拼 token, 但正文不 trim, 也不补模板为 trim 加的换行: 正文只用 qwen_tok.encode 按文本分词 (不可能产生控制 token), 控制 token 由这里按 id 插入; <|image_pad|> 按 grid 展开
     C = qwen_tok.CTL
     seq = [] # str 或 int
-    ri = REASONING[effort or "xhigh"] if enable_thinking else ""
-    if msgs[0]["role"] == "system":
-        c = render_content(msgs[0]["content"], True)
-        if c:
-            seq += [C["<|im_start|>"], "system\n" + (ri + "\n\n" if ri else "")] + c + [C["<|im_end|>"], "\n"]
-        elif ri:
-            seq += [C["<|im_start|>"], "system\n" + ri, C["<|im_end|>"], "\n"]
-    elif ri:
+    ri = REASONING[effort if effort is not None else "xhigh"] if enable_thinking else None # None: 没有 reasoning 指令
+    if msgs[0]["role"] == "system": # 有 system 消息就有 system 块, 内容原样 (不判断是否为空)
+        seq += [C["<|im_start|>"], "system\n" + (ri + "\n\n" if ri is not None else "")] + render_content(msgs[0]["content"], True) + [C["<|im_end|>"], "\n"]
+    elif ri is not None:
         seq += [C["<|im_start|>"], "system\n" + ri, C["<|im_end|>"], "\n"]
-    if not any(m["role"] == "user" and not (flat(render_content(m["content"], False)).startswith("<tool_response>") and flat(render_content(m["content"], False)).endswith("</tool_response>")) for m in msgs):
+    if not any(m["role"] == "user" for m in msgs): # 模板要求至少有一条 user 消息; 不按正文内容判断 (正文一律是普通文本)
         raise BadRequest("No user query found in messages.")
     for i, m in enumerate(msgs):
         c = render_content(m["content"], False)
@@ -156,9 +148,9 @@ def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinj
             seq += [C["<|im_start|>"], "user\n"] + c + [C["<|im_end|>"], "\n"]
         elif m["role"] == "assistant": # 还原成当时的生成提示 + 模型原样生成的内容 (本服务返回的 reasoning_content / content 都是原样的)
             rc = m.get("reasoning_content")
-            if isinstance(rc, str) and rc: # 开 thinking 的轮次: 生成提示到 "<think>\n", 之后 (含 </think> 前后的换行) 都是模型生成的
+            if isinstance(rc, str): # 有 reasoning_content (不管是否为空) 就是开 thinking 的轮次: 生成提示到思考开始 token + "\n", 之后 (含思考结束 token 前后的换行) 都是模型生成的
                 seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n" + rc, C["</think>"]] + c + [C["<|im_end|>"], "\n"]
-            else: # 不开 thinking 的轮次: 生成提示是 "<think>\n\n</think>\n\n", 之后是正文
+            else: # 没有 reasoning_content 字段: 不开 thinking 的轮次, 生成提示是 思考开始 "\n\n" 思考结束 "\n\n", 之后是正文
                 seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n\n", C["</think>"], "\n\n"] + c + [C["<|im_end|>"], "\n"]
         elif m["role"] == "tool":
             if i and msgs[i - 1]["role"] != "tool":
@@ -174,8 +166,7 @@ def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinj
         if isinstance(x, str):
             buf.append(x)
             continue
-        if buf and "".join(buf): # 两个控制 token 之间的正文整段分词 (与官方在 added token 处切开后各段分词相同)
-            ids += qwen_tok.encode("".join(buf))
+        ids += qwen_tok.encode("".join(buf)) # 两个控制 token 之间的正文整段分词 (与官方在 added token 处切开后各段分词相同)
         buf = []
         if x is None:
             break
@@ -200,10 +191,15 @@ def convert_messages(messages): # OpenAI 格式 -> chat 模板格式, 图片和 
             parts = []
             for p in content:
                 if p.get("type") == "text":
-                    parts.append({"type": "text", "text": p.get("text", "")})
+                    if not isinstance(p.get("text"), str):
+                        raise BadRequest("text 类型的 content 必须有字符串 text 字段")
+                    parts.append({"type": "text", "text": p["text"]})
                 elif p.get("type") == "image_url":
                     iu = p.get("image_url")
-                    img, h = load_image(iu if isinstance(iu, str) else iu.get("url", ""))
+                    url = iu if isinstance(iu, str) else (iu.get("url") if isinstance(iu, dict) else None)
+                    if not isinstance(url, str):
+                        raise BadRequest("image_url 必须是字符串或带字符串 url 字段的对象")
+                    img, h = load_image(url)
                     images.append(img)
                     hashes.append(h)
                     parts.append({"type": "image"})
@@ -265,7 +261,9 @@ def thinking_options(body): # 返回 (enable_thinking, reasoning_effort)
         return False, None
     if effort is not None and effort not in EFFORT_MAP:
         raise BadRequest(f"不支持的 reasoning_effort: {effort}")
-    return bool(enable), (EFFORT_MAP[effort] if effort else None)
+    if not isinstance(enable, bool):
+        raise BadRequest("enable_thinking 必须是 true / false")
+    return enable, (EFFORT_MAP[effort] if effort is not None else None)
 
 
 def rope_positions(ids, grids): # 与 HF Qwen3_5Model.get_rope_index 一致 (只处理图片)
@@ -311,7 +309,7 @@ def build_prompt(body): # 锁外执行: 解析消息、下载图片、拼 token 
     seed = body.get("seed")
     if seed is not None and not isinstance(seed, int):
         raise BadRequest("seed 必须是整数")
-    cache = qwen.cache_plan(ids, list(zip(hashes, out["image_grid_thw"].tolist() if images else []))) if G_cache_dir else None
+    cache = qwen.cache_plan(ids, list(zip(hashes, out["image_grid_thw"].tolist() if images else []))) if G_cache_dir is not None else None
     so = body.get("stream_options")
     return {"ids": ids, "out": out, "hashes": hashes, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images), "cache": cache, "cache_stats": (0, 0, 0, 0),
             "include_usage": bool(isinstance(so, dict) and so.get("include_usage"))}
@@ -546,7 +544,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             gen.close() # 客户端断开时也会走到这里, 结束生成并释放锁
         field, rest = dec.finish()
-        fin = {**base, "choices": [{"index": 0, "delta": {field: rest} if rest else {}, "finish_reason": "stop" if last in qwen.EOS_IDS else "length"}]} # rest: 长度上限截断时剩下的不完整字节 (U+FFFD)
+        fin = {**base, "choices": [{"index": 0, "delta": {field: rest}, "finish_reason": "stop" if last in qwen.EOS_IDS else "length"}]} # rest: 截断时剩下的不完整字节 (U+FFFD), 一般为空串
         if p["include_usage"]: # OpenAI: stream_options.include_usage 时在 [DONE] 前单独发一个 choices 为空、带 usage 的 chunk
             self.write_sse(fin)
             self.write_sse({**base, "choices": [], "usage": make_usage(p, n_out)})
@@ -568,7 +566,7 @@ def main():
     p.add_argument("--device", type=int, default=0, help="cuda 后端使用的 GPU 编号")
     p.add_argument("--ctx", type=int, default=None, help="最大上下文 (prompt + 输出), 默认 cpu 32768, cuda 262144; cuda 是每个槽的上下文, 启动时分配全部槽的 KV")
     p.add_argument("--dec-ratio", type=float, default=0.31, help="cuda: prefill 和 decode 同时运行时 decode 分区占的 SM 比例 (其余给 prefill), 取最近的可用值 (偶数个, 两边都至少 8 个), 本卡 156 SM 时 0.31 为 48 个")
-    p.add_argument("--max-image-pixels", type=int, default=1048576, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 0 表示用官方默认 16777216")
+    p.add_argument("--max-image-pixels", type=int, default=16777216, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 默认与官方 preprocessor_config 相同 (16777216), 0 也表示用官方配置")
     p.add_argument("--model-name", default="qwen3.8-27b", help="模型名前缀, 对外返回的名称是 {model-name}-{type}; 请求里的 model 不校验")
     p.add_argument("--image-cache-mb", type=int, default=4096, help="视觉塔输出缓存上限 (MB, 只在内存, LRU 淘汰), 0 表示不缓存")
     p.add_argument("--cache-dir", default=None, help=f"前缀缓存 (磁盘) 目录, 不指定则不启用; 支持的后端 {list(qwen.CACHE_BACKENDS)}; 通过 router 启动时由 router 传入 <router 的 --cache-dir>/<type>")
@@ -585,9 +583,9 @@ def main():
         G_dev = f"cuda:{G_args.device}"
         n_sm = torch.cuda.get_device_properties(G_args.device).multi_processor_count
         dec_sm = min(max(round(n_sm * G_args.dec_ratio / 2) * 2, 8), n_sm - 8) # green context 按 2 个 SM 分, 每个分区至少 8 个
-    if G_args.cache_dir and G_args.type not in qwen.CACHE_BACKENDS:
+    if G_args.cache_dir is not None and G_args.type not in qwen.CACHE_BACKENDS:
         log(f"⚠️ {G_args.type} 后端暂不支持前缀缓存, 忽略 --cache-dir")
-    elif G_args.cache_dir:
+    elif G_args.cache_dir is not None:
         G_cache_dir = open_cache_dir(G_args.cache_dir)
     qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None, G_cache_dir, G_args.cache_threads)
     if G_args.type == "cuda":
