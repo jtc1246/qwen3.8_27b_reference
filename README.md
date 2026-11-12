@@ -84,12 +84,12 @@ python -u server.py --type cuda --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --hf-dir
 python -u tests/test_server.py --base http://127.0.0.1:8000/v1
 ```
 
-`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数) 或 `cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。`--ctx` 默认 cpu 32768, cuda 262144 (cuda 是每个槽的上下文, 启动时分配 4 个槽的 KV, 约 52GB 显存)。
+`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数) 或 `cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。`--ctx` 默认 cpu 32768, cuda 262144 (cuda 是每个槽的上下文, 启动时分配 4 个槽的 KV, 约 52GB 显存)。`--cache-dir <目录>` 启用磁盘前缀缓存 (目前只有 cuda, 直接使用该目录, 见 docs/cuda_impl.md 4.2 节); 通过 router 启动时由 router 统一传入。
 
 ### 多后端路由
 
 ```bash
-python -u router.py --mask 11 --port 8000 --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --hf-dir /path/to/Qwen3.8-27B
+python -u router.py --mask 11 --port 8000 --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --hf-dir /path/to/Qwen3.8-27B --cache-dir /path/to/cache_root
 python -u tests/test_router.py --base http://127.0.0.1:8000/v1
 python -u tests/test_server.py --base http://127.0.0.1:8000/v1 --model qwen3.8-27b-cuda # 经路由测某个后端
 ```
@@ -107,22 +107,26 @@ python -u tests/smoke_test.py --type cuda --gguf /path/to/Qwen3.8-27B-Q4_K_M.ggu
 python 代码在仓库根目录, 与具体后端无关; 各后端 (`qwen_cpu/`、`qwen_cuda/`) 只有 C++ 库, C 接口相同。
 
 - `qwen.py`: C++ 库的 ctypes 封装。`load(gguf, backend, n_threads, device, max_ctx)` 按 `backend` 选择 `LIBS` 里的 so (新增后端只需在 `LIBS` 加一项); 输入 token 序列 (可附带图片 embedding 和 3D 位置), `generate()` 逐个返回采样出的 token id。一个模块实例只加载一个后端, 需要同时用两个时用 importlib 把 `qwen.py` 加载成两个模块 (见 `tests/cuda_vs_cpu.py`)。cuda 另有引擎模式 `engine_*` (server.py 用), 与 `eval_tokens` 等不能混用
+- `qwen_tok.py`: tokenizer 自己实现, 只用标准库: 读 `tokenizer.json` 的 vocab / merges / added token; `encode` = NFC → 预分词 (手写, 等价于官方正则) → byte-level → BPE, 只查 BPE 词表, 不会产生控制 token; `decode` 把 id 还原成字节再按 utf-8 解码 (不完整的字节换成 U+FFFD)。与 HF tokenizers 对比: 真实文本 22 万 token、全部 Unicode 码位 (单独 / 带上下文)、随机 id 的 decode 都相同; 只有字符表版本不同的码位有差别 (Python 3.13 标准库是 Unicode 15.1: 4433 个 Unicode 16 新增字符在这里不算字母; 59 个罕见组合符号的 NFC 重排 HF 没做)。19 万 token 首次 0.25s, 重复内容有缓存
 - `server.py`: OpenAI 兼容服务 (单个后端)
   - 接口: `POST /v1/chat/completions` (支持 `stream`), `GET /v1/models`, `GET /health`
   - 模型名: `{--model-name}-{--type}`, 默认 `qwen3.8-27b-cpu` / `qwen3.8-27b-cuda`, 只用于 `/v1/models` 和响应里的 `model` 字段, 请求里的 `model` 不校验。`/v1/models` 返回 `{"object": "list", "data": [{"id": "qwen3.8-27b-cuda", "object": "model", "created": <请求时的时间戳>, "owned_by": "local"}]}`
   - 支持的参数: `messages` (system/user/assistant, 文本 + `image_url` 图片, 支持 data URL 和 http URL), `temperature`, `seed`, 思考控制 (`enable_thinking` 或 `chat_template_kwargs.enable_thinking`; `reasoning_effort`: none/minimal 关闭思考, low/medium/high/xhigh), 其余参数忽略
   - 默认采样参数与官方推荐一致 (思考 / 非思考两套), `temperature` 只覆盖温度; 思考内容在 `reasoning_content` 字段返回
-  - tokenizer、chat 模板、图片预处理用 transformers 的官方 processor, 视觉塔用 transformers 的模块加载官方权重
+  - tokenizer 和 chat 模板自己实现 (`qwen_tok.py` + `server.py` 的 `build_tokens`, 不用任何第三方库); 图片预处理用 transformers 的官方 image processor, 视觉塔用 transformers 的模块加载官方权重
   - 启动时先加载完所有内容再开始监听; 流式请求的客户端断开会立即停止生成
   - 流式: 开头一个 role chunk, 之后每个输出 token (含结尾的停止 token) 正好一个 chunk, 没有新增文本 (停止 token、`</think>`、多字节字符还不完整、正文开头的换行) 时发空串, 最后一个 chunk 带 finish_reason
   - cpu: 推理是单序列, 并发请求排队串行处理, 不会报错
   - cuda: 最多 4 个请求同时进行, 更多的按到达顺序排队; 输入 (prefill) 按到达顺序逐个算, 输出 (decode) 所有请求每步一起算; prefill 和 decode 同时运行时按 SM 分区 (`--dec-ratio`, decode 默认占 0.31, 本卡 156 SM 时为 48 个, 其余给 prefill), 只有一种时用整卡。同一请求 (固定 seed) 单独跑和并发跑的输出完全相同
   - 图片默认最多 1048576 像素 (约 1024 token), `--max-image-pixels 0` 恢复官方默认
+  - 分词防注入: 按 chat_template.jinja 的规则 (不含 tools) 在 python 里直接拼 token 序列, 控制 token (`<|im_start|>`、`<|im_end|>`、`<think>`、`<|vision_start|>` 等) 只由结构代码按 id 插入, 消息正文 (content、文本 part、reasoning_content) 只用 `qwen_tok.encode` 按文本分词, 正文里写的 `<|im_end|>` 等字符串就是普通文本, 不可能变成控制 token; `<|image_pad|>` 按图片 grid 展开。不含这些字符串时与 HF processor + jinja 模板逐 token 相同
+  - 前缀缓存 (`--cache-dir`, 只有 cuda): 缓存点在每条消息的 `<|im_end|>` 之后, 存到磁盘, 进程重启后仍可用; 同一目录同时只能被一个进程使用 (文件锁)。多轮对话命中 assistant 消息的前提是客户端原样回传它 (开 thinking 时包括 `reasoning_content`), 且重新分词后的 token 与生成时相同
   - 视觉塔 fp32, `--type cuda` 时在 GPU 上, 否则在 CPU 上
   - 图片缓存: 视觉塔的输出按图片原始字节 (base64 解码后 / http 下载的内容) 的 sha256 缓存, 只在内存里, 不写文件; 一个请求里命中的图片直接用缓存, 未命中的图片一起过视觉塔再按图片拆开存入。按 LRU 淘汰, 上限 `--image-cache-mb` (默认 4096MB, 每张 1024 token 的图约 20MB), 0 表示不缓存。图片预处理 (resize、切 patch) 每次仍会执行, 因为需要它确定图片 token 数
 - `router.py`: 多后端路由, 后端列表都取自 `qwen.LIBS`, 新增后端不需要改路由
   - `--mask`: 0/1 串, 第 i 位对应 `qwen.LIBS` 的第 i 个后端 (目前依次是 `cpu`、`cuda`), 1 表示启动; 默认全 1 (现在是 `11`)。位数不对、一个都没选都直接报错
-  - 每个选中的后端启动一个 `server.py --type <后端> --host 127.0.0.1 --port 0` 子进程, 实际端口从子进程日志中解析; 除 `--host`、`--port`、`--mask`、`--start-timeout` 外的参数 (`--gguf`、`--hf-dir`、`--ctx`、`--threads`、`--device` 等) 原样传给每个子进程, 不能传 `--type`
+  - 每个选中的后端启动一个 `server.py --type <后端> --host 127.0.0.1 --port 0` 子进程, 实际端口从子进程日志中解析; 除 `--host`、`--port`、`--mask`、`--start-timeout`、`--cache-dir` 外的参数 (`--gguf`、`--hf-dir`、`--ctx`、`--threads`、`--device` 等) 原样传给每个子进程, 不能传 `--type`
+  - `--cache-dir` (必填, 没有默认值): 前缀缓存根目录, 不存在则创建 (上级目录必须存在); 支持缓存的后端 (`qwen.CACHE_BACKENDS`, 目前只有 cuda) 收到 `--cache-dir <根目录>/<后端名>`, 其余后端不传; 子目录由 server 自己检查和创建
   - 子进程日志加 `[后端名]` 前缀转发到路由的 stderr
   - 启动阶段同时等待所有子进程, 任何一个启动失败 (没有 GPU、显存不够、参数错误等, 子进程退出) 或超过 `--start-timeout` (默认 600s) 未就绪, 立即结束全部子进程并报错退出; 运行中任一子进程退出, 路由也整体退出。子进程设置了 `PR_SET_PDEATHSIG`, 路由被 kill 时子进程也会被结束
   - `GET /v1/models`: 返回所有已启动后端的模型 (各子进程自己报告的名字), 例如 `--mask 11` 时是 `qwen3.8-27b-cpu` 和 `qwen3.8-27b-cuda`

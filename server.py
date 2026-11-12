@@ -3,16 +3,17 @@
 # cpu: C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
 # cuda: 引擎模式, 最多 qwen.nseq() (4) 个请求同时进行: 超出的在 python 按到达顺序排队; prefill 在 C++ 里按顺序逐个算, decode 所有序列每步一起算, 两者同时跑时按 SM 分区
 # --type 选择后端 (qwen.LIBS), cuda 时视觉塔也在 GPU 上; 视觉塔输出按图片原始字节的 sha256 缓存在内存 (LRU)
-import os, sys, io, json, time, uuid, base64, random, ctypes, hashlib, argparse, threading, contextlib, urllib.request
+import os, re, sys, io, json, time, uuid, fcntl, shlex, base64, random, ctypes, shutil, hashlib, argparse, threading, contextlib, urllib.request
 from collections import OrderedDict, deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import numpy as np
 import torch
 from PIL import Image
 from safetensors import safe_open
-from transformers import AutoProcessor, AutoConfig
+from transformers import AutoImageProcessor, AutoConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 import qwen
+import qwen_tok
 
 IMAGE_TOKEN = 248056
 THINK_END = 248069
@@ -23,7 +24,7 @@ SAMPLING = { # 官方推荐参数 (README Best Practices), 客户端只能覆盖
 EFFORT_MAP = {"low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh"} # OpenAI reasoning_effort -> 模板支持的取值
 
 G_args = None
-G_proc = None
+G_imgproc = None # 图片预处理 (transformers 的 image processor); 分词全部用自己的 qwen_tok
 G_vis = None
 G_dev = "cpu" # 视觉塔所在的 torch device
 G_img_cache = OrderedDict() # sha256 -> 该图的视觉输出 (n_tok, 5120) float32, 只在 G_lock 内访问
@@ -32,6 +33,8 @@ G_lock = threading.Lock() # cpu: 整个推理; cuda: 只用于视觉塔和图片
 G_queue_lock = threading.Lock()
 G_waiting = 0
 G_pool = None # cuda 的 SlotPool
+G_cache_dir = None # 前缀缓存目录 (--cache-dir), None 表示不启用
+G_cache_lock = None # 缓存目录锁文件的 fd, 进程生命周期内一直持有
 
 
 class BadRequest(Exception):
@@ -100,6 +103,100 @@ def load_image(url): # 返回 (RGB 图片, 原始字节的 sha256)
     return Image.open(io.BytesIO(data)).convert("RGB"), hashlib.sha256(data).hexdigest()
 
 
+REASONING = { # 与 chat_template.jinja 的 reasoning_instructions 相同 (medium 为空)
+    "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
+    "medium": "",
+    "low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
+}
+
+
+def render_content(content, is_system): # 同模板的 render_content + trim: 返回片段列表, str 是正文, int 是控制 token id
+    if isinstance(content, str):
+        parts = [content]
+    elif content is None:
+        parts = []
+    elif isinstance(content, list):
+        parts = []
+        for it in content:
+            if it.get("type") == "image":
+                if is_system:
+                    raise BadRequest("System message cannot contain images.")
+                parts += [qwen_tok.CTL["<|vision_start|>"], qwen_tok.CTL["<|image_pad|>"], qwen_tok.CTL["<|vision_end|>"]]
+            else:
+                parts.append(str(it.get("text", "")))
+    else:
+        raise BadRequest("Unexpected content type.")
+    while parts and isinstance(parts[0], str) and not parts[0].strip(): # trim: 控制 token 不是空白, 只去掉两端正文的空白
+        parts.pop(0)
+    while parts and isinstance(parts[-1], str) and not parts[-1].strip():
+        parts.pop()
+    if parts and isinstance(parts[0], str):
+        parts[0] = parts[0].lstrip()
+    if parts and isinstance(parts[-1], str):
+        parts[-1] = parts[-1].rstrip()
+    return parts
+
+
+def flat(parts): # 只用于模板里对正文字符串的判断 (startswith 等)
+    return "".join(x if isinstance(x, str) else "\0" for x in parts)
+
+
+def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinja 的规则 (不含 tools) 直接拼 token: 正文只用 qwen_tok.encode 按文本分词 (不可能产生控制 token), 控制 token 由这里按 id 插入; <|image_pad|> 按 grid 展开
+    C = qwen_tok.CTL
+    seq = [] # str 或 int
+    ri = REASONING[effort or "xhigh"] if enable_thinking else ""
+    if msgs[0]["role"] == "system":
+        c = render_content(msgs[0]["content"], True)
+        if c:
+            seq += [C["<|im_start|>"], "system\n" + (ri + "\n\n" if ri else "")] + c + [C["<|im_end|>"], "\n"]
+        elif ri:
+            seq += [C["<|im_start|>"], "system\n" + ri, C["<|im_end|>"], "\n"]
+    elif ri:
+        seq += [C["<|im_start|>"], "system\n" + ri, C["<|im_end|>"], "\n"]
+    if not any(m["role"] == "user" and not (flat(render_content(m["content"], False)).startswith("<tool_response>") and flat(render_content(m["content"], False)).endswith("</tool_response>")) for m in msgs):
+        raise BadRequest("No user query found in messages.")
+    for i, m in enumerate(msgs):
+        c = render_content(m["content"], False)
+        if m["role"] == "system":
+            if i:
+                raise BadRequest("System message must be at the beginning.")
+        elif m["role"] == "user":
+            seq += [C["<|im_start|>"], "user\n"] + c + [C["<|im_end|>"], "\n"]
+        elif m["role"] == "assistant":
+            rc = m.get("reasoning_content")
+            rc = rc.strip() if isinstance(rc, str) else ""
+            seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n" + rc + "\n", C["</think>"], "\n\n"] + c + [C["<|im_end|>"], "\n"]
+        elif m["role"] == "tool":
+            if i and msgs[i - 1]["role"] != "tool":
+                seq += [C["<|im_start|>"], "user"]
+            seq += ["\n", C["<tool_response>"], "\n"] + c + ["\n", C["</tool_response>"]]
+            if i == len(msgs) - 1 or msgs[i + 1]["role"] != "tool":
+                seq += [C["<|im_end|>"], "\n"]
+        else:
+            raise BadRequest("Unexpected message role.")
+    seq += [C["<|im_start|>"], "assistant\n", C["<think>"]] + (["\n\n", C["</think>"], "\n\n"] if not enable_thinking else ["\n"])
+    ids, buf, gi, merge = [], [], 0, G_imgproc.merge_size ** 2
+    for x in seq + [None]:
+        if isinstance(x, str):
+            buf.append(x)
+            continue
+        if buf and "".join(buf): # 两个控制 token 之间的正文整段分词 (与官方在 added token 处切开后各段分词相同)
+            ids += qwen_tok.encode("".join(buf))
+        buf = []
+        if x is None:
+            break
+        if x != IMAGE_TOKEN:
+            ids.append(x)
+            continue
+        if gi >= len(grids):
+            raise BadRequest("图片占位多于图片数")
+        ids += [IMAGE_TOKEN] * (int(np.prod(grids[gi])) // merge)
+        gi += 1
+    if gi != len(grids):
+        raise BadRequest(f"图片数 {len(grids)} 与图片占位数 {gi} 不一致")
+    return ids
+
+
 def convert_messages(messages): # OpenAI 格式 -> chat 模板格式, 图片和 sha256 单独取出
     out, images, hashes = [], [], []
     for m in messages:
@@ -124,6 +221,46 @@ def convert_messages(messages): # OpenAI 格式 -> chat 模板格式, 图片和 
             msg["reasoning_content"] = m["reasoning_content"]
         out.append(msg)
     return out, images, hashes
+
+
+def lock_holder(path): # 从 /proc/locks 按 inode 找持有 flock 的进程, 返回 "pid N, 命令 ..." 或找不到的说明
+    st = os.stat(path)
+    dev = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+    pids = [l.split()[4] for l in open("/proc/locks") if " FLOCK " in l and l.split()[5] == dev] # 格式: 序号: FLOCK ADVISORY WRITE pid 主:次:inode 起 止
+    if not pids:
+        return "在 /proc/locks 里找不到持有者"
+    out = []
+    for pid in pids:
+        try:
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            out.append(f"pid {pid}, 命令 {shlex.join(x.decode(errors='replace') for x in cmd if x)}")
+        except OSError:
+            out.append(f"pid {pid} (找不到该进程, 可能在其他 pid 命名空间)")
+    return "; ".join(out)
+
+
+def open_cache_dir(d): # 前缀缓存目录: 必须是 (不存在且上级存在) / 空目录 / 有 cache.lock (空文件, 只用来 flock) 的目录之一, 否则退出; 加文件锁, 已被占用时打印占用者并退出
+    global G_cache_lock
+    d = os.path.abspath(d)
+    lock = os.path.join(d, "cache.lock")
+    if not os.path.exists(d):
+        if not os.path.isdir(os.path.dirname(d)):
+            log(f"❌ 缓存目录 {d} 的上级目录不存在")
+            os._exit(1)
+        os.mkdir(d)
+    elif not os.path.isdir(d) or (os.listdir(d) and not os.path.isfile(lock)):
+        log(f"❌ 缓存目录 {d} 不是空目录, 也没有 cache.lock, 不是本程序的缓存目录, 拒绝使用")
+        os._exit(1)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log(f"❌ 缓存目录 {d} 已被其他进程占用: {lock_holder(lock)}")
+        os._exit(1)
+    G_cache_lock = fd
+    shutil.rmtree(os.path.join(d, "tmp"), ignore_errors=True) # 上次进程没写完的输出缓存
+    os.mkdir(os.path.join(d, "tmp"))
+    return d
 
 
 def thinking_options(body): # 返回 (enable_thinking, reasoning_effort)
@@ -160,25 +297,17 @@ def rope_positions(ids, grids): # 与 HF Qwen3_5Model.get_rope_index 一致 (只
     return pos
 
 
-def build_prompt(body): # 锁外执行: 解析消息、下载图片、模板渲染、分词、图片预处理
+def build_prompt(body): # 锁外执行: 解析消息、下载图片、拼 token (build_tokens)、图片预处理
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise BadRequest("messages 不能为空")
     msgs, images, hashes = convert_messages(messages)
     enable_thinking, effort = thinking_options(body)
-    kw = {"enable_thinking": enable_thinking}
-    if effort:
-        kw["reasoning_effort"] = effort
-    try:
-        text = G_proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **kw)
-    except Exception as e: # 模板里的 raise_exception, 比如 system 不在开头
-        raise BadRequest(f"chat 模板渲染失败: {e}")
+    out = None
     if images:
         size = {"longest_edge": G_args.max_image_pixels, "shortest_edge": 65536} if G_args.max_image_pixels > 0 else None
-        out = G_proc(text=[text], images=images, return_tensors="pt", **({"size": size} if size else {}))
-    else:
-        out = G_proc(text=[text], return_tensors="pt")
-    ids = out["input_ids"][0].tolist()
+        out = G_imgproc(images=images, return_tensors="pt", **({"size": size} if size else {})) # pixel_values (patch 总数, 1536), image_grid_thw (n_img, 3)
+    ids = build_tokens(msgs, enable_thinking, effort, out["image_grid_thw"].tolist() if images else [])
     temp = body.get("temperature")
     sp = dict(SAMPLING[enable_thinking])
     if temp is not None:
@@ -188,7 +317,8 @@ def build_prompt(body): # 锁外执行: 解析消息、下载图片、模板渲�
     seed = body.get("seed")
     if seed is not None and not isinstance(seed, int):
         raise BadRequest("seed 必须是整数")
-    return {"ids": ids, "out": out if images else None, "hashes": hashes, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images)}
+    cache = qwen.cache_plan(ids, list(zip(hashes, out["image_grid_thw"].tolist() if images else []))) if G_cache_dir else None
+    return {"ids": ids, "out": out, "hashes": hashes, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images), "cache": cache}
 
 
 def vision_embeds(p): # 锁内执行: 命中缓存的图片直接取, 其余图片一起过视觉塔, 返回 (所有图片 token 数, 5120) 和命中数
@@ -236,7 +366,7 @@ def generate_engine(p): # cuda 引擎模式的生成器: 视觉塔 (G_lock 内) 
     with G_lock:
         embd, mask, pos3 = run_vision(p)
     seed = p["seed"] if p["seed"] is not None else random.getrandbits(63)
-    args = qwen.engine_args(p["ids"], embd, mask, pos3, seed=seed, max_new=G_args.ctx - len(p["ids"]), **p["sampling"]) # 拿到槽位前准备好, 之后不能再出错
+    args = qwen.engine_args(p["ids"], embd, mask, pos3, seed=seed, max_new=G_args.ctx - len(p["ids"]), cache=p["cache"], **p["sampling"]) # 拿到槽位前准备好, 之后不能再出错
     slot, ticket = G_pool.acquire(p["rid"])
     buf = (ctypes.c_int * 256)()
     started, done = False, False
@@ -290,7 +420,7 @@ class Decoder: # 增量解码, 遇到 </think> 切换到正文; 多字节字符�
             self.seg = []
             return field, ""
         self.seg.append(tok)
-        new = G_proc.tokenizer.decode(self.seg, skip_special_tokens=False)
+        new = qwen_tok.decode(self.seg)
         if new.endswith("�"): # 多字节字符还不完整, 等后面的 token
             return field, ""
         self.seg = [] # 已是完整字符: 丢掉已解码的 token, 之后单独 decode 再拼接与整段 decode 相同 (ByteLevel decoder, 不清理空格)
@@ -416,7 +546,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global G_args, G_proc, G_vis, G_dev, G_pool
+    global G_args, G_imgproc, G_vis, G_dev, G_pool, G_cache_dir
     p = argparse.ArgumentParser(description="Qwen3.8-27B OpenAI 兼容服务")
     p.add_argument("--gguf", required=True, help="Q4_K_M GGUF 路径")
     p.add_argument("--hf-dir", required=True, help="官方 HF 仓库目录: tokenizer/processor 配置 + 含 model.visual.* 的 safetensors 分片")
@@ -430,6 +560,8 @@ def main():
     p.add_argument("--max-image-pixels", type=int, default=1048576, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 0 表示用官方默认 16777216")
     p.add_argument("--model-name", default="qwen3.8-27b", help="模型名前缀, 对外返回的名称是 {model-name}-{type}; 请求里的 model 不校验")
     p.add_argument("--image-cache-mb", type=int, default=4096, help="视觉塔输出缓存上限 (MB, 只在内存, LRU 淘汰), 0 表示不缓存")
+    p.add_argument("--cache-dir", default=None, help=f"前缀缓存 (磁盘) 目录, 不指定则不启用; 支持的后端 {list(qwen.CACHE_BACKENDS)}; 通过 router 启动时由 router 传入 <router 的 --cache-dir>/<type>")
+    p.add_argument("--cache-threads", type=int, default=8, help="前缀缓存后台量化 state 的线程数")
     G_args = p.parse_args()
     G_args.model_name = f"{G_args.model_name}-{G_args.type}"
     if G_args.ctx is None:
@@ -442,12 +574,17 @@ def main():
         G_dev = f"cuda:{G_args.device}"
         n_sm = torch.cuda.get_device_properties(G_args.device).multi_processor_count
         dec_sm = min(max(round(n_sm * G_args.dec_ratio / 2) * 2, 8), n_sm - 8) # green context 按 2 个 SM 分, 每个分区至少 8 个
-    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None)
+    if G_args.cache_dir and G_args.type not in qwen.CACHE_BACKENDS:
+        log(f"⚠️ {G_args.type} 后端暂不支持前缀缓存, 忽略 --cache-dir")
+    elif G_args.cache_dir:
+        G_cache_dir = open_cache_dir(G_args.cache_dir)
+    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None, G_cache_dir, G_args.cache_threads)
     if G_args.type == "cuda":
         G_pool = SlotPool(qwen.nseq())
         qwen.engine_start()
-    G_proc = AutoProcessor.from_pretrained(G_args.hf_dir)
-    log("✅ processor / tokenizer 加载完成")
+    G_imgproc = AutoImageProcessor.from_pretrained(G_args.hf_dir)
+    qwen_tok.load(os.path.join(G_args.hf_dir, "tokenizer.json"))
+    log("✅ 图片预处理 / tokenizer (qwen_tok) 加载完成")
     G_vis = load_vision(G_args.hf_dir)
     log(f"✅ 视觉塔加载完成 ({G_dev}), 参数 {sum(x.numel() for x in G_vis.parameters()) / 1e6:.1f}M")
     server = ThreadingHTTPServer((G_args.host, G_args.port), Handler)

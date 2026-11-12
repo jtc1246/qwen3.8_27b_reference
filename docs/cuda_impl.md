@@ -11,6 +11,7 @@
 | `cu.h` | driver API 薄封装: 初始化 (含两个 green context 和 4 个 stream)、`ck` 检查、分配、拷贝、`launch` |
 | `gguf.h` | 与 `qwen_cpu/gguf.h` 相同 (只改了 include guard) |
 | `quants_ref.h` | 量化块结构、`row_bytes`、标量参考反量化 (软件 fp16 转换, 不需要 AVX) |
+| `cache.h` | 前缀缓存 (4.2 节): raw syscall 封装、SHA-256、槽状态 8 bit 编码 (AVX2)、写盘线程、量化线程、metadata 读写 |
 
 python 端共用仓库根目录的 `qwen.py` (`load(gguf, "cuda", device=N)`), C 接口与 CPU 版相同 (直接模式, 用槽 0), 只是 `qwen_init` 的第二个参数是 GPU 编号而不是线程数; 另有 CUDA 独有的引擎模式接口 (4.1 节, `qwen.engine_*`)。
 
@@ -87,11 +88,27 @@ lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, �
 - 等待都用 futex (直接 `syscall`, 不经过 libc: musl 的 errno 在 glibc 创建的线程里不可用); 并发路径上不分配内存 (musl 在没有自己创建的线程时 malloc 不加锁, 这里的线程都是 python 的)
 - 直接模式 (`qwen_eval` 等, 测试脚本用) 固定用槽 0, 不能与引擎模式同时用
 
+### 4.2 前缀缓存 (磁盘)
+
+`server.py --cache-dir <目录>` 启用 (直接使用该目录; 目前只有 cuda 实现, 支持的后端列在 `qwen.CACHE_BACKENDS`)。`router.py --cache-dir <根目录>` 必填: router 只检查根目录 (不存在则创建, 上级必须存在), 给支持缓存的后端传 `<根目录>/<后端名>`, 不支持的不传, 子目录由 server 按下面的规则处理。python 在启动时检查目录 (不存在且上级存在 / 空目录 / 有 `cache.lock`, 否则退出), 对 `cache.lock` (空文件) 加 `flock` (已被占用时从 `/proc/locks` 按 inode 找到持有者的 pid, 打印它和 `/proc/<pid>/cmdline` 后退出, 找不到也如实打印; 通过 router 启动时 router 也随之退出), 清空 `tmp/`, 再调 `qwen_cache_init`。
+
+- **缓存点**: 每个 `<|im_end|>` 之后 (system、user、assistant、tool 消息都以它结束), 没有按固定 token 数的缓存点。prompt 末尾的 `<|im_start|>assistant\n<think>\n` 等不是消息边界, 它和之后的输出 (thinking + 正文) 一起算作 assistant 段, 输出以 `<|im_end|>` 结束时才产生缓存点 (以其他停止 token、长度上限或取消结束时不产生, 已写的临时文件删除)。为了让缓存点包含 `<|im_end|>` 本身, 采样到它之后 decode 循环会再算一步把它写进 KV / 状态
+- **key** (python `qwen.cache_plan`): 每段 (两个缓存点之间) 的 token 按 int32 小端序列化, 每张图片 (连续的图片 token) 换成 int32 `[-1, t, h, w]` + 图片原始字节的 sha256, 段的 hash = sha256(序列化); 缓存点的 key = sha256(从头到该点各段 hash 的拼接)。python 把各缓存点的位置、段 hash、key 和最后一个缓存点之后 prompt 的序列化传给 `qwen_prefill`, 输出缓存点的 key 由 C++ 接上输出 token 算出
+- **目录**: 每个缓存点 `<dir>/ab/cd/<64 位 hex key>/`, 必有 `metadata.txt` (文本: key、模型、类型 (角色 + prompt/output)、起止位置、next_pos、写入时是否有 state、各 KV 段长度、链上之前所有缓存点的 key 和末尾位置, 末行 `END`) 和 `kvcache.bin` (只含本段的 KV: 若干段, 每段 `[16 层][K | V | K scale | V scale]`, 补齐到 4096), 可能有 `state.bin` (fp32 槽状态 149.6MiB) 或 `state.bin.compressed` (8 bit 编码约 43.3MB, notes/state_quant_experiments.md 第 5 节的最终方案)。缓存点无论多短都有目录、metadata、kvcache, 只有 state 按规则省略。`metadata.txt` 最后写, 末行是 `END` 才有效
+- **查找** (prefill 线程, 在 FIFO 轮次内): 依次读各缓存点的 metadata, 从后往前找最后一个自身有 state、之前所有点都有效的缓存点 (不能是 prompt 的最后一个 token, 因为要它的 logits), 读入链上各点的 kvcache.bin 上传到槽的 KV, state 优先用压缩版 (上传后 GPU 解码 `k_state_dec`, 与 CPU 编码端的 AVX2 解码逐位相同), 否则 `state.bin`; 命中后把用到的各点 metadata 的 mtime 改为现在 (以后的清理按它判断)。之后从命中位置继续 prefill
+- **state 写入规则** (命中之后的缓存点, 从前往后贪心): 是其所在 2048 块 (按最后一个 token 的位置) 内的第一个缓存点就写 (只看缓存点本身, 不看是否有 state); prompt 最后一个缓存点和输出缓存点另外在距上一个有 state 的点 ≥ 512 时也写。要写 state 的点 prefill 在该处切开 chunk, 算完立即拷出状态
+- **写盘** (写盘线程, 计算线程只把拷出的数据放进无上限的无锁队列): prompt 的缓存点在 prefill 中按 state 点分批交出 (一批的 KV 一次拷出, 写盘时按点切开); 输出每 256 个 token 交出一段 KV, 追加到 `tmp/s<槽>_<编号>/kvcache.bin`, 结束时写 state 和 metadata 后整个目录改名到 key 的位置。已经有效存在的缓存点不重写。prompt 的缓存全部写完之前 `qwen_next` 不返回 token, 输出的缓存写完之前不返回结束, 所以客户端收到第一个 token 时输入部分已可用, 收到结束时输出部分已可用 (只等原始 state, 不等量化)
+- **量化线程**: 常驻, 每 5 秒扫一遍目录, 对有效且只有 `state.bin` 的缓存点编码 (`--cache-threads` 个线程, 默认 8, 约 0.8 秒), 写 `state.bin.compressed.tmp` 后改名, 再删除 `state.bin`; 与计算线程没有任何通信。读取时三次尝试 (压缩版 / 原始 / 压缩版) 应对刚好在替换的情况
+- 除 metadata 外的缓存文件读写都用 direct IO (`O_DIRECT`, 缓冲为匿名 mmap, 大小和偏移 4096 对齐), 启动时先测试目录是否支持
+- 线程: 写盘线程和量化线程是本 so 在 `qwen_cache_init` 中创建的 musl 线程, 只做文件 IO 和 CPU 计算, 不调 libcuda; 所有 GPU 拷贝都在 prefill / decode 线程 (python 创建的 glibc 线程) 里做, 这些线程里的文件操作全部直接 syscall, 内存用 mmap, 不用 musl 的 errno / 锁 / FILE
+- 暂未实现: 清理线程 (缓存目前只增不减)、CPU 后端
+
 ## 5. 验证
 
 - `qwen_selftest`: 6 个真实 tensor (覆盖 f32 / q8_0 / q4_k / q5_k / q6_k 和 lm_head), GPU 反量化与标量参考对比 (实测逐位一致), T = 13 (GEMV) 和 T = 100 (tensor core GEMM, 含不满 64 的 tile) 的 matmul (输入取 fp16 可精确表示的值) 与 double 点积对比 (相对误差 1~5e-5, 阈值 2e-4; 全 fp32 时约 1.5e-8)
 - `tests/cuda_vs_cpu.py`: 同一进程加载 CPU 和 CUDA 两个库, 对比每层 hidden 和 logits: 1100 token prefill (跨 chunk; `--n 4000` 也测过)、逐 token decode、图片 embedding + MRoPE 位置。hidden 相对误差约 2e-3, logits 约 1e-3~2e-3 (阈值 5e-3; KV fp16 时约 1e-3 / 5e-4~1e-3; 全 fp32 时都在 1e-6 量级), top1 全部一致, top-10 重合 9~10 个, 贪心生成结果相同
-- `tests/test_server.py` 对 `server.py --type cuda` 全部通过
+- `tests/test_server.py` 对 `server.py --type cuda` 全部通过 (开 `--cache-dir` 时连跑两次也全部通过)
+- 前缀缓存 (测试在仓库外 `/root/local_llm/tests/prefix_cache/`): C++ SHA-256 与 hashlib 一致; 状态编码在 3 份真实状态上 CPU / GPU 解码逐位相同, DeltaNet 各头相对误差 4.4e-3~4.6e-3, 与实验记录一致; 端到端: 82 个缓存点的长对话 state 规则逐点核对、改最后一条消息时命中最后一个有 state 的公共点、重启后从磁盘 (压缩 state) 命中、同一目录第二个进程退出并打印占用者、图片 (同尺寸不同图片不命中)、流式、客户端断开后无输出缓存点且 tmp 为空、4 个并发同一 prompt。7.2K token prompt 命中时读 390MB 用 0.055s, 写入 (7.2K token KV + state) 0.3s
 - KV q8_0 vs fp16 (同一 CUDA 实现, 真实长文本: llama.cpp 文档 + 本仓库文档): prefill 后 teacher forcing 128 步, 4K 上下文 KL 平均 5.1e-5 (最大 7.9e-4), top1 一致 127/128, PPL 2.0723 → 2.0717; 32K 上下文 KL 平均 5.7e-6 (最大 9.3e-5), top1 128/128, PPL 1.4415 → 1.4413; 30K token 的 needle 检索 (深度 10% / 50% / 90%) 贪心输出逐字相同。q8_0 存储与 "fp16 存储 q8_0 还原值" 的假量化版本逐位一致
 
 ## 6. 性能 (RTX 6000D, `tests/bench.py --type cuda`)

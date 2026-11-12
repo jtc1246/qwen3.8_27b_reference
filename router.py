@@ -123,6 +123,7 @@ def main():
     p.add_argument("--port", type=int, default=8000, help="0 表示由系统自动分配")
     p.add_argument("--mask", default="1" * len(names), help=f"每一位对应一个后端, 顺序 {names}, 1 启动 0 不启动")
     p.add_argument("--start-timeout", type=float, default=600, help="等待每个子进程启动完成的秒数")
+    p.add_argument("--cache-dir", required=True, help=f"前缀缓存根目录 (必填): 不存在则创建 (上级目录必须存在); 支持缓存的后端 {list(qwen.CACHE_BACKENDS)} 收到 <cache-dir>/<后端名>, 其余后端不传")
     args, extra = p.parse_known_args()
     if len(args.mask) != len(names) or set(args.mask) - {"0", "1"}:
         p.error(f"❌ --mask 必须是 {len(names)} 位的 0/1 串, 依次对应 {names}, 当前 {args.mask!r}")
@@ -132,8 +133,15 @@ def main():
     for a in extra:
         if a.split("=")[0] in ("--type", "--host", "--port"):
             p.error(f"❌ {a.split('=')[0]} 由路由决定, 不能传给子进程")
+    root = os.path.abspath(args.cache_dir)
+    if not os.path.isdir(root):
+        if os.path.exists(root) or not os.path.isdir(os.path.dirname(root)):
+            p.error(f"❌ 缓存根目录 {root} 不是目录, 或者它的上级目录不存在")
+        os.mkdir(root)
+        log(f"ℹ️ 创建缓存根目录 {root}")
     for name in sel: # 先全部启动, 再开日志线程 (preexec_fn 在没有其他线程时执行更安全)
-        cmd = "exec " + shlex.join([sys.executable, "-u", os.path.join(ROOT, "server.py"), "--type", name, "--host", "127.0.0.1", "--port", "0"] + extra) # exec: pdeathsig 作用在 python 进程而不是 sh 上
+        cache = ["--cache-dir", os.path.join(root, name)] if name in qwen.CACHE_BACKENDS else []
+        cmd = "exec " + shlex.join([sys.executable, "-u", os.path.join(ROOT, "server.py"), "--type", name, "--host", "127.0.0.1", "--port", "0"] + cache + extra) # exec: pdeathsig 作用在 python 进程而不是 sh 上
         log(f"ℹ️ 启动后端 {name}: {cmd}")
         G_children[name] = {"proc": subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE, preexec_fn=set_pdeathsig), "port": None, "models": [], "dead": False}
     for name in sel:

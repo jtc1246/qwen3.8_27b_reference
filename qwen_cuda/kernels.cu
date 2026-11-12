@@ -959,3 +959,32 @@ extern "C" __global__ void __launch_bounds__(256) k_repack(uint8_t* W, uint64_t 
         row[p] = old[src];
     }
 }
+
+// 前缀缓存: 槽状态 8 bit 编码的解码 (编码见 cache.h Codec), 与 CPU AVX2 版逐位相同: 全部用 _rn 运算, 不让编译器合并成 fma
+__device__ __forceinline__ float exp2_poly(float x) { // 同 Codec::exp2v
+    float n = rintf(x), f = __fsub_rn(x, n);
+    float p = 1.5403530e-4f;
+    p = __fmaf_rn(p, f, 1.3333558e-3f);
+    p = __fmaf_rn(p, f, 9.6181291e-3f);
+    p = __fmaf_rn(p, f, 5.5504109e-2f);
+    p = __fmaf_rn(p, f, 2.4022651e-1f);
+    p = __fmaf_rn(p, f, 6.9314718e-1f);
+    p = __fmaf_rn(p, f, 1.0f);
+    return __fmul_rn(p, __int_as_float(((int)n + 127) << 23));
+}
+
+extern "C" __global__ void __launch_bounds__(256) k_state_dec(const float* amax, const uint8_t* idx, const uint8_t* code, uint64_t n, float* out) { // grid n/256, 每线程一个值
+    uint64_t i = (uint64_t)blockIdx.x * 256 + threadIdx.x;
+    if (i >= n) return;
+    int k = idx[i / 32];
+    float o = k == 255 ? 12.0f : (float)__dadd_rn(2.0, __dmul_rn((double)k, 10.0 / 255.0)); // 档位表, 同 Codec::oct
+    float st = __fdiv_rn(o, 127.0f);
+    uint32_t c = code[i];
+    float v = __fmul_rn(amax[i / 32], exp2_poly(__fmul_rn(__fsub_rn((float)(c & 127), 127.0f), st)));
+    out[i] = __uint_as_float(__float_as_uint(v) ^ ((c & 128) << 24));
+}
+
+extern "C" __global__ void k_state_zero(const uint32_t* zi, uint64_t nz, float* out) {
+    uint64_t i = (uint64_t)blockIdx.x * 256 + threadIdx.x;
+    if (i < nz) out[zi[i]] = 0.0f;
+}
