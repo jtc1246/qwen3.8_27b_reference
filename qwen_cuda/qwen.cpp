@@ -1017,6 +1017,7 @@ int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd
         Cache::Plan* P = S.cp;
         if (P) {
             P->n_pts = Cache::G_dir[0] ? n_pts : -1;
+            P->hit = -1, P->w_kv_in = 0, P->w_st_in = 0, P->w_st_out = 0;
             if (n_pts > Cache::MAXP) {
                 fprintf(stderr, "⚠️ 缓存点 %d 个超过上限 %d, 本请求不用前缀缓存\n", n_pts, Cache::MAXP);
                 P->n_pts = -1;
@@ -1175,6 +1176,15 @@ int qwen_cache_init(const char* dir, int quant_threads) { // 在 qwen_init 之�
     }
     fprintf(stderr, "✅ 前缀缓存已启用: %s, 量化线程 %d\n", dir, quant_threads);
     return 0;
+}
+
+void qwen_cache_stats(int sq, int* out) { // 引擎模式, 请求结束 (qwen_next 返回 0) 之后、槽复用之前调用: [命中的输入 token 数, 输入新写入的 KV token 数, 输入新写入的 state 数, 输出写入的 state 数]
+    Cache::Plan* P = G_slots[sq].cp;
+    bool on = P && P->n_pts >= 0;
+    out[0] = on && P->hit >= 0 ? P->pos[P->hit] : 0;
+    out[1] = on ? P->w_kv_in.load() : 0;
+    out[2] = on ? P->w_st_in.load() : 0;
+    out[3] = on ? P->w_st_out.load() : 0;
 }
 
 void qwen_sha256(const uint8_t* data, uint64_t n, uint8_t* out) { Sha::hash(data, n, out); } // 自测用

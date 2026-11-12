@@ -364,6 +364,7 @@ struct Plan { // 一个槽当前请求的缓存信息; 请求结束 (等所有�
     uint64_t out_off = 0; // 临时 kvcache.bin 已写的字节数
     int* segs; // 输出缓存点各段 token 数
     Sha::Ctx out_sha; // 已输入 prompt 末尾 (最后一个缓存点之后) 的序列化, 结束时再输入输出 token
+    std::atomic<int> w_kv_in{0}, w_st_in{0}, w_st_out{0}; // 写盘线程实际写成功的: 输入部分的 KV token 数 / state 数, 输出部分的 state 数 (0 或 1)
 };
 
 enum : int { K_PF = 0, K_SEG = 1, K_FIN = 2, K_ABORT = 3 };
@@ -555,7 +556,9 @@ void do_pf(Item* it) { // prompt 的若干缓存点: 每点 kvcache.bin (+ state
         snprintf(p, sizeof(p), "%s/state.bin", dir);
         if (hs && !write_direct(p, it->state, G_state_bytes, 0, true)) continue;
         snprintf(type, sizeof(type), "%s prompt", role_name(P.role[j]));
-        write_meta(dir, P.key[j], type, s, e, P.npos[j], hs, &m, 1, P, j);
+        if (!write_meta(dir, P.key[j], type, s, e, P.npos[j], hs, &m, 1, P, j)) continue;
+        P.w_kv_in += m;
+        P.w_st_in += hs;
     }
 }
 
@@ -603,7 +606,9 @@ void do_fin(Item* it) { // 输出结束: 最后一段 + state + metadata 写到�
     if (r < 0) {
         fprintf(stderr, "⚠️ 缓存目录改名失败 %s -> %s: %d\n", tmp, dir, -r);
         rm_point(tmp);
+        return;
     }
+    P.w_st_out = it->state != nullptr;
 }
 
 void done(Item* it) {

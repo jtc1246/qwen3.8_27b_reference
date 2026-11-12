@@ -38,6 +38,7 @@ def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm
         lib.qwen_prefill.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
         lib.qwen_cache_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.qwen_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
         lib.qwen_next.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
         lib.qwen_cancel.argtypes = [ctypes.c_int]
         if dec_sm:
@@ -190,6 +191,12 @@ def engine_prefill(slot, ticket, args): # 阻塞: 在 C++ 里按 ticket 顺序�
 def engine_next(slot, buf): # 阻塞等新 token, 返回 list; 空 list 表示已结束 (之后槽才能复用); buf: ctypes int 数组
     n = G_lib.qwen_next(slot, buf, len(buf))
     return buf[:n]
+
+
+def engine_cache_stats(slot): # 请求结束 (engine_next 读到空 list) 之后、槽复用之前: (命中的输入 token 数, 输入新写入的 KV token 数, 输入新写入的 state 数, 输出写入的 state 数), 没启用缓存时全为 0
+    out = (ctypes.c_int * 4)()
+    G_lib.qwen_cache_stats(slot, out)
+    return tuple(out)
 
 
 def engine_cancel(slot): # 让 decode 循环停止该槽, 之后仍要 engine_next 读到空 list

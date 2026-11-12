@@ -134,5 +134,9 @@ def encode(text): # 正文 -> id (不含任何控制 token)
     return ids
 
 
+def token_bytes(i): # 一个 id 的原始字节 (控制 token 是其内容字符串的 utf-8)
+    return G_tok[i]
+
+
 def decode(ids): # 控制 token 输出其内容字符串
     return b"".join(G_tok[i] for i in ids).decode("utf-8", errors="replace")

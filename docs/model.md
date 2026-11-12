@@ -195,10 +195,10 @@ chat 模板要点:
 <think>
 ```
 
-- `enable_thinking` 默认 true: 生成提示以 `<think>\n` 结尾, 模型先输出思考内容, 再输出 `</think>\n\n` 和正文
+- `enable_thinking` 默认 true: 生成提示以思考开始 token (248068) + `\n` 结尾, 模型先生成思考内容, 再生成思考结束 token (248069), 之后通常是 `\n\n` 和正文
 - `enable_thinking=false`: 生成提示以 `<think>\n\n</think>\n\n` 结尾
 - `reasoning_effort` (仅思考模式, 默认 xhigh, 可选 medium / low): xhigh 和 low 会在 system 开头插入一段指令文字 (即使用户没有给 system 消息也会生成一个 system 段), medium 不插入
-- 历史 assistant 消息可以带 `reasoning_content`, 会被渲染进 `<think>` 块
+- 历史 assistant 消息可以带 `reasoning_content`, 官方模板会 trim 后放进思考开始 / 结束 token 之间 (本仓库 server.py 不 trim, 按原样还原, 见 README)
 
 官方推荐采样参数:
 

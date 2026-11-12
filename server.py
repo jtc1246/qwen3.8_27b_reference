@@ -3,7 +3,7 @@
 # cpu: C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
 # cuda: 引擎模式, 最多 qwen.nseq() (4) 个请求同时进行: 超出的在 python 按到达顺序排队; prefill 在 C++ 里按顺序逐个算, decode 所有序列每步一起算, 两者同时跑时按 SM 分区
 # --type 选择后端 (qwen.LIBS), cuda 时视觉塔也在 GPU 上; 视觉塔输出按图片原始字节的 sha256 缓存在内存 (LRU)
-import os, re, sys, io, json, time, uuid, fcntl, shlex, base64, random, ctypes, shutil, hashlib, argparse, threading, contextlib, urllib.request
+import os, re, sys, io, json, time, uuid, codecs, fcntl, shlex, base64, random, ctypes, shutil, hashlib, argparse, threading, contextlib, urllib.request
 from collections import OrderedDict, deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import numpy as np
@@ -110,7 +110,7 @@ REASONING = { # 与 chat_template.jinja 的 reasoning_instructions 相同 (mediu
 }
 
 
-def render_content(content, is_system): # 同模板的 render_content + trim: 返回片段列表, str 是正文, int 是控制 token id
+def render_content(content, is_system): # 同模板的 render_content, 但不做 trim (正文原样): 返回片段列表, str 是正文 (空串去掉), int 是控制 token id
     if isinstance(content, str):
         parts = [content]
     elif content is None:
@@ -126,22 +126,14 @@ def render_content(content, is_system): # 同模板的 render_content + trim: �
                 parts.append(str(it.get("text", "")))
     else:
         raise BadRequest("Unexpected content type.")
-    while parts and isinstance(parts[0], str) and not parts[0].strip(): # trim: 控制 token 不是空白, 只去掉两端正文的空白
-        parts.pop(0)
-    while parts and isinstance(parts[-1], str) and not parts[-1].strip():
-        parts.pop()
-    if parts and isinstance(parts[0], str):
-        parts[0] = parts[0].lstrip()
-    if parts and isinstance(parts[-1], str):
-        parts[-1] = parts[-1].rstrip()
-    return parts
+    return [x for x in parts if x != ""]
 
 
 def flat(parts): # 只用于模板里对正文字符串的判断 (startswith 等)
     return "".join(x if isinstance(x, str) else "\0" for x in parts)
 
 
-def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinja 的规则 (不含 tools) 直接拼 token: 正文只用 qwen_tok.encode 按文本分词 (不可能产生控制 token), 控制 token 由这里按 id 插入; <|image_pad|> 按 grid 展开
+def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinja 的结构 (不含 tools) 直接拼 token, 但正文不 trim, 也不补模板为 trim 加的换行: 正文只用 qwen_tok.encode 按文本分词 (不可能产生控制 token), 控制 token 由这里按 id 插入; <|image_pad|> 按 grid 展开
     C = qwen_tok.CTL
     seq = [] # str 或 int
     ri = REASONING[effort or "xhigh"] if enable_thinking else ""
@@ -162,10 +154,12 @@ def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinj
                 raise BadRequest("System message must be at the beginning.")
         elif m["role"] == "user":
             seq += [C["<|im_start|>"], "user\n"] + c + [C["<|im_end|>"], "\n"]
-        elif m["role"] == "assistant":
+        elif m["role"] == "assistant": # 还原成当时的生成提示 + 模型原样生成的内容 (本服务返回的 reasoning_content / content 都是原样的)
             rc = m.get("reasoning_content")
-            rc = rc.strip() if isinstance(rc, str) else ""
-            seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n" + rc + "\n", C["</think>"], "\n\n"] + c + [C["<|im_end|>"], "\n"]
+            if isinstance(rc, str) and rc: # 开 thinking 的轮次: 生成提示到 "<think>\n", 之后 (含 </think> 前后的换行) 都是模型生成的
+                seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n" + rc, C["</think>"]] + c + [C["<|im_end|>"], "\n"]
+            else: # 不开 thinking 的轮次: 生成提示是 "<think>\n\n</think>\n\n", 之后是正文
+                seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n\n", C["</think>"], "\n\n"] + c + [C["<|im_end|>"], "\n"]
         elif m["role"] == "tool":
             if i and msgs[i - 1]["role"] != "tool":
                 seq += [C["<|im_start|>"], "user"]
@@ -318,7 +312,17 @@ def build_prompt(body): # 锁外执行: 解析消息、下载图片、拼 token 
     if seed is not None and not isinstance(seed, int):
         raise BadRequest("seed 必须是整数")
     cache = qwen.cache_plan(ids, list(zip(hashes, out["image_grid_thw"].tolist() if images else []))) if G_cache_dir else None
-    return {"ids": ids, "out": out, "hashes": hashes, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images), "cache": cache}
+    so = body.get("stream_options")
+    return {"ids": ids, "out": out, "hashes": hashes, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images), "cache": cache, "cache_stats": (0, 0, 0, 0),
+            "include_usage": bool(isinstance(so, dict) and so.get("include_usage"))}
+
+
+def make_usage(p, n_out): # OpenAI 格式的 usage; 有的字段用 OpenAI 的名字 (cached_tokens), 其余是前缀缓存的统计, 所有字段始终存在
+    hit, kv_in, st_in, st_out = p["cache_stats"]
+    n_in = len(p["ids"])
+    return {"prompt_tokens": n_in, "completion_tokens": n_out, "total_tokens": n_in + n_out,
+            "prompt_tokens_details": {"cached_tokens": hit, "uncached_tokens": n_in - hit, "cache_written_tokens": kv_in, "cache_written_states": st_in},
+            "completion_tokens_details": {"cache_written_states": st_out}}
 
 
 def vision_embeds(p): # 锁内执行: 命中缓存的图片直接取, 其余图片一起过视觉塔, 返回 (所有图片 token 数, 5120) 和命中数
@@ -383,7 +387,8 @@ def generate_engine(p): # cuda 引擎模式的生成器: 视觉塔 (G_lock 内) 
             n += len(toks)
             yield from toks
         done = True
-        log(f"ℹ️ {p['rid']} 槽 {slot}: 生成 {n} tokens, decode {time.time() - t1:.2f}s, {(n - 1) / max(time.time() - t1, 1e-9):.2f} tok/s")
+        p["cache_stats"] = qwen.engine_cache_stats(slot) # 此时缓存已全部写完, 槽还没释放
+        log(f"ℹ️ {p['rid']} 槽 {slot}: 生成 {n} tokens, decode {time.time() - t1:.2f}s, {(n - 1) / max(time.time() - t1, 1e-9):.2f} tok/s, 缓存 (命中 / 写入 KV / 输入 state / 输出 state) {p['cache_stats']}")
     finally:
         if started and not done:
             qwen.engine_cancel(slot)
@@ -404,33 +409,31 @@ def generate_tokens(p): # 生成器, 逐个返回 token id; cpu 在锁内执行,
     yield from qwen.generate(p["ids"], G_args.ctx - len(p["ids"]), embd=embd, embd_mask=mask, pos3=pos3, **p["sampling"])
 
 
-class Decoder: # 增量解码, 遇到 </think> 切换到正文; 多字节字符未完整时暂缓输出
+class Decoder: # 增量解码 (按字节, 标准库 utf-8 增量解码器), 遇到 </think> 切换到正文; 文本原样, 不去掉任何字符
     def __init__(self, thinking):
         self.in_reasoning = thinking
-        self.seg = [] # 还没拼成完整字符的 token
+        self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace") # 多字节字符不完整时暂缓, 非法字节换成 U+FFFD (与 HF 解码相同)
         self.reasoning = ""
         self.content = ""
 
-    def push(self, tok): # 返回 (字段名, 新增文本): 每个 token 都返回一次, 没有新增文本 (停止 token、</think>、字符不完整、开头换行) 时是空串
-        field = "reasoning_content" if self.in_reasoning else "content"
-        if tok in qwen.EOS_IDS:
-            return field, ""
-        if self.in_reasoning and tok == THINK_END:
-            self.in_reasoning = False
-            self.seg = []
-            return field, ""
-        self.seg.append(tok)
-        new = qwen_tok.decode(self.seg)
-        if new.endswith("�"): # 多字节字符还不完整, 等后面的 token
-            return field, ""
-        self.seg = [] # 已是完整字符: 丢掉已解码的 token, 之后单独 decode 再拼接与整段 decode 相同 (ByteLevel decoder, 不清理空格)
-        if not self.in_reasoning and not self.content: # 去掉正文开头的换行 (</think> 后的 \n\n)
-            new = new.lstrip("\n")
-        if self.in_reasoning:
+    def add(self, field, new):
+        if field == "reasoning_content":
             self.reasoning += new
         else:
             self.content += new
         return field, new
+
+    def push(self, tok): # 返回 (字段名, 新增文本): 每个 token 都返回一次, 没有新增文本 (</think>、停止 token、字符还不完整) 时是空串
+        field = "reasoning_content" if self.in_reasoning else "content"
+        if tok in qwen.EOS_IDS or (self.in_reasoning and tok == THINK_END): # 停止 token / </think> 本身不进文本, 之前还不完整的字节吐出来 (U+FFFD), 不丢
+            new = self.dec.decode(b"", final=True)
+            self.dec.reset()
+            self.in_reasoning = self.in_reasoning and tok != THINK_END
+            return self.add(field, new)
+        return self.add(field, self.dec.decode(qwen_tok.token_bytes(tok)))
+
+    def finish(self): # 输出没有以停止 token 结束 (长度上限) 时, 剩下不完整的字节; 返回 (字段名, 文本)
+        return self.add("reasoning_content" if self.in_reasoning else "content", self.dec.decode(b"", final=True))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -518,29 +521,37 @@ class Handler(BaseHTTPRequestHandler):
             n_out += 1
             last = tok
             dec.push(tok)
+        dec.finish()
         msg = {"role": "assistant", "content": dec.content}
         if p["thinking"]:
-            msg["reasoning_content"] = dec.reasoning.strip()
+            msg["reasoning_content"] = dec.reasoning
         self.send_json(200, {
             "id": rid, "object": "chat.completion", "created": int(time.time()), "model": G_args.model_name,
             "choices": [{"index": 0, "message": msg, "finish_reason": "stop" if last in qwen.EOS_IDS else "length"}],
-            "usage": {"prompt_tokens": len(p["ids"]), "completion_tokens": n_out, "total_tokens": len(p["ids"]) + n_out},
+            "usage": make_usage(p, n_out),
         })
 
     def handle_stream(self, p, rid):
         base = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()), "model": G_args.model_name}
         self.write_sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
         dec = Decoder(p["thinking"])
-        last = None
+        last, n_out = None, 0
         gen = generate_tokens(p)
         try:
             for tok in gen: # 每个输出 token (含停止 token) 发一次, 没有新增文本时发空串
                 last = tok
+                n_out += 1
                 field, new = dec.push(tok)
                 self.write_sse({**base, "choices": [{"index": 0, "delta": {field: new}, "finish_reason": None}]})
         finally:
             gen.close() # 客户端断开时也会走到这里, 结束生成并释放锁
-        self.write_sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop" if last in qwen.EOS_IDS else "length"}]})
+        field, rest = dec.finish()
+        fin = {**base, "choices": [{"index": 0, "delta": {field: rest} if rest else {}, "finish_reason": "stop" if last in qwen.EOS_IDS else "length"}]} # rest: 长度上限截断时剩下的不完整字节 (U+FFFD)
+        if p["include_usage"]: # OpenAI: stream_options.include_usage 时在 [DONE] 前单独发一个 choices 为空、带 usage 的 chunk
+            self.write_sse(fin)
+            self.write_sse({**base, "choices": [], "usage": make_usage(p, n_out)})
+        else: # 没要求时附在最后一个 chunk 上 (不会让只读 choices[0] 的客户端出错)
+            self.write_sse({**fin, "usage": make_usage(p, n_out)})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
