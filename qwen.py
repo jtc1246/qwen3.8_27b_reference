@@ -9,7 +9,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 LIBS = {"cpu": "qwen_cpu/cmake_build/libqwen.so", "cuda": "qwen_cuda/cmake_build/libqwen_cuda.so"}
 CACHE_BACKENDS = ("cpu", "cuda") # 支持前缀缓存 (qwen_cache_init) 的后端
 EOS_IDS = (248046, 248044) # <|im_end|>, <|endoftext|>
-IM_START, IM_END, IMAGE_TOKEN = 248045, 248046, 248056
+IM_START, IM_END, IMAGE_TOKEN, THINK_END = 248045, 248046, 248056, 248069
 G_lib = None
 G_backend = None
 
@@ -30,7 +30,7 @@ def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm
     lib = ctypes.CDLL(os.path.join(ROOT, LIBS[backend]))
     lib.qwen_init.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     lib.qwen_eval.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-    lib.qwen_sample.argtypes = [ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    lib.qwen_sample.argtypes = [ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
     lib.qwen_seed.argtypes = [ctypes.c_uint64]
     lib.qwen_logits.restype = ctypes.POINTER(ctypes.c_float)
     lib.qwen_hidden.restype = ctypes.POINTER(ctypes.c_float)
@@ -41,7 +41,7 @@ def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm
         lib.qwen_cache_finish.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
     if backend == "cuda":
         lib.qwen_prefill.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
-                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         lib.qwen_cache_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.qwen_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
         lib.qwen_next.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
@@ -70,10 +70,11 @@ def eval_tokens(tokens, embd=None, embd_mask=None, pos3=None):
         raise RuntimeError(f"❌ qwen_eval 失败, 返回 {ret}")
 
 
-def sample(temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, presence_penalty=0.0, hist=None):
+def sample(temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, presence_penalty=0.0, hist=None, *, think_ok):
+    # 只在普通文本 token、im_end 里采样; think_ok (开了 thinking 且还在思考中) 时也可以采样思考结束 token
     hist = hist or []
     arr = (ctypes.c_int * max(1, len(hist)))(*hist)
-    return G_lib.qwen_sample(temperature, top_k, top_p, min_p, presence_penalty, arr, len(hist))
+    return G_lib.qwen_sample(temperature, top_k, top_p, min_p, presence_penalty, arr, len(hist), int(think_ok))
 
 
 def logits():
@@ -114,8 +115,9 @@ def cache_stats(): # 直接模式 (cpu), 生成结束之后: 同 engine_cache_st
     return tuple(out)
 
 
-def generate(prompt_tokens, max_new_tokens=512, stop_ids=EOS_IDS, embd=None, embd_mask=None, pos3=None, cache=None, **sample_kwargs):
+def generate(prompt_tokens, max_new_tokens=512, stop_ids=EOS_IDS, embd=None, embd_mask=None, pos3=None, cache=None, *, thinking, **sample_kwargs):
     # 生成器: 逐个返回新 token id; 调用方负责在新对话前 reset(); embd/embd_mask/pos3 含义同 eval_tokens
+    # thinking: prompt 是否开了 thinking (生成从思考中开始): 采样到思考结束 token 之前允许采样它, 之后不允许
     # cache: cache_plan 的返回值 (只有 cpu), 用 prefill_cached 代替 eval_tokens; 结束 (含中途关闭) 时 qwen_cache_finish: 以 im_end 结束则写输出缓存点, 否则丢掉, 返回前已写完
     t0 = time.time()
     hit = 0
@@ -125,10 +127,11 @@ def generate(prompt_tokens, max_new_tokens=512, stop_ids=EOS_IDS, embd=None, emb
         hit = prefill_cached(prompt_tokens, embd, embd_mask, pos3, cache)
     t1 = time.time()
     log(f"ℹ️ prefill {len(prompt_tokens)} tokens (缓存命中 {hit}, 计算 {len(prompt_tokens) - hit}), {t1 - t0:.2f}s, {(len(prompt_tokens) - hit) / (t1 - t0):.2f} tok/s")
-    out, ended = [], False
+    out, ended, in_think = [], False, thinking
     try:
         for _ in range(max_new_tokens):
-            tok = sample(hist=out, **sample_kwargs)
+            tok = sample(hist=out, think_ok=in_think, **sample_kwargs)
+            in_think = in_think and tok != THINK_END
             out.append(tok)
             ended = tok in stop_ids
             yield tok
@@ -198,9 +201,9 @@ def cache_plan(ids, images=()):
     return pos, b"".join(hs), b"".join(ks), roles, ser(s, n), role(s, n)
 
 
-def engine_args(tokens, embd=None, embd_mask=None, pos3=None, temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, presence_penalty=0.0, seed=0, max_new=512, stop_ids=EOS_IDS, cache=None):
+def engine_args(tokens, embd=None, embd_mask=None, pos3=None, temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, presence_penalty=0.0, seed=0, max_new=512, stop_ids=EOS_IDS, cache=None, *, thinking):
     # 预先准备好 qwen_prefill 的参数 (拿到 ticket 之后不能再出错, 否则后面的 prefill 都会卡住); embd/embd_mask/pos3 同 eval_tokens, 调用方要保持它们存活
-    # cache: cache_plan 的返回值, None 表示本请求不用前缀缓存
+    # cache: cache_plan 的返回值, None 表示本请求不用前缀缓存; thinking: prompt 是否开了 thinking (见 generate)
     n = len(tokens)
     p_embd = embd.ctypes.data if embd is not None else None
     p_mask = embd_mask.ctypes.data if embd_mask is not None else None
@@ -211,7 +214,7 @@ def engine_args(tokens, embd=None, embd_mask=None, pos3=None, temperature=1.0, t
         pos, hs, ks, roles, tail, tail_role = cache
         m = max(1, len(pos))
         c = (len(pos), (ctypes.c_int * m)(*pos), hs, ks, (ctypes.c_int * m)(*roles), tail, len(tail), tail_role)
-    return ((ctypes.c_int * n)(*tokens), n, p_embd, p_mask, p_pos, temperature, top_k, top_p, min_p, presence_penalty, seed & 0xffffffffffffffff, max_new, (ctypes.c_int * len(stop_ids))(*stop_ids), len(stop_ids)) + c
+    return ((ctypes.c_int * n)(*tokens), n, p_embd, p_mask, p_pos, temperature, top_k, top_p, min_p, presence_penalty, seed & 0xffffffffffffffff, max_new, (ctypes.c_int * len(stop_ids))(*stop_ids), len(stop_ids)) + c + (int(thinking),)
 
 
 def engine_prefill(slot, ticket, args): # 阻塞: 在 C++ 里按 ticket 顺序等前面的 prefill, 算完并采样出第一个 token 后返回

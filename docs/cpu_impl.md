@@ -139,11 +139,11 @@ KV cache 和所有中间结果都是 fp32 (HF 参考实现里 KV 是 bf16)。
 
 ## 8. 采样 (`qwen_sample`)
 
-基于 `G_logits` (最后一个 token) 的拷贝:
+基于 `G_logits` (最后一个 token) 的拷贝, 只在可采样的 token 里选 (cuda 版相同): 普通文本 token (0 ~ 248043)、im_end (248046), `think_ok` (开了 thinking 且还没生成思考结束 token) 时再加上思考结束 token (248069); 其余控制 token (包括 endoftext 248044) 和输出层的 243 个填充位 (248077 ~ 248319, tokenizer 里没有) 不参与任何一步。可采样集合内的结果与不限制时相同。
 
 1. **presence_penalty**: 对 `hist` 中出现过的每个 token (去重) 减去 penalty。由调用方传入已生成的 token, 与 vLLM 只统计输出 token 的做法一致
-2. **temperature ≤ 0**: 直接返回 argmax (greedy)
-3. **top_k**: `nth_element` 选出最大的 k 个, 再按 logit 降序排序 (top_k ≤ 0 表示不限制, 对全部 248320 个排序)
+2. **temperature ≤ 0**: 直接返回可采样 token 里的 argmax (greedy, 相同时取 id 小的)
+3. **top_k**: `nth_element` 选出最大的 k 个, 再按 logit 降序排序 (top_k ≤ 0 表示不限制, 对全部可采样的 token 排序)
 4. 在 double 下计算 `p_i = exp((l_i − l_max) / temperature)`
 5. **min_p**: 去掉 `p_i < min_p · p_max` 的候选 (至少保留 1 个)
 6. **top_p**: 按降序累加归一化概率, 累加值第一次 ≥ top_p 时截断 (包含该 token)
@@ -157,7 +157,7 @@ KV cache 和所有中间结果都是 fp32 (HF 参考实现里 KV 是 bf16)。
 |---|---|
 | `int qwen_init(const char* gguf_path, int n_threads, int max_ctx)` | 加载并分配全部内存; 0 成功, -1 文件或架构错误; 形状/参数不符时直接退出进程。重复调用直接返回 0 |
 | `int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3)` | 追加 n 个 token 到当前序列并计算最后一个的 logits。`embd` `[embd_mask 中 1 的个数][5120]` (只含图片位置, 按位置顺序)、`embd_mask` `[n]`、`pos3` `[n][3]` 都可为 NULL。返回 0 成功, -1 未初始化或 n ≤ 0, -2 超出 max_ctx, -3 token id 越界 (mask 为 1 的位置不检查) |
-| `int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist)` | 从当前 logits 采样一个 token id |
+| `int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, int think_ok)` | 从当前 logits 采样一个 token id (只在可采样的 token 里, 见第 8 节); think_ok: 开了 thinking 且还在思考中, 允许采样思考结束 token |
 | `void qwen_seed(uint64_t seed)` | 设置采样随机数状态 |
 | `void qwen_reset()` | 清零 DeltaNet 的递推和卷积状态, `n_past = next_pos = 0`。KV cache 不需要清零 (按 n_past 覆盖写) |
 | `int qwen_n_past()` | 当前序列长度 |

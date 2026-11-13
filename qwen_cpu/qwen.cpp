@@ -686,7 +686,9 @@ int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_m
     return 0;
 }
 
-int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist) {
+int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, int think_ok) {
+    // 只在可采样的 token 里采样: 普通文本 token [0, N_TEXT)、im_end, think_ok (开了 thinking 且还在思考中) 时加上思考结束 token; 其余控制 token 和输出层的填充位不参与
+    const int N_TEXT = 248044, THINK_END = 248069;
     float* l = G_work.data();
     memcpy(l, G_logits, VOCAB * sizeof(float));
     if (presence_penalty != 0 && hist) {
@@ -699,12 +701,14 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
         for (int i = 0; i < n_hist; i++)
             if (hist[i] >= 0 && hist[i] < VOCAB) G_seen[hist[i]] = 0;
     }
-    if (temperature <= 0) return (int)(std::max_element(l, l + VOCAB) - l);
     int* idx = G_idx.data();
-    for (int i = 0; i < VOCAB; i++) idx[i] = i;
-    int n = (top_k > 0 && top_k < VOCAB) ? top_k : VOCAB;
+    int m = 0; // 可采样的个数
+    for (int i = 0; i < VOCAB; i++)
+        if (i < N_TEXT || i == IM_END || (think_ok && i == THINK_END)) idx[m++] = i;
+    if (temperature <= 0) return *std::max_element(idx, idx + m, [&](int a, int b) { return l[a] < l[b]; }); // 相同时取 id 小的, 与原来一致
+    int n = (top_k > 0 && top_k < m) ? top_k : m;
     auto cmp = [&](int a, int b) { return l[a] > l[b]; };
-    if (n < VOCAB) std::nth_element(idx, idx + n, idx + VOCAB, cmp);
+    if (n < m) std::nth_element(idx, idx + n, idx + m, cmp);
     std::sort(idx, idx + n, cmp);
     vector<double> p(n);
     double sum = 0;

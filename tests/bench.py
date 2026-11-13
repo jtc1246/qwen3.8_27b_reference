@@ -27,7 +27,7 @@ def main():
         qwen.eval_tokens(toks)
         t1 = time.time()
         for _ in range(args.decode):
-            qwen.eval_tokens([qwen.sample(temperature=0)])
+            qwen.eval_tokens([qwen.sample(temperature=0, think_ok=False)])
         t2 = time.time()
         qwen.log(f"ℹ️ [{args.type}] 上下文 {n}: prefill {n / (t1 - t0):.1f} tok/s ({t1 - t0:.2f}s), decode {args.decode / (t2 - t1):.2f} tok/s")
 

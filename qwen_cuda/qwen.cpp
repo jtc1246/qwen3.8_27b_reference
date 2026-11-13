@@ -113,6 +113,7 @@ struct Slot {
     double* p = nullptr;
     std::atomic<int> cpend{0}, cpf{0}; // 前缀缓存: 未完成的写入数 / 其中 prompt 的; qwen_next 在 cpf 为 0 之前不返回 token, cpend 为 0 之前不返回结束
     int c_final = 0; // 1: 已采样到 <|im_end|>, decode 循环再算一步把它写进 KV/状态, 然后生成输出缓存点
+    int think = 0; // 1: 开了 thinking 且还没采样到思考结束 token (此时才允许采样它)
     Cache::Plan* cp = nullptr; // qwen_cache_init 之后才有
 };
 Slot G_slots[NSEQ]; // 直接模式 (qwen_eval / qwen_sample / qwen_reset) 用槽 0
@@ -911,7 +912,10 @@ int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_m
 
 namespace {
 
-int sample_impl(const float* logits, Slot& S, float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, uint64_t& rng) { // 临时空间用槽 S 的
+const int N_TEXT = 248044, THINK_END = 248069; // 普通文本 token 是 [0, N_TEXT) (BPE 词表), 之后是 33 个控制 token 和输出层的填充位
+
+int sample_impl(const float* logits, Slot& S, float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, uint64_t& rng, bool think_ok) { // 临时空间用槽 S 的
+    // 只在可采样的 token 里采样: 普通文本 token、im_end, think_ok (开了 thinking 且还在思考中) 时加上思考结束 token; 其余控制 token 和填充位不参与
     const float* l = logits; // 只读; 有 presence penalty 时才拷贝一份再改
     if (presence_penalty != 0 && hist) {
         float* w = S.work;
@@ -926,12 +930,20 @@ int sample_impl(const float* logits, Slot& S, float temperature, int top_k, floa
         for (int i = 0; i < n_hist; i++)
             if (hist[i] >= 0 && hist[i] < VOCAB) S.seen[hist[i]] = 0;
     }
-    if (temperature <= 0) return (int)(std::max_element(l, l + VOCAB) - l);
+    auto ok = [&](int i) { return i < N_TEXT || i == IM_END || (think_ok && i == THINK_END); };
+    if (temperature <= 0) { // 可采样的里面取最大 (相同时取 id 小的, 与 max_element 一致)
+        int best = 0;
+        for (int i = 1; i < VOCAB; i++)
+            if (ok(i) && l[i] > l[best]) best = i;
+        return best;
+    }
     int* idx = S.idx;
-    int n = (top_k > 0 && top_k < VOCAB) ? top_k : VOCAB;
+    int m = N_TEXT + 1 + think_ok; // 可采样的个数
+    int n = (top_k > 0 && top_k < m) ? top_k : m;
     if (n <= 256) { // top_k 较小: 单遍扫描, 维护按 logit 降序的前 n 个 (多数元素只和当前第 n 大比较一次)
         int cnt = 0;
         for (int i = 0; i < VOCAB; i++) {
+            if (!ok(i)) continue;
             float v = l[i];
             if (cnt == n && v <= l[idx[n - 1]]) continue;
             int j = cnt < n ? cnt++ : n - 1;
@@ -939,9 +951,10 @@ int sample_impl(const float* logits, Slot& S, float temperature, int top_k, floa
             idx[j] = i;
         }
     } else {
-        for (int i = 0; i < VOCAB; i++) idx[i] = i;
+        for (int i = 0, k = 0; i < VOCAB; i++)
+            if (ok(i)) idx[k++] = i;
         auto cmp = [&](int a, int b) { return l[a] > l[b]; };
-        if (n < VOCAB) std::nth_element(idx, idx + n, idx + VOCAB, cmp);
+        if (n < m) std::nth_element(idx, idx + n, idx + m, cmp);
         std::sort(idx, idx + n, cmp);
     }
     double* p = S.p;
@@ -977,8 +990,8 @@ int sample_impl(const float* logits, Slot& S, float temperature, int top_k, floa
 
 extern "C" {
 
-int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist) { // 直接模式: 从最近一次 qwen_eval 的 logits 采样
-    return sample_impl(G_cur_logits, G_slots[0], temperature, top_k, top_p, min_p, presence_penalty, hist, n_hist, G_rng);
+int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, int think_ok) { // 直接模式: 从最近一次 qwen_eval 的 logits 采样; think_ok: 开了 thinking 且还在思考中 (允许采样思考结束 token)
+    return sample_impl(G_cur_logits, G_slots[0], temperature, top_k, top_p, min_p, presence_penalty, hist, n_hist, G_rng, think_ok);
 }
 
 void qwen_seed(uint64_t seed) { G_rng = seed; } // 直接模式
@@ -999,7 +1012,8 @@ float* qwen_hidden() { // [65][5120], 0 是 embedding, i 是第 i 层输出, 都
 }
 
 int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3, float temperature, int top_k, float top_p, float min_p, float presence_penalty, uint64_t seed, int max_new, const int* stop, int n_stop,
-                 int n_pts, const int* pts_pos, const uint8_t* pts_hash, const uint8_t* pts_key, const int* pts_role, const uint8_t* tail, int n_tail, int tail_role) {
+                 int n_pts, const int* pts_pos, const uint8_t* pts_hash, const uint8_t* pts_key, const int* pts_role, const uint8_t* tail, int n_tail, int tail_role, int thinking) {
+    // thinking: 本次开了 thinking (生成从思考中开始), 采样到思考结束 token 之前允许采样它, 之后不允许
     // 引擎模式: 按 ticket 顺序 (FIFO, 从 0 开始连续) 等前面的输入算完, 在调用线程上 prefill 槽 sq, 采样出第一个 token 后交给 decode 循环; 0 成功
     // 失败也会让出 prefill (ticket 不能跳过); 成功后用 qwen_next 取 token
     // 前缀缓存 (n_pts < 0 或没有 qwen_cache_init 则不用): n_pts 个缓存点, 第 i 个 = 前 pts_pos[i] 个 token (递增), 该段 sha256 为 pts_hash[i], key 为 pts_key[i] (各 32 字节), 角色 token pts_role[i];
@@ -1054,7 +1068,9 @@ int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd
             P->out_start = P->out_flushed = P->n_pts ? P->pos[P->n_pts - 1] : 0;
             P->out_off = 0, P->n_segs = 0, P->out_id = Cache::G_out_seq.fetch_add(1);
         }
-        int tok = sample_impl(G_logits, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, nullptr, 0, S.rng);
+        S.think = thinking;
+        int tok = sample_impl(G_logits, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, nullptr, 0, S.rng, S.think);
+        S.think = S.think && tok != THINK_END;
         S.out[0] = tok;
         S.n_out.store(1);
         int fin = 0;
@@ -1140,7 +1156,8 @@ void qwen_decode_loop() { // 引擎模式: decode 循环, 由一个 python 线�
                 continue;
             }
             int n = S.n_out.load();
-            int tok = sample_impl(G_dlogits + (size_t)b * VOCAB, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, S.out, n, S.rng);
+            int tok = sample_impl(G_dlogits + (size_t)b * VOCAB, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, S.out, n, S.rng, S.think);
+            S.think = S.think && tok != THINK_END;
             S.out[n] = tok;
             S.n_out.store(n + 1);
             bool stop = false;

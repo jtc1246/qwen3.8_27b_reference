@@ -70,7 +70,7 @@ KV cache 是 q8_0 (llama.cpp 默认 F16, q8_0 是可选的 `-ctk q8_0 -ctv q8_0`
 - **q8_0**: 34 字节一块, 重排后每 8 块一组 (scale 移到组尾), 量化值按 uint2 / uint4 读
 - 所有矩阵的行数都是 8 的倍数, k 都是 256 的倍数
 
-lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, 采样复用 CPU 版的代码。
+lm_head 用同一个 `k_mm_q6_k` (T = 1); logits 拷回 pinned host 内存后, 采样复用 CPU 版的代码 (可采样范围相同, 见 cpu_impl.md 第 8 节); 引擎模式下 "是否还在思考中" 由各槽自己维护 (`qwen_prefill` 的 thinking 参数开始, 采样到思考结束 token 后关闭)。
 
 ## 4. 其他
 

@@ -58,7 +58,7 @@ def main():
     outs = []
     for m in (cpu, gpu):
         m.reset()
-        outs.append(list(m.generate(prompt, 32, temperature=0)))
+        outs.append(list(m.generate(prompt, 32, thinking=False, temperature=0))) # prompt 结尾已关闭思考
     same = outs[0] == outs[1]
     fails += not same
     print(f"{'✅' if same else '❌'} 贪心生成 32 token: CPU {outs[0]}\n   GPU {outs[1]}", flush=True)

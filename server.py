@@ -3,7 +3,7 @@
 # cpu: C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
 # cuda: 引擎模式, 最多 qwen.nseq() (4) 个请求同时进行: 超出的在 python 按到达顺序排队; prefill 在 C++ 里按顺序逐个算, decode 所有序列每步一起算, 两者同时跑时按 SM 分区
 # --type 选择后端 (qwen.LIBS), cuda 时视觉塔也在 GPU 上; 视觉塔输出按图片原始字节的 sha256 缓存在内存 (LRU)
-import os, re, sys, io, json, time, uuid, codecs, fcntl, shlex, base64, random, ctypes, shutil, hashlib, argparse, threading, contextlib
+import os, re, sys, io, json, time, uuid, codecs, fcntl, shlex, base64, random, ctypes, shutil, sqlite3, hashlib, argparse, threading, contextlib
 from collections import OrderedDict, deque
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import numpy as np
@@ -35,6 +35,8 @@ G_waiting = 0
 G_pool = None # cuda 的 SlotPool
 G_cache_dir = None # 前缀缓存目录 (--cache-dir), None 表示不启用
 G_cache_lock = None # 缓存目录锁文件的 fd, 进程生命周期内一直持有
+G_tokdb = None # 输出 token 缓存 (sqlite3, 在缓存目录里): 文本的 sha256 -> 生成时的 token 序列; 进程内只打开一次, 所有线程共用
+G_tokdb_lock = threading.Lock()
 
 
 class BadRequest(Exception):
@@ -110,9 +112,36 @@ REASONING = { # 与 chat_template.jinja 的 reasoning_instructions 相同 (mediu
 }
 
 
-def render_content(content, is_system): # 同模板的 render_content, 但不做 trim (正文原样): 返回片段列表, str 是正文, int 是控制 token id
+def open_tokdb(d): # 输出 token 缓存: 表里每行是 (文本 utf-8 的 sha256, token 序列每个 3 字节小端), 不存类型 (思考和正文各存一行)
+    global G_tokdb
+    G_tokdb = sqlite3.connect(os.path.join(d, "output_tokens.sqlite3"), check_same_thread=False, isolation_level=None) # autocommit, 各线程用 G_tokdb_lock 串行
+    G_tokdb.execute("CREATE TABLE IF NOT EXISTS output_tokens (key BLOB PRIMARY KEY, tokens BLOB NOT NULL) WITHOUT ROWID")
+
+
+def tokdb_get(text): # 查到返回 token 列表, 否则 None; 没启用缓存时总是 None
+    if G_tokdb is None:
+        return None
+    with G_tokdb_lock:
+        r = G_tokdb.execute("SELECT tokens FROM output_tokens WHERE key = ?", (hashlib.sha256(text.encode("utf-8")).digest(),)).fetchone()
+    return None if r is None else [int.from_bytes(r[0][i:i + 3], "little") for i in range(0, len(r[0]), 3)]
+
+
+def tokdb_put(text, ids): # 已有同样的文本就覆盖
+    with G_tokdb_lock:
+        G_tokdb.execute("INSERT OR REPLACE INTO output_tokens (key, tokens) VALUES (?, ?)", (hashlib.sha256(text.encode("utf-8")).digest(), b"".join(t.to_bytes(3, "little") for t in ids)))
+
+
+def save_output(dec): # 生成结束 (含客户端断开) 时把这次的输出存进输出 token 缓存: 开 thinking 时思考和正文各一行, 否则只有正文
+    if G_tokdb is None:
+        return
+    if dec.thinking:
+        tokdb_put(dec.reasoning, dec.ids["reasoning_content"])
+    tokdb_put(dec.content, dec.ids["content"])
+
+
+def render_content(content, is_system): # 同模板的 render_content, 但不做 trim (正文原样): 返回片段列表, ("u", 字符串) 是正文, int 是控制 token id
     if isinstance(content, str):
-        parts = [content]
+        parts = [("u", content)]
     elif content is None:
         parts = []
     elif isinstance(content, list):
@@ -123,15 +152,16 @@ def render_content(content, is_system): # 同模板的 render_content, 但不做
                     raise BadRequest("System message cannot contain images.")
                 parts += [qwen_tok.CTL["<|vision_start|>"], qwen_tok.CTL["<|image_pad|>"], qwen_tok.CTL["<|vision_end|>"]]
             else:
-                parts.append(it["text"]) # convert_messages 已保证是字符串
+                parts.append(("u", it["text"])) # convert_messages 已保证是字符串
     else:
         raise BadRequest("Unexpected content type.")
     return parts
 
 
 def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinja 的结构 (不含 tools) 直接拼 token, 但正文不 trim, 也不补模板为 trim 加的换行: 正文只用 qwen_tok.encode 按文本分词 (不可能产生控制 token), 控制 token 由这里按 id 插入; <|image_pad|> 按 grid 展开
+    # 每段正文先查输出 token 缓存, 查到就直接用生成时的 token 序列 (不论在哪种消息里)
     C = qwen_tok.CTL
-    seq = [] # str 或 int
+    seq = [] # str: 结构文本, ("u", str): 正文, int: 控制 token
     ri = REASONING[effort if effort is not None else "xhigh"] if enable_thinking else None # None: 没有 reasoning 指令
     if msgs[0]["role"] == "system": # 有 system 消息就有 system 块, 内容原样 (不判断是否为空)
         seq += [C["<|im_start|>"], "system\n" + (ri + "\n\n" if ri is not None else "")] + render_content(msgs[0]["content"], True) + [C["<|im_end|>"], "\n"]
@@ -149,7 +179,7 @@ def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinj
         elif m["role"] == "assistant": # 还原成当时的生成提示 + 模型原样生成的内容 (本服务返回的 reasoning_content / content 都是原样的)
             rc = m.get("reasoning_content")
             if isinstance(rc, str): # 有 reasoning_content (不管是否为空) 就是开 thinking 的轮次: 生成提示到思考开始 token + "\n", 之后 (含思考结束 token 前后的换行) 都是模型生成的
-                seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n" + rc, C["</think>"]] + c + [C["<|im_end|>"], "\n"]
+                seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n", ("u", rc), C["</think>"]] + c + [C["<|im_end|>"], "\n"]
             else: # 没有 reasoning_content 字段: 不开 thinking 的轮次, 生成提示是 思考开始 "\n\n" 思考结束 "\n\n", 之后是正文
                 seq += [C["<|im_start|>"], "assistant\n", C["<think>"], "\n\n", C["</think>"], "\n\n"] + c + [C["<|im_end|>"], "\n"]
         elif m["role"] == "tool":
@@ -166,7 +196,15 @@ def build_tokens(msgs, enable_thinking, effort, grids): # 按 chat_template.jinj
         if isinstance(x, str):
             buf.append(x)
             continue
-        ids += qwen_tok.encode("".join(buf)) # 两个控制 token 之间的正文整段分词 (与官方在 added token 处切开后各段分词相同)
+        if isinstance(x, tuple): # 正文: 输出 token 缓存里有就用存下的 token 序列 (之前的文本先单独分词); 没有就和两边的结构文本一起整段分词
+            hit = tokdb_get(x[1])
+            if hit is None:
+                buf.append(x[1])
+                continue
+            ids += qwen_tok.encode("".join(buf)) + hit
+            buf = []
+            continue
+        ids += qwen_tok.encode("".join(buf)) # 两个控制 token 之间的文本整段分词 (与官方在 added token 处切开后各段分词相同)
         buf = []
         if x is None:
             break
@@ -368,7 +406,7 @@ def generate_engine(p): # cuda 引擎模式的生成器: 视觉塔 (G_lock 内) 
     with G_lock:
         embd, mask, pos3 = run_vision(p)
     seed = p["seed"] if p["seed"] is not None else random.getrandbits(63)
-    args = qwen.engine_args(p["ids"], embd, mask, pos3, seed=seed, max_new=G_args.ctx - len(p["ids"]), cache=p["cache"], **p["sampling"]) # 拿到槽位前准备好, 之后不能再出错
+    args = qwen.engine_args(p["ids"], embd, mask, pos3, seed=seed, max_new=G_args.ctx - len(p["ids"]), cache=p["cache"], thinking=p["thinking"], **p["sampling"]) # 拿到槽位前准备好, 之后不能再出错
     slot, ticket = G_pool.acquire(p["rid"])
     buf = (ctypes.c_int * 256)()
     started, done = False, False
@@ -404,17 +442,19 @@ def generate_tokens(p): # 生成器, 逐个返回 token id; cpu 在锁内执行,
     embd, mask, pos3 = run_vision(p)
     qwen.reset()
     qwen.seed(p["seed"] if p["seed"] is not None else random.getrandbits(63))
-    yield from qwen.generate(p["ids"], G_args.ctx - len(p["ids"]), embd=embd, embd_mask=mask, pos3=pos3, cache=p["cache"], **p["sampling"])
+    yield from qwen.generate(p["ids"], G_args.ctx - len(p["ids"]), embd=embd, embd_mask=mask, pos3=pos3, cache=p["cache"], thinking=p["thinking"], **p["sampling"])
     if p["cache"] is not None:
         p["cache_stats"] = qwen.cache_stats() # 缓存已全部写完
 
 
 class Decoder: # 增量解码 (按字节, 标准库 utf-8 增量解码器), 遇到 </think> 切换到正文; 文本原样, 不去掉任何字符
     def __init__(self, thinking):
+        self.thinking = thinking
         self.in_reasoning = thinking
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace") # 多字节字符不完整时暂缓, 非法字节换成 U+FFFD (与 HF 解码相同)
         self.reasoning = ""
         self.content = ""
+        self.ids = {"reasoning_content": [], "content": []} # 每个字段生成的 token (不含划分两段的思考结束 token 和停止 token), 存进输出 token 缓存
 
     def add(self, field, new):
         if field == "reasoning_content":
@@ -430,6 +470,7 @@ class Decoder: # 增量解码 (按字节, 标准库 utf-8 增量解码器), 遇�
             self.dec.reset()
             self.in_reasoning = self.in_reasoning and tok != THINK_END
             return self.add(field, new)
+        self.ids[field].append(tok)
         return self.add(field, self.dec.decode(qwen_tok.token_bytes(tok)))
 
     def finish(self): # 输出没有以停止 token 结束 (长度上限) 时, 剩下不完整的字节; 返回 (字段名, 文本)
@@ -522,6 +563,7 @@ class Handler(BaseHTTPRequestHandler):
             last = tok
             dec.push(tok)
         dec.finish()
+        save_output(dec)
         msg = {"role": "assistant", "content": dec.content}
         if p["thinking"]:
             msg["reasoning_content"] = dec.reasoning
@@ -545,7 +587,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.write_sse({**base, "choices": [{"index": 0, "delta": {field: new}, "finish_reason": None}]})
         finally:
             gen.close() # 客户端断开时也会走到这里, 结束生成并释放锁
-        field, rest = dec.finish()
+            field, rest = dec.finish()
+            save_output(dec) # 客户端断开时也存 (客户端可能保留了已收到的部分)
         fin = {**base, "choices": [{"index": 0, "delta": {field: rest}, "finish_reason": "stop" if last in qwen.EOS_IDS else "length"}]} # rest: 截断时剩下的不完整字节 (U+FFFD), 一般为空串
         if p["include_usage"]: # OpenAI: stream_options.include_usage 时在 [DONE] 前单独发一个 choices 为空、带 usage 的 chunk
             self.write_sse(fin)
@@ -589,6 +632,7 @@ def main():
         log(f"⚠️ {G_args.type} 后端暂不支持前缀缓存, 忽略 --cache-dir")
     elif G_args.cache_dir is not None:
         G_cache_dir = open_cache_dir(G_args.cache_dir)
+        open_tokdb(G_cache_dir)
     qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None, G_cache_dir, G_args.cache_threads)
     if G_args.type == "cuda":
         G_pool = SlotPool(qwen.nseq())

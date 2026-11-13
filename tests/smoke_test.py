@@ -82,7 +82,7 @@ def main():
     fails = lib.qwen_selftest()
     qwen.log(("✅ 自测全部通过" if fails == 0 else f"❌ 自测失败 {fails} 项"))
     out = []
-    for tok in qwen.generate(prompt, args.max_new, temperature=args.temp):
+    for tok in qwen.generate(prompt, args.max_new, thinking=args.think, temperature=args.temp):
         out.append(tok)
         sys.stderr.write(decode([tok]))
         sys.stderr.flush()
