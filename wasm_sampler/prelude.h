@@ -39,9 +39,9 @@ const int QS_VOCAB = 248320; // logits 个数, 含控制 token 和输出层填�
 const int QS_N_TEXT = 248044; // 普通文本 token 是 [0, QS_N_TEXT)
 const int QS_IM_END = 248046, QS_THINK_END = 248069;
 
-// 返回值的合法性 (服务端检查, 不合法则请求报错): 普通文本、QS_IM_END (结束本次生成), 以及 thinking 模式下思考结束之前的 QS_THINK_END; 其余控制 token (包括 endoftext 248044) 都不允许
+// 返回值的合法性 (服务端检查, 不合法则请求报错): 普通文本; 思考中 (thinking 模式且还没返回过 QS_THINK_END) 是 QS_THINK_END (结束思考), 否则是 QS_IM_END (结束本次生成); 思考中不能直接返回 QS_IM_END, 其余控制 token (包括 endoftext 248044) 都不允许
 // 何时结束思考、何时结束生成完全由用户决定, 没有额外的结束信号; 不返回结束 token 就一直生成到上下文用完
-inline bool qs_allowed(int id, bool in_thinking) { return (id >= 0 && id < QS_N_TEXT) || id == QS_IM_END || (in_thinking && id == QS_THINK_END); }
+inline bool qs_allowed(int id, bool in_thinking) { return (id >= 0 && id < QS_N_TEXT) || id == (in_thinking ? QS_THINK_END : QS_IM_END); }
 inline float qs_half_to_float(uint16_t h) { // IEEE fp16 -> float (含非规格化数、inf、nan)
     uint32_t s = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff, f;
     if (e == 31) f = s | 0x7f800000 | (m << 13);

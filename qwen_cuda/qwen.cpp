@@ -918,7 +918,7 @@ namespace {
 const int N_TEXT = 248044, THINK_END = 248069; // 普通文本 token 是 [0, N_TEXT) (BPE 词表), 之后是 33 个控制 token 和输出层的填充位
 
 int sample_impl(const float* logits, Slot& S, float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, uint64_t& rng, bool think_ok) { // 临时空间用槽 S 的
-    // 只在可采样的 token 里采样: 普通文本 token、im_end, think_ok (开了 thinking 且还在思考中) 时加上思考结束 token; 其余控制 token 和填充位不参与
+    // 只在可采样的 token 里采样: 普通文本 token, think_ok (开了 thinking 且还在思考中) 时加上思考结束 token, 否则加上 im_end; 其余控制 token 和填充位不参与
     const float* l = logits; // 只读; 有 presence penalty 时才拷贝一份再改
     if (presence_penalty != 0 && hist) {
         float* w = S.work;
@@ -933,7 +933,7 @@ int sample_impl(const float* logits, Slot& S, float temperature, int top_k, floa
         for (int i = 0; i < n_hist; i++)
             if (hist[i] >= 0 && hist[i] < VOCAB) S.seen[hist[i]] = 0;
     }
-    auto ok = [&](int i) { return i < N_TEXT || i == IM_END || (think_ok && i == THINK_END); };
+    auto ok = [&](int i) { return i < N_TEXT || i == (think_ok ? THINK_END : IM_END); }; // 思考中只能先结束思考 (不能直接 im_end), 之后才能 im_end
     if (temperature <= 0) { // 可采样的里面取最大 (相同时取 id 小的, 与 max_element 一致)
         int best = 0;
         for (int i = 1; i < VOCAB; i++)
@@ -941,7 +941,7 @@ int sample_impl(const float* logits, Slot& S, float temperature, int top_k, floa
         return best;
     }
     int* idx = S.idx;
-    int m = N_TEXT + 1 + think_ok; // 可采样的个数
+    int m = N_TEXT + 1; // 可采样的个数: 普通文本 + 思考结束 / im_end 二者之一
     int n = (top_k > 0 && top_k < m) ? top_k : m;
     if (n <= 256) { // top_k 较小: 单遍扫描, 维护按 logit 降序的前 n 个 (多数元素只和当前第 n 大比较一次)
         int cnt = 0;
@@ -990,10 +990,14 @@ int sample_impl(const float* logits, Slot& S, float temperature, int top_k, floa
 }
 
 int wasm_check(int sq, bool ok, int tok) { // 自定义采样的结果: 出错或返回值不合法时返回 -1, 原因写在 S.err
-    // 返回值只能是普通文本、im_end, 或 thinking 模式下思考结束之前的思考结束 token (与内置采样相同, endoftext 也不允许); 结束完全由用户决定 (没有长度限制, 直到上下文用完)
+    // 返回值只能是普通文本, 思考中的思考结束 token, 或不在思考中时的 im_end (与内置采样相同, endoftext 也不允许); 结束完全由用户决定 (没有长度限制, 直到上下文用完)
     Slot& S = G_slots[sq];
     if (!ok) {
         snprintf(S.err, sizeof(S.err), "%s", WasmSampler::error(sq));
+        return -1;
+    }
+    if (tok == IM_END && S.think) {
+        snprintf(S.err, sizeof(S.err), "sample 在思考还没结束时返回了 im_end %d (要先返回思考结束 token %d)", tok, THINK_END);
         return -1;
     }
     if (tok == THINK_END && !S.think) {
@@ -1001,7 +1005,7 @@ int wasm_check(int sq, bool ok, int tok) { // 自定义采样的结果: 出错�
         return -1;
     }
     if (tok < 0 || !(tok < N_TEXT || tok == IM_END || tok == THINK_END)) {
-        snprintf(S.err, sizeof(S.err), "sample 返回了不允许的 token %d (只能是普通文本 [0, %d)、im_end %d, 或思考中的 %d)", tok, N_TEXT, IM_END, THINK_END);
+        snprintf(S.err, sizeof(S.err), "sample 返回了不允许的 token %d (只能是普通文本 [0, %d)、思考中的思考结束 token %d、思考结束后的 im_end %d)", tok, N_TEXT, THINK_END, IM_END);
         return -1;
     }
     return tok;

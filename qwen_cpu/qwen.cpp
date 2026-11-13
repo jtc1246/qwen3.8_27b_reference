@@ -687,7 +687,7 @@ int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_m
 }
 
 int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, int think_ok) {
-    // 只在可采样的 token 里采样: 普通文本 token [0, N_TEXT)、im_end, think_ok (开了 thinking 且还在思考中) 时加上思考结束 token; 其余控制 token 和输出层的填充位不参与
+    // 只在可采样的 token 里采样: 普通文本 token [0, N_TEXT), think_ok (开了 thinking 且还在思考中) 时加上思考结束 token, 否则加上 im_end (思考中不能直接结束); 其余控制 token 和输出层的填充位不参与
     const int N_TEXT = 248044, THINK_END = 248069;
     float* l = G_work.data();
     memcpy(l, G_logits, VOCAB * sizeof(float));
@@ -704,7 +704,7 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
     int* idx = G_idx.data();
     int m = 0; // 可采样的个数
     for (int i = 0; i < VOCAB; i++)
-        if (i < N_TEXT || i == IM_END || (think_ok && i == THINK_END)) idx[m++] = i;
+        if (i < N_TEXT || i == (think_ok ? THINK_END : IM_END)) idx[m++] = i;
     if (temperature <= 0) return *std::max_element(idx, idx + m, [&](int a, int b) { return l[a] < l[b]; }); // 相同时取 id 小的, 与原来一致
     int n = (top_k > 0 && top_k < m) ? top_k : m;
     auto cmp = [&](int a, int b) { return l[a] > l[b]; };

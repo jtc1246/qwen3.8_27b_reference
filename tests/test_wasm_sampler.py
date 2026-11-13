@@ -152,6 +152,7 @@ def test_errors():
     expect_400({"messages": MSG, "sampler_cpp": REPLAY, "sampler_data": b64(toks([100, 101, END_OF_TEXT]))}, "已生成 2 个 token): sample 返回了不允许的 token 248044", "返回 endoftext")
     expect_400({"messages": MSG, "enable_thinking": False, "sampler_cpp": INIT0 + "int sample(void* data) { return QS_THINK_END; }"}, "不是 thinking 模式", "非 thinking 模式返回思考结束 token")
     expect_400({"messages": MSG, "enable_thinking": True, "sampler_cpp": REPLAY, "sampler_data": b64(toks([100, THINK_END, 101, THINK_END]))}, "思考已经结束", "思考结束后再次返回思考结束 token")
+    expect_400({"messages": MSG, "enable_thinking": True, "sampler_cpp": REPLAY, "sampler_data": b64(toks([100, 101, IM_END]))}, "已生成 2 个 token): sample 在思考还没结束时返回了 im_end", "思考中直接返回 im_end")
     trap5 = "int G_n = 0;\n" + INIT0 + "int sample(void* data) { if (G_n == 5) __builtin_trap(); return 100 + G_n++; }"
     expect_400({"messages": MSG, "sampler_cpp": trap5}, "已生成 5 个 token", "第 6 次 sample trap (非流式)")
     code, r = post({"messages": MSG, "sampler_cpp": trap5}, stream=True)

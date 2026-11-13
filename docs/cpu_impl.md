@@ -139,7 +139,7 @@ KV cache 和所有中间结果都是 fp32 (HF 参考实现里 KV 是 bf16)。
 
 ## 8. 采样 (`qwen_sample`)
 
-基于 `G_logits` (最后一个 token) 的拷贝, 只在可采样的 token 里选 (cuda 版相同): 普通文本 token (0 ~ 248043)、im_end (248046), `think_ok` (开了 thinking 且还没生成思考结束 token) 时再加上思考结束 token (248069); 其余控制 token (包括 endoftext 248044) 和输出层的 243 个填充位 (248077 ~ 248319, tokenizer 里没有) 不参与任何一步。可采样集合内的结果与不限制时相同。
+基于 `G_logits` (最后一个 token) 的拷贝, 只在可采样的 token 里选 (cuda 版相同): 普通文本 token (0 ~ 248043), `think_ok` (开了 thinking 且还没生成思考结束 token) 时再加上思考结束 token (248069), 否则加上 im_end (248046), 即思考中不能直接结束, 要先结束思考; 其余控制 token (包括 endoftext 248044) 和输出层的 243 个填充位 (248077 ~ 248319, tokenizer 里没有) 不参与任何一步。可采样集合内的结果与不限制时相同。
 
 1. **presence_penalty**: 对 `hist` 中出现过的每个 token (去重) 减去 penalty。由调用方传入已生成的 token, 与 vLLM 只统计输出 token 的做法一致
 2. **temperature ≤ 0**: 直接返回可采样 token 里的 argmax (greedy, 相同时取 id 小的)
