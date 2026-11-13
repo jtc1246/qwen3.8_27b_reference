@@ -14,6 +14,7 @@ from transformers import AutoImageProcessor, AutoConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 import qwen
 import qwen_tok
+import wasm_sampler
 
 IMAGE_TOKEN = 248056
 THINK_END = 248069
@@ -349,8 +350,30 @@ def build_prompt(body): # 锁外执行: 解析消息、下载图片、拼 token 
         raise BadRequest("seed 必须是整数")
     cache = qwen.cache_plan(ids, list(zip(hashes, out["image_grid_thw"].tolist() if images else []))) if G_cache_dir is not None else None
     so = body.get("stream_options")
+    wasm, wasm_data = None, None
+    if body.get("sampler_cpp") is not None: # 自定义采样: C++ 源码 (接口见 wasm_sampler/prelude.h), 服务端编译成 wasm (有缓存), 代替内置采样; sampler_data: 交给 sampler_init 的二进制 (base64)
+        if G_args.type != "cuda":
+            raise BadRequest("自定义采样 (sampler_cpp) 只有 cuda 后端支持")
+        sd = body.get("sampler_data")
+        if sd is not None:
+            if not isinstance(sd, str):
+                raise BadRequest("sampler_data 必须是 base64 字符串")
+            try:
+                wasm_data = base64.b64decode(sd, validate=True)
+            except ValueError as e:
+                raise BadRequest(f"sampler_data 的 base64 不合法: {e}")
+            if len(wasm_data) > wasm_sampler.MAX_DATA:
+                raise BadRequest(f"sampler_data 解码后 {len(wasm_data)} 字节, 超过上限 {wasm_sampler.MAX_DATA}")
+        t0 = time.time()
+        try:
+            wasm = wasm_sampler.compile(body["sampler_cpp"])
+        except wasm_sampler.CompileError as e:
+            raise BadRequest(f"自定义采样编译失败: {e}")
+        log(f"ℹ️ 自定义采样模块 {len(wasm)} 字节, 编译 (或读缓存) {time.time() - t0:.2f}s, sampler_data {len(wasm_data) if wasm_data else 0} 字节")
+    elif body.get("sampler_data") is not None:
+        raise BadRequest("sampler_data 只能和 sampler_cpp 一起用")
     return {"ids": ids, "out": out, "hashes": hashes, "thinking": enable_thinking, "sampling": sp, "seed": seed, "n_images": len(images), "cache": cache, "cache_stats": (0, 0, 0, 0),
-            "include_usage": bool(isinstance(so, dict) and so.get("include_usage"))}
+            "include_usage": bool(isinstance(so, dict) and so.get("include_usage")), "wasm": wasm, "wasm_data": wasm_data}
 
 
 def make_usage(p, n_out): # OpenAI 格式的 usage; 有的字段用 OpenAI 的名字 (cached_tokens), 其余是前缀缓存的统计, 所有字段始终存在
@@ -406,7 +429,7 @@ def generate_engine(p): # cuda 引擎模式的生成器: 视觉塔 (G_lock 内) 
     with G_lock:
         embd, mask, pos3 = run_vision(p)
     seed = p["seed"] if p["seed"] is not None else random.getrandbits(63)
-    args = qwen.engine_args(p["ids"], embd, mask, pos3, seed=seed, max_new=G_args.ctx - len(p["ids"]), cache=p["cache"], thinking=p["thinking"], **p["sampling"]) # 拿到槽位前准备好, 之后不能再出错
+    args = qwen.engine_args(p["ids"], embd, mask, pos3, seed=seed, max_new=G_args.ctx - len(p["ids"]), cache=p["cache"], wasm=p["wasm"], wasm_data=p["wasm_data"], thinking=p["thinking"], **p["sampling"]) # 拿到槽位前准备好, 之后不能再出错
     slot, ticket = G_pool.acquire(p["rid"])
     buf = (ctypes.c_int * 256)()
     started, done = False, False
@@ -424,7 +447,10 @@ def generate_engine(p): # cuda 引擎模式的生成器: 视觉塔 (G_lock 内) 
             yield from toks
         done = True
         p["cache_stats"] = qwen.engine_cache_stats(slot) # 此时缓存已全部写完, 槽还没释放
-        log(f"ℹ️ {p['rid']} 槽 {slot}: 生成 {n} tokens, decode {time.time() - t1:.2f}s, {(n - 1) / max(time.time() - t1, 1e-9):.2f} tok/s, 缓存 (命中 / 写入 KV / 输入 state / 输出 state) {p['cache_stats']}")
+        log(f"ℹ️ {p['rid']} 槽 {slot}: 生成 {n} tokens, decode {time.time() - t1:.2f}s, {max(n - 1, 0) / max(time.time() - t1, 1e-9):.2f} tok/s, 缓存 (命中 / 写入 KV / 输入 state / 输出 state) {p['cache_stats']}")
+        err = qwen.engine_error(slot)
+        if err is not None:
+            raise BadRequest(f"自定义采样出错 (已生成 {n} 个 token): {err}")
     finally:
         if started and not done:
             qwen.engine_cancel(slot)
@@ -531,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
         try:
             with G_lock if G_args.type != "cuda" else contextlib.nullcontext():
-                log(f"ℹ️ {rid[-8:]} 开始: prompt {len(p['ids'])} tokens, 图片 {p['n_images']}, thinking={p['thinking']}, {p['sampling']}, seed={p['seed']}")
+                log(f"ℹ️ {rid[-8:]} 开始: prompt {len(p['ids'])} tokens, 图片 {p['n_images']}, thinking={p['thinking']}, {'自定义采样 (wasm)' if p['wasm'] else p['sampling']}, seed={p['seed']}")
                 if stream:
                     self.handle_stream(p, rid)
                 else:
@@ -616,6 +642,8 @@ def main():
     p.add_argument("--image-cache-mb", type=int, default=4096, help="视觉塔输出缓存上限 (MB, 只在内存, LRU 淘汰), 0 表示不缓存")
     p.add_argument("--cache-dir", default=None, help=f"前缀缓存 (磁盘) 目录, 不指定则不启用; 支持的后端 {list(qwen.CACHE_BACKENDS)}; 通过 router 启动时由 router 传入 <router 的 --cache-dir>/<type>")
     p.add_argument("--cache-threads", type=int, default=8, help="前缀缓存后台量化 state 的线程数")
+    p.add_argument("--sampler-rootfs", default=None, help="自定义采样的编译镜像 (tar, 由 wasm_sampler.py build-rootfs 生成), 与 --cache-dir 一起指定后才能用请求的 sampler_cpp (只有 cuda); 编译结果缓存在 <cache-dir>/wasm")
+    p.add_argument("--wasm-tmp-dir", default="/dev/shm", help="自定义采样编译用的临时目录, 每次编译在这里解压一份编译镜像 (约 360MB), 用完删除")
     G_args = p.parse_args()
     G_args.model_name = f"{G_args.model_name}-{G_args.type}"
     if G_args.ctx is None:
@@ -633,6 +661,10 @@ def main():
     elif G_args.cache_dir is not None:
         G_cache_dir = open_cache_dir(G_args.cache_dir)
         open_tokdb(G_cache_dir)
+    if G_args.type == "cuda": # 这里不检查镜像 / 目录, 收到自定义采样请求时才用到, 有问题只让那个请求报错
+        wasm_sampler.init(G_args.sampler_rootfs, os.path.join(G_cache_dir, "wasm") if G_cache_dir else None, G_args.wasm_tmp_dir) # 编译缓存放在前缀缓存目录里 (前缀缓存只认两位十六进制的子目录, 不受影响)
+        if G_args.sampler_rootfs:
+            log(f"ℹ️ 自定义采样: 编译镜像 {wasm_sampler.G_image}, 编译缓存 {wasm_sampler.G_dir}, 临时目录 {wasm_sampler.G_tmp}")
     qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None, G_cache_dir, G_args.cache_threads)
     if G_args.type == "cuda":
         G_pool = SlotPool(qwen.nseq())

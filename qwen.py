@@ -41,7 +41,9 @@ def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm
         lib.qwen_cache_finish.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
     if backend == "cuda":
         lib.qwen_prefill.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_uint64, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
-                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint64]
+        lib.qwen_slot_error.argtypes = [ctypes.c_int]
+        lib.qwen_slot_error.restype = ctypes.c_char_p
         lib.qwen_cache_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
         lib.qwen_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
         lib.qwen_next.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
@@ -201,9 +203,10 @@ def cache_plan(ids, images=()):
     return pos, b"".join(hs), b"".join(ks), roles, ser(s, n), role(s, n)
 
 
-def engine_args(tokens, embd=None, embd_mask=None, pos3=None, temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, presence_penalty=0.0, seed=0, max_new=512, stop_ids=EOS_IDS, cache=None, *, thinking):
+def engine_args(tokens, embd=None, embd_mask=None, pos3=None, temperature=1.0, top_k=20, top_p=0.95, min_p=0.0, presence_penalty=0.0, seed=0, max_new=512, stop_ids=EOS_IDS, cache=None, wasm=None, wasm_data=None, *, thinking):
     # 预先准备好 qwen_prefill 的参数 (拿到 ticket 之后不能再出错, 否则后面的 prefill 都会卡住); embd/embd_mask/pos3 同 eval_tokens, 调用方要保持它们存活
     # cache: cache_plan 的返回值, None 表示本请求不用前缀缓存; thinking: prompt 是否开了 thinking (见 generate)
+    # wasm: 自定义采样模块 (wasm_sampler.compile 的结果), None 表示用内置采样 (上面的采样参数); 有 wasm 时采样参数和 seed 都不起作用; wasm_data: 交给 sampler_init 的 custom_data (bytes), None 表示没有
     n = len(tokens)
     p_embd = embd.ctypes.data if embd is not None else None
     p_mask = embd_mask.ctypes.data if embd_mask is not None else None
@@ -214,7 +217,7 @@ def engine_args(tokens, embd=None, embd_mask=None, pos3=None, temperature=1.0, t
         pos, hs, ks, roles, tail, tail_role = cache
         m = max(1, len(pos))
         c = (len(pos), (ctypes.c_int * m)(*pos), hs, ks, (ctypes.c_int * m)(*roles), tail, len(tail), tail_role)
-    return ((ctypes.c_int * n)(*tokens), n, p_embd, p_mask, p_pos, temperature, top_k, top_p, min_p, presence_penalty, seed & 0xffffffffffffffff, max_new, (ctypes.c_int * len(stop_ids))(*stop_ids), len(stop_ids)) + c + (int(thinking),)
+    return ((ctypes.c_int * n)(*tokens), n, p_embd, p_mask, p_pos, temperature, top_k, top_p, min_p, presence_penalty, seed & 0xffffffffffffffff, max_new, (ctypes.c_int * len(stop_ids))(*stop_ids), len(stop_ids)) + c + (int(thinking), wasm, len(wasm) if wasm else 0, wasm_data, len(wasm_data) if wasm_data else 0)
 
 
 def engine_prefill(slot, ticket, args): # 阻塞: 在 C++ 里按 ticket 顺序等前面的 prefill, 算完并采样出第一个 token 后返回
@@ -232,6 +235,11 @@ def engine_cache_stats(slot): # 请求结束 (engine_next 读到空 list) 之后
     out = (ctypes.c_int * 4)()
     G_lib.qwen_cache_stats(slot, out)
     return tuple(out)
+
+
+def engine_error(slot): # 请求结束 (engine_next 读到空 list) 之后、槽复用之前: 自定义采样出错的原因, 没出错为 None
+    e = G_lib.qwen_slot_error(slot)
+    return e.decode("utf-8", "replace") if e else None
 
 
 def engine_cancel(slot): # 让 decode 循环停止该槽, 之后仍要 engine_next 读到空 list

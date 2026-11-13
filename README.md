@@ -53,6 +53,22 @@ pip install -r requirements_cuda.txt --extra-index-url https://download.pytorch.
 
 `+cpu` / `+cu132` 版本只在 PyTorch 自己的源上有, 所以需要 `--extra-index-url`。其余主要版本: python 3.13, transformers 5.22.2, tokenizers 0.23.3, safetensors 0.8.0, numpy 2.5.4, pillow 13.0.0。
 
+**4. 自定义采样 (可选, 只有 cuda)**: 不用这个功能可以跳过, 其余功能不受影响。需要两样东西:
+
+- WAMR 源码: 仓库里的 `resources/WAMR-2.4.5.tar.gz` (编译 CUDA 版时用)
+- 编译镜像: [sampler_rootfs.tar.7z](https://github.com/jtc1246/qwen3.8_27b_reference/releases/download/wasm/sampler_rootfs.tar.7z) (运行服务时用, 解压后是 `sampler_rootfs.tar`)
+
+```bash
+# 在仓库根目录执行
+mkdir -p ~/opt
+tar -xzf resources/WAMR-2.4.5.tar.gz -C ~/opt
+echo 'export WAMR_DIR=$HOME/opt/wasm-micro-runtime-WAMR-2.4.5' >> ~/.bashrc
+wget https://github.com/jtc1246/qwen3.8_27b_reference/releases/download/wasm/sampler_rootfs.tar.7z
+7z x sampler_rootfs.tar.7z
+```
+
+运行服务的机器需要有 `tar`、`chroot`、`unshare` 命令, 并且有权限使用 `chroot` 和 `unshare --net`。
+
 ## 编译
 
 ```bash
@@ -65,6 +81,7 @@ CUDA 版本 (需要 NVIDIA 驱动, 编译时还需要 nvcc, 版本不能高于�
 
 ```bash
 conda install -n local_llm --override-channels -c conda-forge cuda-nvcc=13.2.86
+export WAMR_DIR=/path/to/wasm-micro-runtime-WAMR-2.4.5 # 可选 (环境准备第 4 步), 不设置则编译出的 so 不支持自定义采样
 ./qwen_cuda/compile.sh
 ```
 
@@ -84,7 +101,31 @@ python -u server.py --type cuda --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --hf-dir
 python -u tests/test_server.py --base http://127.0.0.1:8000/v1
 ```
 
-`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数) 或 `cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。`--ctx` 默认 cpu 32768, cuda 262144 (cuda 是每个槽的上下文, 启动时分配 4 个槽的 KV, 约 52GB 显存)。`--cache-dir <目录>` 启用磁盘前缀缓存 (cpu 和 cuda 都支持, 直接使用该目录, 见 docs/cpu_impl.md 9.1 节和 docs/cuda_impl.md 4.2 节); 通过 router 启动时由 router 统一传入。
+`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数) 或 `cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。`--ctx` 默认 cpu 32768, cuda 262144 (cuda 是每个槽的上下文, 启动时分配 4 个槽的 KV, 约 52GB 显存)。`--cache-dir <目录>` 启用磁盘前缀缓存 (cpu 和 cuda 都支持, 直接使用该目录, 见 docs/cpu_impl.md 9.1 节和 docs/cuda_impl.md 4.2 节); 通过 router 启动时由 router 统一传入。`--sampler-rootfs` 见下面的自定义采样。
+
+### 自定义采样 (只有 cuda)
+
+启动时加 `--sampler-rootfs /path/to/sampler_rootfs.tar` (镜像见环境准备第 4 步), 同时需要 `--cache-dir` (编译结果缓存在 `<cache-dir>/wasm`, 通过 router 启动时就是 `<根目录>/cuda/wasm`; `--sampler-rootfs` 同样直接传给 router)。`--wasm-tmp-dir` 是编译用的临时目录 (默认 `/dev/shm`, 每次编译约占 360MB, 用完删除)。没有配置或 so 编译时没有 WAMR 时, 只有带 `sampler_cpp` 的请求报错, 其余请求不受影响。
+
+请求里加 `"sampler_cpp": "<C++ 源码>"`, 可选 `"sampler_data": "<base64>"`, 用这段代码代替内置采样 (temperature、seed 等采样参数不再起作用)。代码里实现两个函数:
+
+```cpp
+void sampler_init(bool is_thinking_mode, void* custom_data, uint64_t custom_data_len); // 每个请求开始时调用一次
+int sample(void* data); // 每生成一个 token 调用一次, data 是本步 248320 个 logits (fp16, 小端), 返回本步的 token id
+```
+
+- 每个请求单独一个实例, 全局变量在请求内一直保持 (生成状态、已输出的 token、随机数等由代码自己维护), 不跨请求
+- `custom_data` 是 `sampler_data` 解码后的二进制, 不传时是 nullptr / 0
+- 何时结束由代码决定: 返回 im_end (248046) 结束生成, thinking 模式下返回思考结束 token (248069) 结束思考; 没有长度限制, 一直不结束就生成到上下文用完
+- 返回值只能是普通文本 `[0, 248044)`、im_end, 以及 thinking 模式下思考结束之前的思考结束 token, 其余 (包括 endoftext、非 thinking 模式或思考结束后再返回思考结束 token) 都会报错
+- 常量 (`QS_VOCAB`、`QS_IM_END`、`QS_THINK_END` 等) 和辅助函数 (`qs_allowed`、`qs_half_to_float`) 已自动包含 ([wasm_sampler/prelude.h](wasm_sampler/prelude.h)), 可以 include 标准 C / C++ 头文件, 但不能调用 printf、time 等需要系统接口的函数; 示例见 [wasm_sampler/examples/top_k.cpp](wasm_sampler/examples/top_k.cpp) (`sampler_data` 前 8 字节是随机种子)
+- 限制: 源码和 `sampler_data` (解码后) 各最多 1MB, 编译最多 60s, 内存最多 1GB, 每次 `sample` / `sampler_init` 最多约 20 亿条指令 (约 2s)
+- 出错 (编译失败、函数缺失或签名不对、运行时越界 / 死循环 / trap、返回值不合法) 时非流式返回 400 和错误信息, 流式在已发出的 token 之后发一个 `error` 事件
+- 相同源码只编译一次 (缓存在 `<cache-dir>/wasm`, 不会自动删除)
+
+```bash
+python -u tests/test_wasm_sampler.py --base http://127.0.0.1:8000/v1 --hf-dir /path/to/Qwen3.8-27B
+```
 
 ### 多后端路由
 
@@ -137,3 +178,5 @@ python 代码在仓库根目录, 与具体后端无关; 各后端 (`qwen_cpu/`�
 - `tests/bench.py`: 不同上下文长度的 prefill / decode 速度 (`--type`, 默认 cuda)
 - `tests/test_server.py`: 服务端到端测试 (system、思考开关、流式、图片、图片缓存、多图、seed、并发); `--model` 指定请求里的模型名 (经路由测试时用)
 - `tests/test_router.py`: 路由测试 (模型列表、按模型名转发、大小写、不匹配 / 匹配多个时报错)
+- `wasm_sampler.py`: 自定义采样代码的编译和缓存
+- `tests/test_wasm_sampler.py`: 自定义采样测试 (`--long` 另测生成到上下文用完), 需要配置了自定义采样的 cuda 服务

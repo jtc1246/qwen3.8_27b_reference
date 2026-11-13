@@ -16,6 +16,7 @@
 #include "gguf.h"
 #include "quants_ref.h"
 #include "cache.h"
+#include "wasm_sampler.h"
 
 using std::string;
 using std::vector;
@@ -100,7 +101,7 @@ struct Slot {
     int n_past = 0, next_pos = 0; // 同一时刻只有 prefill 线程或 decode 线程在用
     std::atomic<int> state{0}; // 1: decode 中, 由 decode 循环推进
     std::atomic<int> cancel{0};
-    std::atomic<int> n_out{0}, done{0}; // 已生成 token 数; done: 0 进行中, 1 遇到停止 token, 2 达到长度上限, 3 取消
+    std::atomic<int> n_out{0}, done{0}; // 已生成 token 数; done: 0 进行中, 1 遇到停止 token, 2 达到长度上限, 3 取消, 4 自定义采样出错
     std::atomic<uint32_t> ver{0}; // 产生 token 或结束时 +1, qwen_next 在上面等
     int rd = 0; // qwen_next 已读到的位置
     int* out = nullptr; // 生成的 token [max_ctx], 也是 presence penalty 的历史
@@ -115,6 +116,8 @@ struct Slot {
     int c_final = 0; // 1: 已采样到 <|im_end|>, decode 循环再算一步把它写进 KV/状态, 然后生成输出缓存点
     int think = 0; // 1: 开了 thinking 且还没采样到思考结束 token (此时才允许采样它)
     Cache::Plan* cp = nullptr; // qwen_cache_init 之后才有
+    int wasm = 0, wasm_loaded = 0, think_req = 0; // 本请求用自定义采样 (wasm) / 槽的 wasm 实例还在 (下个请求不用时卸载) / 本请求开了 thinking
+    char err[512] = {}; // 本请求出错 (done 为 4) 的原因, 非空表示出错
 };
 Slot G_slots[NSEQ]; // 直接模式 (qwen_eval / qwen_sample / qwen_reset) 用槽 0
 std::atomic<uint32_t> G_pf_turn{0}; // 当前可以 prefill 的 ticket
@@ -986,6 +989,33 @@ int sample_impl(const float* logits, Slot& S, float temperature, int top_k, floa
     return idx[keep - 1];
 }
 
+int wasm_check(int sq, bool ok, int tok) { // 自定义采样的结果: 出错或返回值不合法时返回 -1, 原因写在 S.err
+    // 返回值只能是普通文本、im_end, 或 thinking 模式下思考结束之前的思考结束 token (与内置采样相同, endoftext 也不允许); 结束完全由用户决定 (没有长度限制, 直到上下文用完)
+    Slot& S = G_slots[sq];
+    if (!ok) {
+        snprintf(S.err, sizeof(S.err), "%s", WasmSampler::error(sq));
+        return -1;
+    }
+    if (tok == THINK_END && !S.think) {
+        snprintf(S.err, sizeof(S.err), "sample 返回了思考结束 token %d, 但本次%s", tok, S.think_req ? "思考已经结束" : "不是 thinking 模式");
+        return -1;
+    }
+    if (tok < 0 || !(tok < N_TEXT || tok == IM_END || tok == THINK_END)) {
+        snprintf(S.err, sizeof(S.err), "sample 返回了不允许的 token %d (只能是普通文本 [0, %d)、im_end %d, 或思考中的 %d)", tok, N_TEXT, IM_END, THINK_END);
+        return -1;
+    }
+    return tok;
+}
+
+int sample_slot(int sq, const float* logits, const int* hist, int n_hist) { // 引擎模式: 本请求有自定义采样时调 wasm (在该槽的 worker 线程里), 否则 sample_impl; 失败返回 -1, 原因写在 S.err
+    Slot& S = G_slots[sq];
+    if (!S.wasm) return sample_impl(logits, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, hist, n_hist, S.rng, S.think);
+    WasmSampler::sample_post(sq, logits);
+    int tok = -1;
+    bool ok = WasmSampler::sample_wait(sq, tok);
+    return wasm_check(sq, ok, tok);
+}
+
 } // namespace
 
 extern "C" {
@@ -1012,7 +1042,8 @@ float* qwen_hidden() { // [65][5120], 0 是 embedding, i 是第 i 层输出, 都
 }
 
 int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd, const uint8_t* embd_mask, const int* pos3, float temperature, int top_k, float top_p, float min_p, float presence_penalty, uint64_t seed, int max_new, const int* stop, int n_stop,
-                 int n_pts, const int* pts_pos, const uint8_t* pts_hash, const uint8_t* pts_key, const int* pts_role, const uint8_t* tail, int n_tail, int tail_role, int thinking) {
+                 int n_pts, const int* pts_pos, const uint8_t* pts_hash, const uint8_t* pts_key, const int* pts_role, const uint8_t* tail, int n_tail, int tail_role, int thinking, const uint8_t* wasm, int n_wasm, const uint8_t* cdata, uint64_t n_cdata) {
+    // wasm: 自定义采样模块 (n_wasm 字节, 0 表示用内置采样, 此时采样参数和 seed 不起作用), cdata: 交给 sampler_init 的 custom_data; 加载或采样失败时本请求以 done 4 结束, 原因见 qwen_slot_error
     // thinking: 本次开了 thinking (生成从思考中开始), 采样到思考结束 token 之前允许采样它, 之后不允许
     // 引擎模式: 按 ticket 顺序 (FIFO, 从 0 开始连续) 等前面的输入算完, 在调用线程上 prefill 槽 sq, 采样出第一个 token 后交给 decode 循环; 0 成功
     // 失败也会让出 prefill (ticket 不能跳过); 成功后用 qwen_next 取 token
@@ -1028,6 +1059,23 @@ int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd
         ret = -3;
     } else {
         Slot& S = G_slots[sq];
+        S.err[0] = 0;
+        S.wasm = n_wasm > 0;
+        if (S.wasm_loaded && !S.wasm) WasmSampler::unload(sq);
+        S.wasm_loaded = S.wasm;
+        S.think_req = thinking;
+        if (S.wasm && !WasmSampler::load(sq, wasm, n_wasm, cdata, n_cdata, thinking)) { // 新实例 + sampler_init; 失败则不 prefill, 直接以 done 4 结束 (没有 token)
+            snprintf(S.err, sizeof(S.err), "%s", WasmSampler::error(sq));
+            fprintf(stderr, "❌ 槽 %d 自定义采样模块加载失败: %s\n", sq, S.err);
+            S.wasm = S.wasm_loaded = 0;
+            S.rd = 0;
+            S.n_out.store(0);
+            S.cancel.store(0);
+            S.done.store(4);
+            S.ver.fetch_add(1);
+            fwake(S.ver);
+            goto pf_end;
+        }
         Cache::Plan* P = S.cp;
         if (P) {
             P->n_pts = Cache::G_on ? n_pts : -1;
@@ -1069,11 +1117,11 @@ int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd
             P->out_off = 0, P->n_segs = 0, P->out_id = Cache::G_out_seq.fetch_add(1);
         }
         S.think = thinking;
-        int tok = sample_impl(G_logits, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, nullptr, 0, S.rng, S.think);
+        int tok = sample_slot(sq, G_logits, nullptr, 0);
         S.think = S.think && tok != THINK_END;
-        S.out[0] = tok;
-        S.n_out.store(1);
-        int fin = 0;
+        if (tok >= 0) S.out[0] = tok;
+        S.n_out.store(tok >= 0);
+        int fin = tok < 0 ? 4 : 0; // 4: 自定义采样出错
         for (int i = 0; i < n_stop; i++) fin |= tok == stop[i];
         if (!fin && (max_new <= 1 || S.n_past >= G_max_ctx)) fin = 2;
         S.c_final = fin == 1 && tok == IM_END && P && P->out_on && S.n_past < G_max_ctx; // 第一个 token 就是 <|im_end|>: 交给 decode 循环算完它再结束
@@ -1093,6 +1141,7 @@ int qwen_prefill(int sq, int ticket, const int* tokens, int n, const float* embd
         int hit = P && P->n_pts >= 0 && P->hit >= 0 ? P->pos[P->hit] : 0;
         fprintf(stderr, "ℹ️ 槽 %d prefill %d tokens (缓存命中 %d, 计算 %d), %.2fs, %.1f tok/s (开始时%s)\n", sq, n, hit, n - hit, sec, (n - hit) / sec, part ? "有 decode 在跑, 用 prefill 分区" : "整卡");
     }
+pf_end:
     G_pf_turn.fetch_add(1);
     fwake(G_pf_turn);
     return ret;
@@ -1113,6 +1162,8 @@ int qwen_next(int sq, int* buf, int cap) { // 引擎模式: 等槽 sq 的新 tok
         fwait(S.ver, v);
     }
 }
+
+const char* qwen_slot_error(int sq) { return G_slots[sq].err; } // 引擎模式, 请求结束 (qwen_next 返回 0) 之后: 非空表示出错 (自定义采样), 内容是原因
 
 void qwen_cancel(int sq) { G_slots[sq].cancel.store(1); } // 引擎模式: 让 decode 循环结束槽 sq, 之后仍要用 qwen_next 读到 0 才能复用该槽
 
@@ -1147,6 +1198,24 @@ void qwen_decode_loop() { // 引擎模式: decode 循环, 由一个 python 线�
             continue;
         }
         decode_step(slots, toks, B);
+        int samp[NSEQ]; // 有自定义采样时: 先提交各槽的 wasm 采样 (各自的 worker 线程并行), 内置采样的槽在本线程算, 最后收齐; 没有时走原来的逐槽采样
+        bool par = false;
+        for (int b = 0; b < B; b++) par |= G_slots[slots[b]].wasm && !G_slots[slots[b]].c_final;
+        if (par) {
+            for (int b = 0; b < B; b++)
+                if (G_slots[slots[b]].wasm && !G_slots[slots[b]].c_final) WasmSampler::sample_post(slots[b], G_dlogits + (size_t)b * VOCAB);
+            for (int b = 0; b < B; b++) {
+                Slot& S = G_slots[slots[b]];
+                if (S.c_final) continue;
+                if (!S.wasm) {
+                    samp[b] = sample_slot(slots[b], G_dlogits + (size_t)b * VOCAB, S.out, S.n_out.load());
+                    continue;
+                }
+                int tok = -1;
+                bool ok = WasmSampler::sample_wait(slots[b], tok);
+                samp[b] = wasm_check(slots[b], ok, tok);
+            }
+        }
         for (int b = 0; b < B; b++) {
             Slot& S = G_slots[slots[b]];
             if (S.c_final) { // 刚把 <|im_end|> 算进 KV/状态
@@ -1156,7 +1225,11 @@ void qwen_decode_loop() { // 引擎模式: decode 循环, 由一个 python 线�
                 continue;
             }
             int n = S.n_out.load();
-            int tok = sample_impl(G_dlogits + (size_t)b * VOCAB, S, S.temp, S.top_k, S.top_p, S.min_p, S.pp, S.out, n, S.rng, S.think);
+            int tok = par ? samp[b] : sample_slot(slots[b], G_dlogits + (size_t)b * VOCAB, S.out, n);
+            if (tok < 0) {
+                finish(S, 4);
+                continue;
+            }
             S.think = S.think && tok != THINK_END;
             S.out[n] = tok;
             S.n_out.store(n + 1);
