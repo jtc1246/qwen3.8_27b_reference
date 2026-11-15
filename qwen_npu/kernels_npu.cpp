@@ -1,5 +1,5 @@
 // Qwen3.8-27B 的全部 Ascend C kernel (310P)
-// matmul 走 cube: 权重为 repack.h 的 fractal 量化布局 (I8F/I8BF/I4F), 向量单元反量化到 fp16, mmad fp16 累加 fp32
+// matmul 走 cube: 权重为 repack.h 的 fractal 量化布局 (I8F/I4SF 等), 向量单元反量化到 fp16, mmad fp16 累加 fp32
 // k_gemm 统一 decode (m=1, x 为 f32 向量) 和 prefill (m<=256, x 由 k_pack_x 转 fp16 zZ 布局)
 // 其余 kernel (attention/DeltaNet/conv/norm 等) 全 fp32 向量计算; 激活/缓存均为 GM 上的 fp32
 #include "kernel_operator.h"
@@ -16,9 +16,11 @@ constexpr int N_HEAD = 24, N_KV = 4, HD = 256;
 constexpr int LK = 16, LV = 48, LHD = 128;
 constexpr int KEY_DIM = LK * LHD, V_DIM = LV * LHD, QKV_DIM = 2 * KEY_DIM + V_DIM;
 constexpr int Q_DIM = N_HEAD * HD * 2, KV_DIM = N_KV * HD;
+constexpr int QKVZ = QKV_DIM + V_DIM; // DeltaNet 的 qkv+z 合并矩阵每 token 输出宽度
+constexpr int QKVC = Q_DIM + 2 * KV_DIM; // 全注意力 q+k+v 合并矩阵每 token 输出宽度
 constexpr float EPS = 1e-6f;
 constexpr uint64_t FULL = 0xffffffffffffffffULL;
-enum { FMT_F32 = 0, FMT_I8 = 1, FMT_I8B = 2, FMT_I4 = 3, FMT_I8F = 4, FMT_I8BF = 5, FMT_I4F = 6 };
+enum { FMT_F32 = 0, FMT_I8 = 1, FMT_I8B = 2, FMT_I4 = 3, FMT_I8F = 4, FMT_I8BF = 5, FMT_I4F = 6, FMT_I4SF = 7 };
 
 __aicore__ inline int pad64i(int x) { return (x + 63) / 64 * 64; }
 
@@ -46,8 +48,8 @@ template <int FMT> __aicore__ inline void gemm_body(GM_ADDR w, GM_ADDR x, GM_ADD
     LocalTensor<float> l0c = l0c_buf.Get<float>();
     int cores = (int)AscendC::GetBlockNum(), core = (int)AscendC::GetBlockIdx();
     int nr = n / cores, KS = k / 128, M1 = (m + 15) / 16;
-    constexpr int QB = FMT == FMT_I4F ? 1024 : 2048; // 每 ni(16行) 每切片量化字节
-    constexpr int SB = FMT == FMT_I8F ? 2304 : (FMT == FMT_I8BF ? 2560 : 1536); // 每 ni 每切片总字节
+    constexpr int QB = (FMT == FMT_I4F || FMT == FMT_I4SF) ? 1024 : 2048; // 每 ni(16行) 每切片量化字节
+    constexpr int SB = FMT == FMT_I8F ? 2304 : (FMT == FMT_I8BF ? 2560 : (FMT == FMT_I4SF ? 1280 : 1536)); // 每 ni 每切片总字节
     uint64_t core_off = (uint64_t)core * (nr / 16) * KS * SB;
     GlobalTensor<uint8_t> gw;
     gw.SetGlobalBuffer((__gm__ uint8_t*)w + core_off, (uint64_t)(nr / 16) * KS * SB);
@@ -60,14 +62,20 @@ template <int FMT> __aicore__ inline void gemm_body(GM_ADDR w, GM_ADDR x, GM_ADD
     LocalTensor<uint8_t> qbuf0 = ub, qbuf1 = ub[40960]; // 切片双缓冲 (I8BF 最大 40960)
     LocalTensor<half> wh0 = ub[81920].ReinterpretCast<half>(), wh1 = ub[81920 + 32768].ReinterpretCast<half>();
     LocalTensor<float> co0 = ub[147456].ReinterpretCast<float>(), co1 = ub[147456 + 16384].ReinterpretCast<float>();
-    LocalTensor<half> th = ub[180224].ReinterpretCast<half>(); // I4F 解码临时
+    LocalTensor<half> th = ub[180224].ReinterpretCast<half>(); // nibble 解码临时
     LocalTensor<half> tm = ub[196608].ReinterpretCast<half>();
     LocalTensor<int16_t> ti = ub[212992].ReinterpretCast<int16_t>();
+    LocalTensor<uint16_t> mk = ub[229376].ReinterpretCast<uint16_t>(); // I4SF And 掩码 [16]0x0F0F | [16]0xF0F0
     AscendC::SetVectorMask<half>(FULL, FULL);
     AscendC::UnaryRepeatParams cp8(1, 1, 8, 4);
     AscendC::UnaryRepeatParams cpa(1, 1, 8, 8);
     AscendC::BinaryRepeatParams bph(1, 1, 1, 8, 8, 8);
     AscendC::BinaryRepeatParams bsc(1, 1, 0, 16, 16, 1); // scale 乘: 每 fractal 两个 repeat 分两次调用, src1 块内复用
+    AscendC::BinaryRepeatParams bmk(1, 1, 0, 8, 8, 0); // And: src1 单块复用且不前进
+    if (FMT == FMT_I4SF) {
+        AscendC::Duplicate(mk, (uint16_t)0x0F0F, 16);
+        AscendC::Duplicate(mk[16], (uint16_t)0xF0F0, 16);
+    }
     if (m == 1) { // x: f32 -> fp16 -> L1 (每 128-k 切片 512B 对齐) -> L0A 常驻
         LocalTensor<float> xf = ub.ReinterpretCast<float>(); // 借 qbuf 区
         LocalTensor<half> xh = ub[81920].ReinterpretCast<half>(); // 借 wh 区
@@ -134,9 +142,17 @@ template <int FMT> __aicore__ inline void gemm_body(GM_ADDR w, GM_ADDR x, GM_ADD
                 LocalTensor<half> wh = h ? wh1 : wh0;
                 int hb = h * qnb / 2, hf = h * nfrac / 2; // 半片字节偏移 / 起始 fractal
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ewf[h]);
-                if (FMT != FMT_I4F) {
+                if (FMT != FMT_I4F && FMT != FMT_I4SF) {
                     AscendC::Cast<half, int8_t, false>(wh, qbuf[hb].ReinterpretCast<int8_t>(), RoundMode::CAST_NONE, FULL, (uint8_t)(NI * 8), cp8);
-                } else { // nibble 半片: 字节 i = lo(半片前 2ki 的元素 i) | hi(后 2ki)<<4
+                } else if (FMT == FMT_I4SF) { // And 平面解码: 字节 = lo | hi<<4 (nibble 为 q+8); hi 平面天然带 x16, scale 已在 repack 时预除
+                    int nby = NI * 512;
+                    AscendC::And<uint16_t, false>(th.ReinterpretCast<uint16_t>(), qbuf[hb].ReinterpretCast<uint16_t>(), mk, FULL, (uint8_t)(nby / 256), bmk);
+                    AscendC::And<uint16_t, false>(tm.ReinterpretCast<uint16_t>(), qbuf[hb].ReinterpretCast<uint16_t>(), mk[16], FULL, (uint8_t)(nby / 256), bmk);
+                    AscendC::Cast<half, uint8_t, false>(wh, th.ReinterpretCast<uint8_t>(), RoundMode::CAST_NONE, FULL, (uint8_t)(nby / 128), cp8); // lo = q+8
+                    AscendC::Cast<half, uint8_t, false>(wh[nby], tm.ReinterpretCast<uint8_t>(), RoundMode::CAST_NONE, FULL, (uint8_t)(nby / 128), cp8); // 16*(q+8)
+                    AscendC::Adds<half, false>(wh, wh, (half)-8.0f, FULL, (uint8_t)(nby / 128), cpa);
+                    AscendC::Adds<half, false>(wh[nby], wh[nby], (half)-128.0f, FULL, (uint8_t)(nby / 128), cpa); // 16q
+                } else { // I4F (GGUF 时代): nibble 乘法链
                     int nby = NI * 512;
                     AscendC::Cast<half, uint8_t, false>(th, qbuf[hb], RoundMode::CAST_NONE, FULL, (uint8_t)(nby / 128), cp8);
                     AscendC::Muls<half, false>(tm, th, (half)0.0625f, FULL, (uint8_t)(nby / 128), cpa);
@@ -149,7 +165,7 @@ template <int FMT> __aicore__ inline void gemm_body(GM_ADDR w, GM_ADDR x, GM_ADD
                 LocalTensor<half> sc = qbuf[qnb].ReinterpretCast<half>(); // scale 块区 (每 fractal 16 half)
                 AscendC::Mul<half, false>(wh, wh, sc[hf * 16], FULL, (uint8_t)(nfrac / 2), bsc);
                 AscendC::Mul<half, false>(wh[128], wh[128], sc[hf * 16], FULL, (uint8_t)(nfrac / 2), bsc);
-                if (FMT != FMT_I8F) { // bias 块区
+                if (FMT != FMT_I8F && FMT != FMT_I4SF) { // bias 块区
                     LocalTensor<half> bi = qbuf[qnb + nfrac * 32].ReinterpretCast<half>();
                     AscendC::Add<half, false>(wh, wh, bi[hf * 16], FULL, (uint8_t)(nfrac / 2), bsc);
                     AscendC::Add<half, false>(wh[128], wh[128], bi[hf * 16], FULL, (uint8_t)(nfrac / 2), bsc);
@@ -321,6 +337,7 @@ template <int FMT> __aicore__ inline void dq_body(GM_ADDR w, GM_ADDR rows, GM_AD
 extern "C" __global__ __aicore__ void k_gemm_i8(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I8F>(w, x, xp, y, m, n, k); }
 extern "C" __global__ __aicore__ void k_gemm_i8b(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I8BF>(w, x, xp, y, m, n, k); }
 extern "C" __global__ __aicore__ void k_gemm_i4(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I4F>(w, x, xp, y, m, n, k); }
+extern "C" __global__ __aicore__ void k_gemm_i4s(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I4SF>(w, x, xp, y, m, n, k); }
 extern "C" __global__ __aicore__ void k_dq_f32(GM_ADDR w, GM_ADDR rows, GM_ADDR out, int32_t nr, int32_t k, int32_t stride) { dq_body<FMT_F32>(w, rows, out, nr, k, stride); }
 extern "C" __global__ __aicore__ void k_dq_i8(GM_ADDR w, GM_ADDR rows, GM_ADDR out, int32_t nr, int32_t k, int32_t stride) { dq_body<FMT_I8>(w, rows, out, nr, k, stride); }
 extern "C" __global__ __aicore__ void k_dq_i8b(GM_ADDR w, GM_ADDR rows, GM_ADDR out, int32_t nr, int32_t k, int32_t stride) { dq_body<FMT_I8B>(w, rows, out, nr, k, stride); }
@@ -407,7 +424,8 @@ extern "C" __global__ __aicore__ void k_silu_mul(GM_ADDR g, GM_ADDR u, int32_t t
     }
 }
 
-// 因果 depthwise conv1d (核宽 4) + SiLU; state GM 布局 [3][QKV_DIM], cw GM 布局 [4][QKV_DIM] (host 已重排)
+// 因果 depthwise conv1d (核宽 4) + SiLU; qkv 为合并输出 [T][QKVZ], 只处理前 QKV_DIM 通道 (z 段不卷积)
+// state GM 布局 [3][QKV_DIM], cw GM 布局 [4][QKV_DIM] (host 已重排)
 extern "C" __global__ __aicore__ void k_conv(GM_ADDR qkv, GM_ADDR state, GM_ADDR cw, int32_t T)
 {
     AscendC::TPipe pipe;
@@ -421,7 +439,7 @@ extern "C" __global__ __aicore__ void k_conv(GM_ADDR qkv, GM_ADDR state, GM_ADDR
     LocalTensor<float> o = ub[C * 32].ReinterpretCast<float>();
     LocalTensor<float> tt = ub[C * 36].ReinterpretCast<float>();
     GlobalTensor<float> gq, gs, gw;
-    gq.SetGlobalBuffer((__gm__ float*)qkv, (uint64_t)T * QKV_DIM);
+    gq.SetGlobalBuffer((__gm__ float*)qkv, (uint64_t)T * QKVZ);
     gs.SetGlobalBuffer((__gm__ float*)state, 3 * QKV_DIM);
     gw.SetGlobalBuffer((__gm__ float*)cw, 4 * QKV_DIM);
     for (int j = 0; j < 4; j++) AscendC::DataCopy(w4[j * C], gw[j * QKV_DIM + c0], C);
@@ -431,7 +449,7 @@ extern "C" __global__ __aicore__ void k_conv(GM_ADDR qkv, GM_ADDR state, GM_ADDR
     AscendC::DataCopy(s2, gs[2 * QKV_DIM + c0], C);
     AscendC::PipeBarrier<PIPE_ALL>();
     for (int t = 0; t < T; t++) {
-        AscendC::DataCopy(xn, gq[(uint64_t)t * QKV_DIM + c0], C);
+        AscendC::DataCopy(xn, gq[(uint64_t)t * QKVZ + c0], C);
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::Mul(o, w4, s0, C);
         AscendC::MulAddDst(o, w4[C], s1, C);
@@ -442,7 +460,7 @@ extern "C" __global__ __aicore__ void k_conv(GM_ADDR qkv, GM_ADDR state, GM_ADDR
         AscendC::Adds(tt, tt, 1.0f, C);
         AscendC::Div(o, o, tt, C);
         AscendC::PipeBarrier<PIPE_ALL>();
-        AscendC::DataCopy(gq[(uint64_t)t * QKV_DIM + c0], o, C);
+        AscendC::DataCopy(gq[(uint64_t)t * QKVZ + c0], o, C);
         AscendC::PipeBarrier<PIPE_ALL>();
         LocalTensor<float> old = s0;
         s0 = s1;
@@ -457,8 +475,8 @@ extern "C" __global__ __aicore__ void k_conv(GM_ADDR qkv, GM_ADDR state, GM_ADDR
 }
 
 // Gated DeltaNet 递推: 每核 6 个 v 头, 每头状态 S[128][128] 常驻 UB, 对 T 个 token 顺序递推
-// state GM: [48][128][128]; qkv: conv 后的 [T][QKV_DIM]; z: [T][V_DIM]; a/b: [T][48]; out: [T][V_DIM]
-extern "C" __global__ __aicore__ void k_deltanet(GM_ADDR qkv, GM_ADDR z, GM_ADDR a, GM_ADDR b, GM_ADDR ssm_a, GM_ADDR dt_bias, GM_ADDR ssm_norm, GM_ADDR state, GM_ADDR out, int32_t T)
+// state GM: [48][128][128]; qkvz: conv 后的合并输出 [T][QKVZ] (前 QKV_DIM 为 qkv, 后 V_DIM 为 z); ab: [T][96] (前 48 a, 后 48 b); out: [T][V_DIM]
+extern "C" __global__ __aicore__ void k_deltanet(GM_ADDR qkvz, GM_ADDR ab, GM_ADDR ssm_a, GM_ADDR dt_bias, GM_ADDR ssm_norm, GM_ADDR state, GM_ADDR out, int32_t T)
 {
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> tb;
@@ -484,11 +502,9 @@ extern "C" __global__ __aicore__ void k_deltanet(GM_ADDR qkv, GM_ADDR z, GM_ADDR
     LocalTensor<float> db = ub[o2 + 9728].ReinterpretCast<float>(); // dt_bias [48]
     LocalTensor<float> sp = ub[o2 + 9984].ReinterpretCast<float>(); // softplus / decay 行 [48]
     LocalTensor<float> sp2 = ub[o2 + 10240].ReinterpretCast<float>();
-    GlobalTensor<float> gq, gz, ga, gb, gsa, gdb, gsn, gst, go;
-    gq.SetGlobalBuffer((__gm__ float*)qkv, (uint64_t)T * QKV_DIM);
-    gz.SetGlobalBuffer((__gm__ float*)z, (uint64_t)T * V_DIM);
-    ga.SetGlobalBuffer((__gm__ float*)a, (uint64_t)T * LV);
-    gb.SetGlobalBuffer((__gm__ float*)b, (uint64_t)T * LV);
+    GlobalTensor<float> gq, gab, gsa, gdb, gsn, gst, go;
+    gq.SetGlobalBuffer((__gm__ float*)qkvz, (uint64_t)T * QKVZ);
+    gab.SetGlobalBuffer((__gm__ float*)ab, (uint64_t)T * 96 + 64);
     gsa.SetGlobalBuffer((__gm__ float*)ssm_a, LV);
     gdb.SetGlobalBuffer((__gm__ float*)dt_bias, LV);
     gsn.SetGlobalBuffer((__gm__ float*)ssm_norm, LHD);
@@ -509,12 +525,12 @@ extern "C" __global__ __aicore__ void k_deltanet(GM_ADDR qkv, GM_ADDR z, GM_ADDR
         AscendC::DataCopy(S, gst[(uint64_t)h * LHD * LHD], LHD * LHD);
         AscendC::PipeBarrier<PIPE_ALL>();
         for (int t = 0; t < T; t++) {
-            AscendC::DataCopy(qr, gq[(uint64_t)t * QKV_DIM + kh * LHD], LHD);
-            AscendC::DataCopy(kr, gq[(uint64_t)t * QKV_DIM + KEY_DIM + kh * LHD], LHD);
-            AscendC::DataCopy(vr, gq[(uint64_t)t * QKV_DIM + 2 * KEY_DIM + h * LHD], LHD);
-            AscendC::DataCopy(zr, gz[(uint64_t)t * V_DIM + h * LHD], LHD);
-            AscendC::DataCopy(ar, ga[(uint64_t)t * LV], 64);
-            AscendC::DataCopy(br, gb[(uint64_t)t * LV], 64);
+            AscendC::DataCopy(qr, gq[(uint64_t)t * QKVZ + kh * LHD], LHD);
+            AscendC::DataCopy(kr, gq[(uint64_t)t * QKVZ + KEY_DIM + kh * LHD], LHD);
+            AscendC::DataCopy(vr, gq[(uint64_t)t * QKVZ + 2 * KEY_DIM + h * LHD], LHD);
+            AscendC::DataCopy(zr, gq[(uint64_t)t * QKVZ + QKV_DIM + h * LHD], LHD);
+            AscendC::DataCopy(ar, gab[(uint64_t)t * 96], 64);
+            AscendC::DataCopy(br, gab[(uint64_t)t * 96 + 48], 64);
             AscendC::PipeBarrier<PIPE_ALL>();
             // beta 行 = sigmoid(br); decay 行 = exp(ssm_a * softplus(ar + dt_bias))
             AscendC::Add(sp, ar, db, 48);
@@ -589,8 +605,8 @@ extern "C" __global__ __aicore__ void k_deltanet(GM_ADDR qkv, GM_ADDR z, GM_ADDR
 }
 
 // q/k 头 RMSNorm + 交错 MRoPE + 写 KV cache; cos/sin 行 [T][32] 由 host 按 pos3 预先算好
-// 单元 = (t, 头), 头 0..23 为 q, 24..27 为 k (k 同时把 v 写入 cache)
-extern "C" __global__ __aicore__ void k_qk_rope(GM_ADDR qg, GM_ADDR kx, GM_ADDR vx, GM_ADDR q_norm, GM_ADDR k_norm, GM_ADDR cosr, GM_ADDR sinr, GM_ADDR kc, GM_ADDR vc, int32_t n_past, int32_t T)
+// qkv 为合并输出 [T][QKVC] (q+gate | k | v); 单元 = (t, 头), 头 0..23 为 q, 24..27 为 k (k 同时把 v 写入 cache)
+extern "C" __global__ __aicore__ void k_qk_rope(GM_ADDR qkv, GM_ADDR q_norm, GM_ADDR k_norm, GM_ADDR cosr, GM_ADDR sinr, GM_ADDR kc, GM_ADDR vc, int32_t n_past, int32_t T)
 {
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> tb;
@@ -604,10 +620,8 @@ extern "C" __global__ __aicore__ void k_qk_rope(GM_ADDR qg, GM_ADDR kx, GM_ADDR 
     LocalTensor<float> cs = ub[5120].ReinterpretCast<float>(); // [32]+[32]
     LocalTensor<float> red = ub[5504].ReinterpretCast<float>(); // 5504 = 5120+384, 64 个
     LocalTensor<float> vr = ub[5760].ReinterpretCast<float>();
-    GlobalTensor<float> gqg, gkx, gvx, gqn, gkn, gcs, gsn, gkc, gvc;
-    gqg.SetGlobalBuffer((__gm__ float*)qg, (uint64_t)T * Q_DIM);
-    gkx.SetGlobalBuffer((__gm__ float*)kx, (uint64_t)T * KV_DIM);
-    gvx.SetGlobalBuffer((__gm__ float*)vx, (uint64_t)T * KV_DIM);
+    GlobalTensor<float> gqg, gqn, gkn, gcs, gsn, gkc, gvc;
+    gqg.SetGlobalBuffer((__gm__ float*)qkv, (uint64_t)T * QKVC);
     gqn.SetGlobalBuffer((__gm__ float*)q_norm, HD);
     gkn.SetGlobalBuffer((__gm__ float*)k_norm, HD);
     gcs.SetGlobalBuffer((__gm__ float*)cosr, (uint64_t)T * 32);
@@ -622,8 +636,8 @@ extern "C" __global__ __aicore__ void k_qk_rope(GM_ADDR qg, GM_ADDR kx, GM_ADDR 
     for (int uidx = core; uidx < units; uidx += cores) {
         int t = uidx / (N_HEAD + N_KV), u = uidx % (N_HEAD + N_KV);
         bool is_q = u < N_HEAD;
-        if (is_q) AscendC::DataCopy(pr, gqg[(uint64_t)t * Q_DIM + u * HD * 2], HD);
-        else AscendC::DataCopy(pr, gkx[(uint64_t)t * KV_DIM + (u - N_HEAD) * HD], HD);
+        if (is_q) AscendC::DataCopy(pr, gqg[(uint64_t)t * QKVC + u * HD * 2], HD);
+        else AscendC::DataCopy(pr, gqg[(uint64_t)t * QKVC + Q_DIM + (u - N_HEAD) * HD], HD);
         AscendC::DataCopy(cs, gcs[(uint64_t)t * 32], 32);
         AscendC::DataCopy(cs[32], gsn[(uint64_t)t * 32], 32);
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -646,13 +660,13 @@ extern "C" __global__ __aicore__ void k_qk_rope(GM_ADDR qg, GM_ADDR kx, GM_ADDR 
         AscendC::Add(yr[32], tp[32], tp[64], 32);
         AscendC::PipeBarrier<PIPE_ALL>();
         if (is_q) {
-            AscendC::DataCopy(gqg[(uint64_t)t * Q_DIM + u * HD * 2], yr, HD);
+            AscendC::DataCopy(gqg[(uint64_t)t * QKVC + u * HD * 2], yr, HD);
             AscendC::PipeBarrier<PIPE_ALL>();
             continue;
         }
         int kh = u - N_HEAD;
         uint64_t dst = (uint64_t)(n_past + t) * KV_DIM + kh * HD;
-        AscendC::DataCopy(vr, gvx[(uint64_t)t * KV_DIM + kh * HD], HD);
+        AscendC::DataCopy(vr, gqg[(uint64_t)t * QKVC + Q_DIM + KV_DIM + kh * HD], HD);
         AscendC::DataCopy(gkc[dst], yr, HD);
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::DataCopy(gvc[dst], vr, HD);
@@ -687,7 +701,7 @@ extern "C" __global__ __aicore__ void k_attn(GM_ADDR qg, GM_ADDR kc, GM_ADDR vc,
     LocalTensor<float> red = ub[o4 + 4096].ReinterpretCast<float>(); // [256]
     LocalTensor<float> wk = ub[o4 + 5120].ReinterpretCast<float>(); // ReduceMax 工作区 / 常量 1 [256]
     GlobalTensor<float> gqg, gkc, gvc, gat;
-    gqg.SetGlobalBuffer((__gm__ float*)qg, (uint64_t)T * Q_DIM);
+    gqg.SetGlobalBuffer((__gm__ float*)qg, (uint64_t)T * QKVC); // q+gate 来自合并输出 [T][QKVC]
     gkc.SetGlobalBuffer((__gm__ float*)kc, 1);
     gvc.SetGlobalBuffer((__gm__ float*)vc, 1);
     gat.SetGlobalBuffer((__gm__ float*)att, (uint64_t)T * N_HEAD * HD);
@@ -703,7 +717,7 @@ extern "C" __global__ __aicore__ void k_attn(GM_ADDR qg, GM_ADDR kc, GM_ADDR vc,
         int ti = uidx / N_HEAD, h = uidx % N_HEAD, kvh = h / (N_HEAD / N_KV);
         int tq0 = ti * QT, tqn = T - tq0 < QT ? T - tq0 : QT;
         AscendC::PipeBarrier<PIPE_ALL>();
-        AscendC::DataCopy(Qb, gqg[(uint64_t)tq0 * Q_DIM + h * HD * 2], AscendC::DataCopyParams((uint16_t)tqn, HD * 4 / 32, (Q_DIM - HD) * 4 / 32, 0));
+        AscendC::DataCopy(Qb, gqg[(uint64_t)tq0 * QKVC + h * HD * 2], AscendC::DataCopyParams((uint16_t)tqn, HD * 4 / 32, (QKVC - HD) * 4 / 32, 0));
         AscendC::Duplicate(Ob, 0.0f, QT * HD);
         AscendC::Duplicate(mb, -3e38f, QT * 8);
         AscendC::Duplicate(lb, 0.0f, QT * 8);
@@ -775,7 +789,7 @@ extern "C" __global__ __aicore__ void k_attn(GM_ADDR qg, GM_ADDR kc, GM_ADDR vc,
         AscendC::Div(mc, wk, mc, QT); // 1/l
         AscendC::Brcb(lnbr, mc, 2, AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_ALL>(); // 批循环结束, Kb 借放 gate 块
-        AscendC::DataCopy(Kb, gqg[(uint64_t)tq0 * Q_DIM + h * HD * 2 + HD], AscendC::DataCopyParams((uint16_t)tqn, HD * 4 / 32, (Q_DIM - HD) * 4 / 32, 0));
+        AscendC::DataCopy(Kb, gqg[(uint64_t)tq0 * QKVC + h * HD * 2 + HD], AscendC::DataCopyParams((uint16_t)tqn, HD * 4 / 32, (QKVC - HD) * 4 / 32, 0));
         AscendC::PipeBarrier<PIPE_ALL>();
         for (int tq = 0; tq < tqn; tq++) {
             LocalTensor<float> ob = Ob[tq * HD];

@@ -1,6 +1,9 @@
-// Qwen3.8-27B (qwen35 架构) NPU (Ascend 310P) 推理, 输入 GGUF (Q4_K_M), 通过 extern "C" 给 python ctypes 调用
+// Qwen3.8-27B NPU (Ascend 310P) 推理, 输入 RedHatAI/Qwen3.8-27B-INT4 的 model.safetensors
+// (compressed-tensors int4 对称 group128, AWQ 平滑 + GPTQ), 通过 extern "C" 给 python ctypes 调用
 // matmul 权重重打包成 fractal 量化布局走 cube (k_gemm, fp16 反量化 + mmad), decode 和 prefill 同一 kernel
-// alpha/beta (f32) 走 k_gemv_f32t; 其余计算 fp32 向量
+// 主干 int4 为 I4SF; lm_head/tok_embd 由 bf16 在 host 按 per-16 RTN 转 int8; alpha/beta (f32) 走 k_gemv_f32t
+// HF -> 本实现的权重变换 (与 GGUF 转换一致, 见 docs/model.md 第 11 节): norm +1 (ssm_norm 除外)、
+// ssm_a = -exp(A_log)、DeltaNet v 头 grouped -> tiled 重排 (第 j 个 v 头用第 j%16 个 qk 头)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,18 +14,13 @@
 #include <string>
 #include <vector>
 #include "acl.h"
-#include "gguf.h"
-#include "quants_ref.h"
+#include "st.h"
 #include "repack.h"
 #include "aclrtlaunch_k_gemm_i8.h"
-#include "aclrtlaunch_k_gemm_i8b.h"
-#include "aclrtlaunch_k_gemm_i4.h"
+#include "aclrtlaunch_k_gemm_i4s.h"
 #include "aclrtlaunch_k_pack_x.h"
 #include "aclrtlaunch_k_gemv_f32t.h"
-#include "aclrtlaunch_k_dq_f32.h"
 #include "aclrtlaunch_k_dq_i8.h"
-#include "aclrtlaunch_k_dq_i8b.h"
-#include "aclrtlaunch_k_dq_i4.h"
 #include "aclrtlaunch_k_add_norm.h"
 #include "aclrtlaunch_k_silu_mul.h"
 #include "aclrtlaunch_k_conv.h"
@@ -40,6 +38,7 @@ const int N_HEAD = 24, N_KV = 4, HD = 256, ROT = 64;
 const int LK = 16, LV = 48, LHD = 128;
 const int KEY_DIM = LK * LHD, V_DIM = LV * LHD, QKV_DIM = 2 * KEY_DIM + V_DIM;
 const int Q_DIM = N_HEAD * HD * 2, KV_DIM = N_KV * HD, ATT_DIM = N_HEAD * HD;
+const int QKVZ = QKV_DIM + V_DIM, QKVC = Q_DIM + 2 * KV_DIM; // qkv+z / q+k+v 合并矩阵的每 token 输出宽度
 const int CHUNK = 256; // prefill 每批处理的 token 数
 const float THETA = 1e7f;
 const int PAD = 256; // 每个 matmul 输出缓冲末尾的安全余量 (字节)
@@ -56,31 +55,36 @@ struct Layer {
     void* attn_norm = nullptr;
     void* post_norm = nullptr;
     Weight ffn_gate, ffn_up, ffn_down;
-    Weight qkv, gate_z, alpha, beta, ssm_out;
+    Weight qkv, ab, ssm_out; // qkv = in_proj_qkv + in_proj_z 行拼接 [QKVZ][D]; ab = α+β 行拼接 f32 [96][D]
     void* ssm_a = nullptr; // 补零到 64
     void* dt_bias = nullptr;
     void* conv_w = nullptr; // 已重排为 [4][QKV_DIM]
     void* ssm_norm = nullptr;
     void* conv_state = nullptr; // [3][QKV_DIM]
     void* ssm_state = nullptr; // [48][128][128]
-    Weight wq, wk, wv, wo;
+    Weight wqkv, wo; // wqkv = q+k+v 行拼接 [QKVC][D]
     void* q_norm = nullptr;
     void* k_norm = nullptr;
     void* k_cache = nullptr; // [max_ctx][1024] f32
     void* v_cache = nullptr;
 };
 
-struct SelfRow { string name; uint32_t type; int k, n; int rows[8]; vector<uint8_t> raw; }; // 自测保存的原始行
+struct SelfRef { string name; const Weight* w; int rows[8]; vector<float> ref; }; // 自测: 8 行反量化参考值 (重排后语义, [8][k])
 
-Gguf::File G_file;
+St::File G_st;
+// DeltaNet v 头重排 (HF grouped -> tiled, 同 GGUF 转换): tiled 头 j 对应 HF 头 (j%16)*3 + j/16
+int G_perm48[LV];
+int G_rows_qkv[QKV_DIM]; // in_proj_qkv 行重排 (q/k 恒等, v 段按头重排); conv1d 通道同此
+int G_rows_z[V_DIM]; // in_proj_z 行重排
+int G_kblk_out[V_DIM / 128]; // out_proj k 方向 128 块重排 (一块恰好一个 v 头, 与量化组对齐)
 Layer G_layers[N_LAYER];
 Weight G_tok_embd, G_output;
 void* G_output_norm = nullptr;
 int G_max_ctx = 0, G_n_past = 0, G_next_pos = 0;
 bool G_inited = false;
 uint64_t G_rng = 0x853c49e6748fea9bULL;
-void *G_d_x = nullptr, *G_d_xn = nullptr, *G_d_out = nullptr, *G_d_qkv = nullptr, *G_d_z = nullptr, *G_d_a = nullptr, *G_d_b = nullptr, *G_d_o = nullptr;
-void *G_d_qg = nullptr, *G_d_k = nullptr, *G_d_v = nullptr, *G_d_att = nullptr, *G_d_g = nullptr, *G_d_u = nullptr;
+void *G_d_x = nullptr, *G_d_xn = nullptr, *G_d_out = nullptr, *G_d_qkv = nullptr, *G_d_ab = nullptr, *G_d_o = nullptr;
+void *G_d_qg = nullptr, *G_d_att = nullptr, *G_d_g = nullptr, *G_d_u = nullptr;
 void *G_d_logits = nullptr, *G_d_hidden = nullptr, *G_d_tok = nullptr, *G_d_cos = nullptr, *G_d_sin = nullptr;
 void *G_d_xp = nullptr; // k_pack_x 的 fp16 zZ 布局 x
 float G_inv_freq[ROT / 2];
@@ -90,50 +94,104 @@ int G_pos[CHUNK * 3];
 vector<float> G_work;
 vector<int> G_idx;
 vector<uint8_t> G_seen;
-vector<SelfRow> G_selfrows;
+vector<SelfRef> G_selfrefs;
 
 inline void* fp(void* base, size_t n_floats) { return (uint8_t*)base + n_floats * sizeof(float); }
 
-const Gguf::Tensor& find_tensor(const string& name) {
-    auto it = G_file.tensors.find(name);
-    if (it == G_file.tensors.end()) {
+const St::Tensor& find_t(const string& name) {
+    auto it = G_st.tensors.find(name);
+    if (it == G_st.tensors.end()) {
         fprintf(stderr, "❌ 缺少 tensor %s\n", name.c_str());
         _Exit(1);
     }
     return it->second;
 }
 
-Weight get_w(const string& name, int k, int n) { // matmul 权重: fractal 重打包 + 上传 (f32 原样)
-    const Gguf::Tensor& t = find_tensor(name);
-    if (t.dims.size() != 2 || t.dims[0] != k || t.dims[1] != n) {
-        fprintf(stderr, "❌ %s 形状不对, 期望 [%d, %d]\n", name.c_str(), k, n);
+void check_shape(const St::Tensor& t, const string& name, int dtype, std::initializer_list<int64_t> shape) {
+    if (t.dtype != dtype || t.shape != vector<int64_t>(shape)) {
+        fprintf(stderr, "❌ %s dtype/形状不对 (dtype=%d, ndim=%zu)\n", name.c_str(), t.dtype, t.shape.size());
+        _Exit(1);
+    }
+}
+
+struct QSrc { // int4 量化矩阵三元组 + 可选重排 (行 / k 方向 128 块, 128 块与量化组对齐, 重排无损)
+    const uint32_t* pk;
+    const uint16_t* sc;
+    int k, n;
+    const int* row_map;
+    const int* kblk_map;
+};
+
+QSrc get_qsrc(const string& base, int k, int n, const int* row_map, const int* kblk_map) {
+    const St::Tensor& tp = find_t(base + ".weight_packed");
+    const St::Tensor& ts = find_t(base + ".weight_scale");
+    const St::Tensor& th = find_t(base + ".weight_shape");
+    check_shape(tp, base + ".weight_packed", St::DT_I32, {n, k / 8});
+    check_shape(ts, base + ".weight_scale", St::DT_BF16, {n, k / 128});
+    const int64_t* sh = (const int64_t*)th.data;
+    if (th.dtype != St::DT_I64 || St::numel(th) != 2 || sh[0] != n || sh[1] != k) {
+        fprintf(stderr, "❌ %s weight_shape 不符 (期望 [%d, %d])\n", base.c_str(), n, k);
+        _Exit(1);
+    }
+    return {(const uint32_t*)tp.data, (const uint16_t*)ts.data, k, n, row_map, kblk_map};
+}
+
+// 解一行 int4 (按重排后的行号 r): nat 为 0..15 的 nibble 值 (q+8), s16 为 per-16 f32 scale (per-128 组复制)
+void decode_q4_row(const QSrc& q, int r, int8_t* nat, float* s16) {
+    int rr = q.row_map ? q.row_map[r] : r;
+    const uint32_t* w = q.pk + (uint64_t)rr * (q.k / 8);
+    const uint16_t* sp = q.sc + (uint64_t)rr * (q.k / 128);
+    for (int kb = 0; kb < q.k / 128; kb++) {
+        int sb = q.kblk_map ? q.kblk_map[kb] : kb;
+        const uint32_t* ww = w + sb * 16;
+        int8_t* o = nat + kb * 128;
+        for (int i = 0; i < 16; i++) {
+            uint32_t v = ww[i];
+            for (int j = 0; j < 8; j++) o[i * 8 + j] = (int8_t)((v >> (4 * j)) & 15);
+        }
+        float s = Repack::bf2f(sp[sb]);
+        for (int g = 0; g < 8; g++) s16[kb * 8 + g] = s;
+    }
+}
+
+struct QSeg { string base; int n; const int* row_map; }; // 行方向拼接的一段 (共享 k)
+
+// 多段 int4 矩阵行拼接后重打包 (段内可带行重排): 合并后一次 matmul, 省启动和小矩阵的流水浪费
+Weight get_w_q4_cat(const vector<QSeg>& segs, int k, const int* kblk_map = nullptr) {
+    vector<QSrc> qs;
+    vector<int> soff{0};
+    for (const QSeg& g : segs) {
+        qs.push_back(get_qsrc(g.base, k, g.n, g.row_map, kblk_map));
+        soff.push_back(soff.back() + g.n);
+    }
+    int n = soff.back();
+    if (k % 128 || n % 128) {
+        fprintf(stderr, "❌ %s 形状 [%d, %d] 不满足 fractal 布局要求\n", segs[0].base.c_str(), k, n);
         _Exit(1);
     }
     Weight w;
+    w.fmt = Repack::FMT_I4SF;
     w.k = k;
     w.n = n;
-    if (t.type == Gguf::T_F32) {
-        w.fmt = Repack::FMT_F32;
-        w.stride = k * 4;
-        w.data = Acl::alloc((uint64_t)n * k * 4 + PAD);
-        Acl::h2d(w.data, t.data, (uint64_t)n * k * 4);
-        return w;
-    }
-    if (k % 128 || n % 128) {
-        fprintf(stderr, "❌ %s 形状 [%d, %d] 不满足 fractal 布局要求\n", name.c_str(), k, n);
-        _Exit(1);
-    }
-    w.fmt = Repack::fmt2_for(t.type);
     int SB = Repack::sb2_ni(w.fmt), KS = k / 128, nr = n / 8;
     w.data = Acl::alloc((uint64_t)(n / 16) * KS * SB);
     vector<uint8_t> staging;
+    vector<int8_t> nat((size_t)16 * k);
+    vector<float> s16((size_t)16 * (k / 16));
     uint64_t off = 0;
     for (int c = 0; c < 8; c++) { // 每核的行连续存放, 核内按 256 行分块
         for (int r0 = 0; r0 < nr; r0 += 256) {
-            int nb = std::min(256, nr - r0);
-            uint64_t bb = (uint64_t)KS * (nb / 16) * SB;
+            int nb = std::min(256, nr - r0), NI = nb / 16;
+            uint64_t bb = (uint64_t)KS * NI * SB;
             staging.resize(bb);
-            Repack::repack2_block(t.type, (const uint8_t*)t.data, k, c * nr + r0, nb, staging.data());
+            for (int ni = 0; ni < NI; ni++) {
+                for (int rr = 0; rr < 16; rr++) {
+                    int r = c * nr + r0 + ni * 16 + rr, si = 0;
+                    while (r >= soff[si + 1]) si++;
+                    decode_q4_row(qs[si], r - soff[si], &nat[(size_t)rr * k], &s16[(size_t)rr * (k / 16)]);
+                }
+                Repack::pack2_16rows(w.fmt, k, NI, ni, nat.data(), s16.data(), staging.data());
+            }
             Acl::h2d((uint8_t*)w.data + off, staging.data(), bb);
             off += bb;
         }
@@ -141,65 +199,161 @@ Weight get_w(const string& name, int k, int n) { // matmul 权重: fractal 重�
     return w;
 }
 
-Weight get_w_embd(const string& name, int k, int n) { // tok_embd: 旧 wave 布局 (只做反量化查行)
-    const Gguf::Tensor& t = find_tensor(name);
-    if (t.dims.size() != 2 || t.dims[0] != k || t.dims[1] != n) {
-        fprintf(stderr, "❌ %s 形状不对, 期望 [%d, %d]\n", name.c_str(), k, n);
-        _Exit(1);
-    }
+Weight get_w_q4(const string& base, int k, int n, const int* row_map = nullptr, const int* kblk_map = nullptr) {
+    return get_w_q4_cat({{base, n, row_map}}, k, kblk_map);
+}
+
+inline void bf16_row_f32(const St::Tensor& t, int64_t r, int k, float* out) {
+    const uint16_t* p = (const uint16_t*)t.data + (uint64_t)r * k;
+    for (int i = 0; i < k; i++) out[i] = Repack::bf2f(p[i]);
+}
+
+Weight get_w_i8_bf16(const string& name, int k, int n) { // lm_head: bf16 -> per-16 RTN int8 -> I8F fractal
+    const St::Tensor& t = find_t(name);
+    check_shape(t, name, St::DT_BF16, {n, k});
     Weight w;
-    w.fmt = Repack::fmt_for(t.type);
+    w.fmt = Repack::FMT_I8F;
+    w.k = k;
+    w.n = n;
+    int SB = Repack::sb2_ni(w.fmt), KS = k / 128, nr = n / 8;
+    w.data = Acl::alloc((uint64_t)(n / 16) * KS * SB);
+    vector<uint8_t> staging;
+    vector<float> row(k);
+    vector<int8_t> nat((size_t)16 * k);
+    vector<float> s16((size_t)16 * (k / 16));
+    uint64_t off = 0;
+    for (int c = 0; c < 8; c++) {
+        for (int r0 = 0; r0 < nr; r0 += 256) {
+            int nb = std::min(256, nr - r0), NI = nb / 16;
+            uint64_t bb = (uint64_t)KS * NI * SB;
+            staging.resize(bb);
+            for (int ni = 0; ni < NI; ni++) {
+                for (int rr = 0; rr < 16; rr++) {
+                    bf16_row_f32(t, c * nr + r0 + ni * 16 + rr, k, row.data());
+                    Repack::quant_row_i8(row.data(), k, &nat[(size_t)rr * k], &s16[(size_t)rr * (k / 16)]);
+                }
+                Repack::pack2_16rows(w.fmt, k, NI, ni, nat.data(), s16.data(), staging.data());
+            }
+            Acl::h2d((uint8_t*)w.data + off, staging.data(), bb);
+            off += bb;
+        }
+    }
+    return w;
+}
+
+Weight get_embd_i8(const string& name, int k, int n) { // tok_embd: bf16 -> per-16 RTN int8 -> wave I8 (k_dq_i8 查行)
+    const St::Tensor& t = find_t(name);
+    check_shape(t, name, St::DT_BF16, {n, k});
+    Weight w;
+    w.fmt = Repack::FMT_I8;
     w.k = k;
     w.n = n;
     w.stride = (int)Repack::row_stride(w.fmt, k);
     w.data = Acl::alloc((uint64_t)n * w.stride + PAD);
     const int SLICE = 2048; // 每批重打包的行数
     vector<uint8_t> staging((uint64_t)SLICE * w.stride);
+    vector<float> row(k);
+    vector<int8_t> nat(k);
+    vector<float> s(k / 16);
     for (int r0 = 0; r0 < n; r0 += SLICE) {
         int nr = std::min(SLICE, n - r0);
-        Repack::repack_rows(t.type, (const uint8_t*)t.data, k, r0, nr, staging.data());
+        for (int r = 0; r < nr; r++) {
+            bf16_row_f32(t, r0 + r, k, row.data());
+            Repack::quant_row_i8(row.data(), k, nat.data(), s.data());
+            Repack::pack_row_i8(k, nat.data(), s.data(), staging.data() + (uint64_t)r * w.stride);
+        }
         Acl::h2d((uint8_t*)w.data + (uint64_t)r0 * w.stride, staging.data(), (uint64_t)nr * w.stride);
     }
     return w;
 }
 
-void* get_f(const string& name, int64_t numel, int64_t alloc_numel = 0) { // f32 原样上传, 可指定更大的分配 (补零)
-    const Gguf::Tensor& t = find_tensor(name);
-    int64_t cnt = 1;
-    for (int64_t d : t.dims) cnt *= d;
-    if (t.type != Gguf::T_F32 || cnt != numel) {
-        fprintf(stderr, "❌ %s 需要 f32 且元素数 %ld, 实际 type=%u numel=%ld\n", name.c_str(), (long)numel, t.type, (long)cnt);
+vector<float> load_f32(const string& name, int64_t numel) { // bf16/f32 小张量 -> f32
+    const St::Tensor& t = find_t(name);
+    if (St::numel(t) != numel || (t.dtype != St::DT_BF16 && t.dtype != St::DT_F32)) {
+        fprintf(stderr, "❌ %s 需要 bf16/f32 且元素数 %ld, 实际 dtype=%d numel=%ld\n", name.c_str(), (long)numel, t.dtype, (long)St::numel(t));
         _Exit(1);
     }
+    vector<float> v(numel);
+    if (t.dtype == St::DT_F32) memcpy(v.data(), t.data, numel * 4);
+    else
+        for (int64_t i = 0; i < numel; i++) v[i] = Repack::bf2f(((const uint16_t*)t.data)[i]);
+    return v;
+}
+
+void* up_f32(const float* v, int64_t numel, int64_t alloc_numel = 0) { // f32 上传, 可指定更大的分配 (补零)
     if (!alloc_numel) alloc_numel = numel;
     void* p = Acl::alloc((uint64_t)alloc_numel * 4);
-    Acl::h2d(p, t.data, (uint64_t)numel * 4);
+    Acl::h2d(p, v, (uint64_t)numel * 4);
     return p;
 }
 
-void check_kv(const char* key, double expect) {
-    auto it = G_file.kv_num.find(key);
-    if (it == G_file.kv_num.end() || std::fabs(it->second - expect) > 1e-6 * std::fabs(expect)) {
-        fprintf(stderr, "❌ GGUF 参数 %s 不符合预期 %g\n", key, expect);
-        _Exit(1);
-    }
+void* get_norm(const string& name, int n, bool add1) { // HF norm 权重为零中心 w, 计算用 1+w (ssm_norm 除外)
+    vector<float> v = load_f32(name, n);
+    if (add1)
+        for (float& x : v) x += 1.0f;
+    return up_f32(v.data(), n);
 }
 
-void save_selfrow(const string& name) { // 自测用: 保存首末各 4 行的原始量化数据
-    const Gguf::Tensor& t = find_tensor(name);
-    SelfRow s;
-    s.name = name;
-    s.type = t.type;
-    s.k = (int)t.dims[0];
-    s.n = (int)t.dims[1];
-    uint64_t rb = Quants::row_bytes(t.type, s.k);
-    int rows[8] = {0, 1, 2, 3, s.n - 4, s.n - 3, s.n - 2, s.n - 1};
-    s.raw.resize(rb * 8);
-    for (int i = 0; i < 8; i++) {
-        s.rows[i] = rows[i];
-        memcpy(s.raw.data() + rb * i, (const uint8_t*)t.data + rb * rows[i], rb);
+Weight get_w_ab(const string& p) { // α+β 合并 [96][D] f32 (行按 tiled 头序), 一次 GEMV 算完
+    const St::Tensor& ta = find_t(p + "linear_attn.in_proj_a.weight");
+    const St::Tensor& tb = find_t(p + "linear_attn.in_proj_b.weight");
+    check_shape(ta, p + "in_proj_a", St::DT_BF16, {LV, D});
+    check_shape(tb, p + "in_proj_b", St::DT_BF16, {LV, D});
+    vector<float> o((size_t)2 * LV * D);
+    for (int j = 0; j < LV; j++) {
+        bf16_row_f32(ta, G_perm48[j], D, &o[(size_t)j * D]);
+        bf16_row_f32(tb, G_perm48[j], D, &o[(size_t)(LV + j) * D]);
     }
-    G_selfrows.push_back(std::move(s));
+    Weight w;
+    w.fmt = Repack::FMT_F32;
+    w.k = D;
+    w.n = 2 * LV;
+    w.stride = D * 4;
+    w.data = Acl::alloc((uint64_t)2 * LV * D * 4 + PAD);
+    Acl::h2d(w.data, o.data(), (uint64_t)2 * LV * D * 4);
+    return w;
+}
+
+void save_ref(const string& name, const Weight* w, const vector<float>& ref) { // 自测参考: 首末各 4 行的反量化 f32
+    SelfRef s;
+    s.name = name;
+    s.w = w;
+    for (int i = 0; i < 8; i++) s.rows[i] = i < 4 ? i : w->n - 8 + i;
+    s.ref = ref;
+    G_selfrefs.push_back(std::move(s));
+}
+
+void save_ref_q4(const string& name, const Weight* w, const vector<QSeg>& segs, const int* kblk_map) {
+    vector<QSrc> qs;
+    vector<int> soff{0};
+    for (const QSeg& g : segs) {
+        qs.push_back(get_qsrc(g.base, w->k, g.n, g.row_map, kblk_map));
+        soff.push_back(soff.back() + g.n);
+    }
+    vector<float> ref((size_t)8 * w->k);
+    vector<int8_t> nat(w->k);
+    vector<float> s16(w->k / 16);
+    for (int i = 0; i < 8; i++) {
+        int r = i < 4 ? i : w->n - 8 + i, si = 0;
+        while (r >= soff[si + 1]) si++;
+        decode_q4_row(qs[si], r - soff[si], nat.data(), s16.data());
+        for (int c = 0; c < w->k; c++) ref[(size_t)i * w->k + c] = (nat[c] - 8) * s16[c / 16];
+    }
+    save_ref(name, w, ref);
+}
+
+void save_ref_i8(const string& name, const Weight* w) { // lm_head / tok_embd: 参考 = RTN 后的 s*q
+    const St::Tensor& t = find_t(name);
+    vector<float> ref((size_t)8 * w->k);
+    vector<float> row(w->k);
+    vector<int8_t> nat(w->k);
+    vector<float> s(w->k / 16);
+    for (int i = 0; i < 8; i++) {
+        bf16_row_f32(t, i < 4 ? i : w->n - 8 + i, w->k, row.data());
+        Repack::quant_row_i8(row.data(), w->k, nat.data(), s.data());
+        for (int c = 0; c < w->k; c++) ref[(size_t)i * w->k + c] = s[c / 16] * nat[c];
+    }
+    save_ref(name, w, ref);
 }
 
 const void* G_pack_src = nullptr; // k_pack_x 结果缓存 (同一 x 的多个 matmul 只打包一次)
@@ -241,21 +395,15 @@ void matmul(const Weight& w, void* x, int T, void* y) { // x: [T][k] f32, y: [T]
     prof_mark(9);
     aclError e;
     if (w.fmt == Repack::FMT_I8F) e = ACLRT_LAUNCH_KERNEL(k_gemm_i8)(8, Acl::G_stream, w.data, x, xp, y, T, w.n, w.k);
-    else if (w.fmt == Repack::FMT_I8BF) e = ACLRT_LAUNCH_KERNEL(k_gemm_i8b)(8, Acl::G_stream, w.data, x, xp, y, T, w.n, w.k);
-    else e = ACLRT_LAUNCH_KERNEL(k_gemm_i4)(8, Acl::G_stream, w.data, x, xp, y, T, w.n, w.k);
+    else e = ACLRT_LAUNCH_KERNEL(k_gemm_i4s)(8, Acl::G_stream, w.data, x, xp, y, T, w.n, w.k);
     Acl::ck(e, "launch gemm");
     prof_mark(0);
 }
 
 void matmul_tok(const Weight& w, void* x, void* y) { matmul(w, x, 1, y); }
 
-void dq_rows(const Weight& w, void* d_rows, void* d_out, int nr) { // 反量化 nr 行到自然顺序 f32
-    aclError e;
-    if (w.fmt == Repack::FMT_F32) e = ACLRT_LAUNCH_KERNEL(k_dq_f32)(8, Acl::G_stream, w.data, d_rows, d_out, nr, w.k, w.stride);
-    else if (w.fmt == Repack::FMT_I8) e = ACLRT_LAUNCH_KERNEL(k_dq_i8)(8, Acl::G_stream, w.data, d_rows, d_out, nr, w.k, w.stride);
-    else if (w.fmt == Repack::FMT_I8B) e = ACLRT_LAUNCH_KERNEL(k_dq_i8b)(8, Acl::G_stream, w.data, d_rows, d_out, nr, w.k, w.stride);
-    else e = ACLRT_LAUNCH_KERNEL(k_dq_i4)(8, Acl::G_stream, w.data, d_rows, d_out, nr, w.k, w.stride);
-    Acl::ck(e, "launch dq");
+void dq_rows(const Weight& w, void* d_rows, void* d_out, int nr) { // 反量化 nr 行到自然顺序 f32 (tok_embd, wave I8)
+    Acl::ck(ACLRT_LAUNCH_KERNEL(k_dq_i8)(8, Acl::G_stream, w.data, d_rows, d_out, nr, w.k, w.stride), "launch dq");
 }
 
 void add_norm(void* add, void* w, void* hidden, int T) {
@@ -293,22 +441,18 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
         add_norm(l ? G_d_out : nullptr, L.attn_norm, fp(G_d_hidden, (size_t)l * D), T);
         if (L.recr) {
             matmul(L.qkv, G_d_xn, T, G_d_qkv);
-            matmul(L.gate_z, G_d_xn, T, G_d_z);
-            matmul(L.alpha, G_d_xn, T, G_d_a);
-            matmul(L.beta, G_d_xn, T, G_d_b);
+            matmul(L.ab, G_d_xn, T, G_d_ab);
             Acl::ck(ACLRT_LAUNCH_KERNEL(k_conv)(8, Acl::G_stream, G_d_qkv, L.conv_state, L.conv_w, T), "launch conv");
             prof_mark(3);
-            Acl::ck(ACLRT_LAUNCH_KERNEL(k_deltanet)(8, Acl::G_stream, G_d_qkv, G_d_z, G_d_a, G_d_b, L.ssm_a, L.dt_bias, L.ssm_norm, L.ssm_state, G_d_o, T), "launch deltanet");
+            Acl::ck(ACLRT_LAUNCH_KERNEL(k_deltanet)(8, Acl::G_stream, G_d_qkv, G_d_ab, L.ssm_a, L.dt_bias, L.ssm_norm, L.ssm_state, G_d_o, T), "launch deltanet");
             prof_mark(4);
             pack_invalidate();
             matmul(L.ssm_out, G_d_o, T, G_d_out);
         } else {
-            matmul(L.wq, G_d_xn, T, G_d_qg);
-            matmul(L.wk, G_d_xn, T, G_d_k);
-            matmul(L.wv, G_d_xn, T, G_d_v);
+            matmul(L.wqkv, G_d_xn, T, G_d_qg);
             const char* ph2 = getenv("QWEN_NPU_PHASE");
             if (ph2 && l == stop_l && atoi(ph2) == 10) { Acl::sync(); return; }
-            Acl::ck(ACLRT_LAUNCH_KERNEL(k_qk_rope)(8, Acl::G_stream, G_d_qg, G_d_k, G_d_v, L.q_norm, L.k_norm, G_d_cos, G_d_sin, L.k_cache, L.v_cache, G_n_past, T), "launch qk_rope");
+            Acl::ck(ACLRT_LAUNCH_KERNEL(k_qk_rope)(8, Acl::G_stream, G_d_qg, L.q_norm, L.k_norm, G_d_cos, G_d_sin, L.k_cache, L.v_cache, G_n_past, T), "launch qk_rope");
             prof_mark(5);
             if (ph2 && l == stop_l && atoi(ph2) == 11) { Acl::sync(); return; }
             Acl::ck(ACLRT_LAUNCH_KERNEL(k_attn)(8, Acl::G_stream, G_d_qg, L.k_cache, L.v_cache, G_d_att, G_n_past, T), "launch attn");
@@ -362,92 +506,82 @@ int qwen_init(const char* path, int device, int max_ctx) {
     }
     auto t0 = std::chrono::steady_clock::now();
     Acl::init(device);
-    if (!Gguf::open(G_file, path)) return -1;
-    if (G_file.kv_str["general.architecture"] != "qwen35") {
-        fprintf(stderr, "❌ 架构不是 qwen35: %s\n", G_file.kv_str["general.architecture"].c_str());
-        return -1;
-    }
-    check_kv("qwen35.embedding_length", D);
-    check_kv("qwen35.feed_forward_length", FF);
-    check_kv("qwen35.attention.head_count", N_HEAD);
-    check_kv("qwen35.attention.head_count_kv", N_KV);
-    check_kv("qwen35.attention.key_length", HD);
-    check_kv("qwen35.rope.dimension_count", ROT);
-    check_kv("qwen35.rope.freq_base", THETA);
-    check_kv("qwen35.ssm.state_size", LHD);
-    check_kv("qwen35.ssm.group_count", LK);
-    check_kv("qwen35.ssm.time_step_rank", LV);
-    check_kv("qwen35.ssm.conv_kernel", 4);
-    check_kv("qwen35.full_attention_interval", 4);
+    if (!St::open(G_st, path)) return -1;
     G_max_ctx = max_ctx;
-    const char* selfnames[] = {"token_embd.weight", "blk.0.attn_qkv.weight", "blk.0.ffn_gate.weight", "blk.51.ffn_down.weight", "blk.0.ffn_up.weight", "blk.0.ssm_alpha.weight", "output.weight"};
-    for (const char* nm : selfnames) save_selfrow(nm);
+    for (int j = 0; j < LV; j++) G_perm48[j] = (j % LK) * 3 + j / LK; // tiled 头 j <- HF 头
+    for (int r = 0; r < QKV_DIM; r++) G_rows_qkv[r] = r < 2 * KEY_DIM ? r : 2 * KEY_DIM + G_perm48[(r - 2 * KEY_DIM) / LHD] * LHD + r % LHD;
+    for (int r = 0; r < V_DIM; r++) G_rows_z[r] = G_perm48[r / LHD] * LHD + r % LHD;
+    for (int j = 0; j < LV; j++) G_kblk_out[j] = G_perm48[j];
     auto t1 = std::chrono::steady_clock::now();
-    G_tok_embd = get_w_embd("token_embd.weight", D, VOCAB);
-    G_output = get_w("output.weight", D, VOCAB);
-    G_output_norm = get_f("output_norm.weight", D);
+    G_tok_embd = get_embd_i8("model.language_model.embed_tokens.weight", D, VOCAB);
+    save_ref_i8("model.language_model.embed_tokens.weight", &G_tok_embd);
+    G_output = get_w_i8_bf16("lm_head.weight", D, VOCAB);
+    save_ref_i8("lm_head.weight", &G_output);
+    G_output_norm = get_norm("model.language_model.norm.weight", D, true);
     void* conv_all = Acl::alloc((size_t)N_LAYER * 3 * QKV_DIM * 4);
     void* ssm_all = Acl::alloc((size_t)N_LAYER * LV * LHD * LHD * 4);
     vector<float> cwt(4 * QKV_DIM);
     for (int l = 0; l < N_LAYER; l++) {
         Layer& L = G_layers[l];
-        string p = "blk." + std::to_string(l) + ".";
+        string p = "model.language_model.layers." + std::to_string(l) + ".";
         L.recr = (l + 1) % 4 != 0;
-        L.attn_norm = get_f(p + "attn_norm.weight", D);
-        L.post_norm = get_f(p + "post_attention_norm.weight", D);
-        L.ffn_gate = get_w(p + "ffn_gate.weight", D, FF);
-        L.ffn_up = get_w(p + "ffn_up.weight", D, FF);
-        L.ffn_down = get_w(p + "ffn_down.weight", FF, D);
+        L.attn_norm = get_norm(p + "input_layernorm.weight", D, true);
+        L.post_norm = get_norm(p + "post_attention_layernorm.weight", D, true);
+        L.ffn_gate = get_w_q4(p + "mlp.gate_proj", D, FF);
+        L.ffn_up = get_w_q4(p + "mlp.up_proj", D, FF);
+        L.ffn_down = get_w_q4(p + "mlp.down_proj", FF, D);
+        if (l == 0) save_ref_q4(p + "mlp.gate_proj", &L.ffn_gate, {{p + "mlp.gate_proj", FF, nullptr}}, nullptr);
+        if (l == 51) save_ref_q4(p + "mlp.down_proj", &L.ffn_down, {{p + "mlp.down_proj", D, nullptr}}, nullptr);
         if (L.recr) {
-            L.qkv = get_w(p + "attn_qkv.weight", D, QKV_DIM);
-            L.gate_z = get_w(p + "attn_gate.weight", D, V_DIM);
-            L.alpha = get_w(p + "ssm_alpha.weight", D, LV);
-            L.beta = get_w(p + "ssm_beta.weight", D, LV);
-            L.ssm_out = get_w(p + "ssm_out.weight", V_DIM, D);
-            L.ssm_a = get_f(p + "ssm_a", LV, 64);
-            L.dt_bias = get_f(p + "ssm_dt.bias", LV, 64);
-            L.ssm_norm = get_f(p + "ssm_norm.weight", LHD);
-            const Gguf::Tensor& ct = find_tensor(p + "ssm_conv1d.weight");
-            int64_t cnt = 1;
-            for (int64_t dd : ct.dims) cnt *= dd;
-            if (ct.type != Gguf::T_F32 || cnt != (int64_t)QKV_DIM * 4) {
-                fprintf(stderr, "❌ %s 形状/类型不对\n", (p + "ssm_conv1d.weight").c_str());
-                _Exit(1);
+            vector<QSeg> qkv_segs = {{p + "linear_attn.in_proj_qkv", QKV_DIM, G_rows_qkv}, {p + "linear_attn.in_proj_z", V_DIM, G_rows_z}};
+            L.qkv = get_w_q4_cat(qkv_segs, D);
+            L.ab = get_w_ab(p);
+            L.ssm_out = get_w_q4(p + "linear_attn.out_proj", V_DIM, D, nullptr, G_kblk_out);
+            if (l == 0) {
+                save_ref_q4(p + "linear_attn.in_proj_qkv+z", &L.qkv, qkv_segs, nullptr);
+                save_ref_q4(p + "linear_attn.out_proj", &L.ssm_out, {{p + "linear_attn.out_proj", D, nullptr}}, G_kblk_out);
+                const St::Tensor& ta = find_t(p + "linear_attn.in_proj_a.weight");
+                const St::Tensor& tb = find_t(p + "linear_attn.in_proj_b.weight");
+                vector<float> aref((size_t)8 * D);
+                for (int i = 0; i < 4; i++) bf16_row_f32(ta, G_perm48[i], D, &aref[(size_t)i * D]);
+                for (int i = 4; i < 8; i++) bf16_row_f32(tb, G_perm48[LV - 8 + i], D, &aref[(size_t)i * D]); // 合并矩阵尾 4 行 = β 的 44..47
+                save_ref(p + "linear_attn.in_proj_a+b", &L.ab, aref);
             }
-            const float* cw = (const float*)ct.data; // GGUF [通道][4] -> NPU [4][通道]
+            vector<float> alog = load_f32(p + "linear_attn.A_log", LV);
+            vector<float> a64(64, 0.0f), b64(64, 0.0f);
+            for (int j = 0; j < LV; j++) a64[j] = -expf(alog[G_perm48[j]]); // ssm_a = -exp(A_log), 按 tiled 头序
+            L.ssm_a = up_f32(a64.data(), 64);
+            vector<float> dtb = load_f32(p + "linear_attn.dt_bias", LV);
+            for (int j = 0; j < LV; j++) b64[j] = dtb[G_perm48[j]];
+            L.dt_bias = up_f32(b64.data(), 64);
+            L.ssm_norm = get_norm(p + "linear_attn.norm.weight", LHD, false);
+            vector<float> cw = load_f32(p + "linear_attn.conv1d.weight", (int64_t)QKV_DIM * 4); // [通道][1][4] -> [4][通道], v 通道重排
             for (int c = 0; c < QKV_DIM; c++)
-                for (int j = 0; j < 4; j++) cwt[j * QKV_DIM + c] = cw[c * 4 + j];
+                for (int j = 0; j < 4; j++) cwt[j * QKV_DIM + c] = cw[G_rows_qkv[c] * 4 + j];
             L.conv_w = Acl::alloc((size_t)4 * QKV_DIM * 4);
             Acl::h2d(L.conv_w, cwt.data(), (size_t)4 * QKV_DIM * 4);
             L.conv_state = fp(conv_all, (size_t)l * 3 * QKV_DIM);
             L.ssm_state = fp(ssm_all, (size_t)l * LV * LHD * LHD);
             continue;
         }
-        L.wq = get_w(p + "attn_q.weight", D, Q_DIM);
-        L.wk = get_w(p + "attn_k.weight", D, KV_DIM);
-        L.wv = get_w(p + "attn_v.weight", D, KV_DIM);
-        L.wo = get_w(p + "attn_output.weight", ATT_DIM, D);
-        L.q_norm = get_f(p + "attn_q_norm.weight", HD);
-        L.k_norm = get_f(p + "attn_k_norm.weight", HD);
+        L.wqkv = get_w_q4_cat({{p + "self_attn.q_proj", Q_DIM, nullptr}, {p + "self_attn.k_proj", KV_DIM, nullptr}, {p + "self_attn.v_proj", KV_DIM, nullptr}}, D);
+        L.wo = get_w_q4(p + "self_attn.o_proj", ATT_DIM, D);
+        L.q_norm = get_norm(p + "self_attn.q_norm.weight", HD, true);
+        L.k_norm = get_norm(p + "self_attn.k_norm.weight", HD, true);
         L.k_cache = Acl::alloc((size_t)max_ctx * KV_DIM * 4);
         L.v_cache = Acl::alloc((size_t)max_ctx * KV_DIM * 4);
     }
     double up = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     fprintf(stderr, "ℹ️ 权重重打包并上传完成, %.1fs\n", up);
-    free((void*)G_file.base);
-    G_file.base = nullptr;
+    St::close(G_st);
     for (int i = 0; i < ROT / 2; i++) G_inv_freq[i] = 1.0f / powf(THETA, (float)(2 * i) / ROT);
     G_d_x = Acl::alloc((size_t)CHUNK * D * 4 + PAD);
     G_d_xn = Acl::alloc((size_t)CHUNK * D * 4 + PAD);
     G_d_out = Acl::alloc((size_t)CHUNK * D * 4 + PAD);
-    G_d_qkv = Acl::alloc((size_t)CHUNK * QKV_DIM * 4 + PAD);
-    G_d_z = Acl::alloc((size_t)CHUNK * V_DIM * 4 + PAD);
-    G_d_a = Acl::alloc((size_t)CHUNK * LV * 4 + PAD);
-    G_d_b = Acl::alloc((size_t)CHUNK * LV * 4 + PAD);
+    G_d_qkv = Acl::alloc((size_t)CHUNK * QKVZ * 4 + PAD);
+    G_d_ab = Acl::alloc((size_t)CHUNK * 2 * LV * 4 + PAD);
     G_d_o = Acl::alloc((size_t)CHUNK * V_DIM * 4 + PAD);
-    G_d_qg = Acl::alloc((size_t)CHUNK * Q_DIM * 4 + PAD);
-    G_d_k = Acl::alloc((size_t)CHUNK * KV_DIM * 4 + PAD);
-    G_d_v = Acl::alloc((size_t)CHUNK * KV_DIM * 4 + PAD);
+    G_d_qg = Acl::alloc((size_t)CHUNK * QKVC * 4 + PAD);
     G_d_att = Acl::alloc((size_t)CHUNK * ATT_DIM * 4 + PAD);
     G_d_g = Acl::alloc((size_t)CHUNK * FF * 4 + PAD);
     G_d_u = Acl::alloc((size_t)CHUNK * FF * 4 + PAD);
@@ -576,35 +710,22 @@ float* qwen_hidden() {
     return G_hidden.data();
 }
 
-int qwen_selftest() { // tok_embd: 反量化逐位对照; matmul 权重: m=1 GEMM vs 保存行的 f32 反量化点积 (fp16 计算, 阈值 5e-3)
+int qwen_selftest() { // tok_embd: 反量化 vs host 参考逐位; matmul 权重: m=1 GEMM vs 参考行的 f32 点积 (fp16 计算, 阈值 5e-3)
     Acl::bind();
     int fails = 0;
-    struct Item { const char* name; Weight* w; };
-    Item items[] = {{"token_embd.weight", &G_tok_embd}, {"blk.0.attn_qkv.weight", &G_layers[0].qkv},
-                    {"blk.0.ffn_gate.weight", &G_layers[0].ffn_gate}, {"blk.51.ffn_down.weight", &G_layers[51].ffn_down},
-                    {"blk.0.ffn_up.weight", &G_layers[0].ffn_up}, {"blk.0.ssm_alpha.weight", &G_layers[0].alpha},
-                    {"output.weight", &G_output}};
-    for (SelfRow& s : G_selfrows) {
-        Weight* w = nullptr;
-        for (Item& it : items)
-            if (s.name == it.name) w = it.w;
-        if (!w) continue;
-        int k = s.k;
-        uint64_t rb = Quants::row_bytes(s.type, k);
-        vector<float> ref(k);
-        if (s.name == "token_embd.weight") {
+    for (SelfRef& s : G_selfrefs) {
+        const Weight* w = s.w;
+        int k = w->k;
+        if (w->fmt == Repack::FMT_I8) { // tok_embd 反量化查行, 与 host 参考逐位一致
             Acl::h2d(G_d_tok, s.rows, 8 * 4);
             dq_rows(*w, G_d_tok, G_d_out, 8);
             Acl::sync();
             vector<float> got((size_t)8 * k);
             Acl::d2h(got.data(), G_d_out, got.size() * 4);
             double max_diff = 0, max_abs = 0;
-            for (int r = 0; r < 8; r++) {
-                Quants::Ref::dequant_row(s.type, s.raw.data() + rb * r, ref.data(), k);
-                for (int i = 0; i < k; i++) {
-                    max_diff = std::max(max_diff, (double)std::fabs(got[(size_t)r * k + i] - ref[i]));
-                    max_abs = std::max(max_abs, (double)std::fabs(ref[i]));
-                }
+            for (size_t i = 0; i < got.size(); i++) {
+                max_diff = std::max(max_diff, (double)std::fabs(got[i] - s.ref[i]));
+                max_abs = std::max(max_abs, (double)std::fabs(s.ref[i]));
             }
             bool ok = max_diff <= 1e-6 * max_abs;
             fails += !ok;
@@ -619,7 +740,7 @@ int qwen_selftest() { // tok_embd: 反量化逐位对照; matmul 权重: m=1 GEM
         Acl::d2h(y.data(), G_d_u, (size_t)w->n * 4);
         double max_rel = 0;
         for (int r = 0; r < 8; r++) {
-            Quants::Ref::dequant_row(s.type, s.raw.data() + rb * r, ref.data(), k);
+            const float* ref = &s.ref[(size_t)r * k];
             double refd = 0, mag = 0;
             for (int j = 0; j < k; j++) {
                 refd += (double)ref[j] * x[j];
@@ -642,14 +763,10 @@ int qwen_dbg(const char* name, float* out, long long n) { // 调试: 读取中�
     if (s == "x") p = G_d_x;
     else if (s == "xn") p = G_d_xn;
     else if (s == "out") p = G_d_out;
-    else if (s == "qkv") p = G_d_qkv;
-    else if (s == "z") p = G_d_z;
-    else if (s == "a") p = G_d_a;
-    else if (s == "b") p = G_d_b;
+    else if (s == "qkv") p = G_d_qkv; // 含 z 段 ([T][QKVZ])
+    else if (s == "ab") p = G_d_ab;
     else if (s == "o") p = G_d_o;
-    else if (s == "qg") p = G_d_qg;
-    else if (s == "k") p = G_d_k;
-    else if (s == "v") p = G_d_v;
+    else if (s == "qg") p = G_d_qg; // 含 k/v 段 ([T][QKVC])
     else if (s == "att") p = G_d_att;
     else if (s == "g") p = G_d_g;
     else if (s == "u") p = G_d_u;
