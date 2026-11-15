@@ -1,8 +1,8 @@
 # C++ NPU (华为昇腾 310P) 实现说明
 
-`qwen_npu/` 是文本主干在华为 Atlas 300I Duo (Ascend 310P3) 上的实现, 结构对应 [cpu_impl.md](cpu_impl.md) / [cuda_impl.md](cuda_impl.md) 的第一版: 模型常量、权重绑定、前向流程、采样和 C 接口与 CPU / CUDA 版一一对应。
+`qwen_npu/` 是文本主干在华为 Atlas 300I Duo (Ascend 310P3) 上的实现, 结构对应 [cpu_impl.md](cpu_impl.md) / [cuda_impl.md](cuda_impl.md): 模型常量、权重绑定、前向流程、采样和 C 接口与 CPU / CUDA 版一一对应。
 
-当前状态 (2026-11-15): **v1, 只保证正确性, 性能未优化**。单芯片、单序列、全 fp32 计算、只用向量单元 (未用 cube)。与 CPU 版的数值对齐已全部通过; decode 约 1.8 tok/s, prefill 约 1.9 tok/s (见第 8 节, 优化方向见第 9 节)。python 侧 (`qwen.py` / `server.py`) 尚未接入该后端, 目前通过 ctypes 直接加载测试。
+当前状态 (2026-11-15): **v2, matmul 全部走 cube (fp16 反量化 + mmad), 其余计算 fp32 向量**。单芯片、单序列; decode 约 5.1 tok/s, prefill 约 180-210 tok/s (见第 8 节, v1 分别为 1.8 / 1.9)。与 CPU 版贪心逐 token 一致 (fp16 计算, 逐层误差 ~1e-3 级, 阈值 5e-3)。python 侧 (`qwen.py` / `server.py`) 尚未接入该后端, 目前通过 ctypes 直接加载测试。
 
 ## 1. 文件与构建
 
@@ -35,85 +35,105 @@ lib.qwen_init(b"/path/to/Qwen3.8-27B-Q4_K_M.gguf", 0, 4096)
 
 ## 2. 权重重打包
 
-310P 向量单元没有整数移位指令, k-quant 的位打包格式无法在 device 高效解码, 因此加载时在 host 把每个矩阵重打包成以下格式再上传 (`repack.h`)。所有格式都能**逐位还原原始反量化值**: scale / bias 用 f32 存 (d×sc 等乘积在 fp32 下是精确的, 与 CPU 版的 fp32 中间值一致), 量化值用原始整数存。
+matmul 权重 (除 alpha/beta) 全部重打包成 **cube GEMM 的 fractal 量化布局** (`repack.h` 的 `repack2_block`), device 侧向量单元反量化成 fp16 后喂给 cube。量化值用原始整数存, scale/bias 转成 fp16 (fp16 乘加与 CUDA fp16 版同级误差, 不再逐位等于 CPU 的 fp32 反量化)。
 
-| 格式 | 来源 | 行布局 | 字节/权重 |
+| 格式 | 来源 | 字节/权重 | 内容 |
 |---|---|---|---|
-| I4 | q4_k | nibble 两平面 + per-32 f32 scale + f32 bias | 0.75 |
-| I8 | q8_0, q6_k | int8 + per-16 f32 scale | 1.25 |
-| I8B | q5_k | int8 + per-16 f32 scale + f32 bias | 1.5 |
-| F32 | f32 (alpha / beta) | 原样 | 4 |
+| I8F | q8_0, q6_k | 1.125 | int8 + 每 16 元素 fp16 scale |
+| I8BF | q5_k | 1.25 | int8 + per-16 fp16 scale + bias |
+| I4F | q4_k | 0.75 | nibble + per-32 (复制成 per-16) fp16 scale + bias |
+| F32 | f32 (alpha / beta) | 4 | 自然行布局 (向量 GEMV 用) |
 
-- 值部分是 **wave 布局**: 自然顺序的 8-float 块按轮转重排 (I8 系 2 路, I4 4 路), 使得 kernel 里 `Mul`/`MulAddDst` 逐元素乘加后, 一次 `BlockReduceSum` (per-8 求和) 直接得到每个量化组的部分和; x 在 kernel 内用带块跨步的 `Adds` 做一次对应重排
-- I4 的 nibble 解码用乘法技巧: 字节 b → half, 高 nibble = `CAST_RINT(b×0.0625 − 0.46875)` (小数部分恒在 ±0.47 内, 结果精确), 低 nibble = b − 16×高
-- 组数补齐到 64 的倍数, 补齐区 scale / bias 全零 (kernel 侧还会把对应 UB 清零, 否则 0 × 未初始化可能得 NaN)
-- 行跨度 64B 对齐; 总显存约 22GB (原始 GGUF 16.2GB), 重打包 + 上传约 12s
-- norm、ssm_a 等小 f32 向量原样上传; `ssm_conv1d.weight` 重排成 `[4][QKV_DIM]` 平面; conv 状态布局改为 `[3][QKV_DIM]` (与 CPU / CUDA 的 `[c][3]` 不同, 为了向量化)
+fractal 布局 (对应 `k_gemm` 的流水):
+
+- 行按 8 核均分 (nr = n/8, 要求 n 为 128 的倍数), 核内按 256 行分块, 块内按 128-k 切片
+- 每切片 = `[8 ki][NI ni]` 个 512B fractal + scale 区 `[ki][ni][16 half]` (+bias 区同样); fractal 内为 **[16k][16r] k 主序** — 这样 scale 恰好按 32B 块变化, kernel 里用 `src1BlkStride=0` 的块复用技巧逐 fractal 乘 scale, 完全不需要广播展开 (310P 的 Brcb/Gather 都慢到不可用); L1→L0B 用 `LoadData` 的 `ifTranspose` 转回标准 [16n][16k]
+- I4F 切片按半片组织 (半片 = 4 个 ki), 字节 i = 半片前 2 个 ki 的元素 i (低 nibble) | 后 2 个 ki 的元素 i (高 nibble) << 4
+- `token_embd.weight` 仍用 v1 的 wave 布局 (旧 I4 格式, f32 scale, 反量化逐位精确), 只给 `k_dq_*` 做 embedding 查行
+- 总显存约 23.2GB (v1 为 25.0), 重打包 + 上传约 21s
+
+norm、ssm_a 等小 f32 向量原样上传; `ssm_conv1d.weight` 重排成 `[4][QKV_DIM]` 平面; conv 状态布局 `[3][QKV_DIM]`。
 
 ## 3. Kernel
 
-全部在 `kernels_npu.cpp`, block_dim 8 (单核场景除外), 激活全部是 GM 上的 fp32。
+全部在 `kernels_npu.cpp`, block_dim 8 (k_gemv_f32t 为 n/8), 激活全部是 GM 上的 fp32。
 
 | kernel | 说明 |
 |---|---|
-| `k_gemv_{f32,i8,i8b,i4}` | 单 token 矩阵乘 y[n] = W·x。每核 n/8 行; 行加载 TQue 双缓冲与计算重叠, 小行 8 行一批拷贝; 反量化 + `Mul`/`MulAddDst` 逐元素乘加 + `BlockReduceSum` 得组和 ×scale (+bias×组内 x 和), 两级 `WholeReduceSum` 规约, 16 行一批写出 (无标量操作); 热路径全部 Level-0 调用 + mask 只设一次 |
-| `k_dq_{f32,i8,i8b,i4}` | 按行号表反量化整行到自然顺序 f32 (embedding 和自测用); scale 用 `Brcb` 展开成 per-8, wave→自然顺序用 DataCopy 的 32B 块跨步写 GM |
+| `k_gemm_{i8,i8b,i4}` | 核心 matmul, **decode (m=1) 和 prefill (m≤256) 同一个 kernel**。流水: MTE2 (量化切片) → 向量反量化 fp16 (cast + scale 块复用乘, I4F 先做 nibble 乘法解码) → MTE3 (L1) → MTE1 (转置加载 L0B) → mmad (fp16, fp32 累加, L0C 常驻累加整个 k) → 输出。m=1 时 x 在 kernel 内转 fp16 常驻 L0A (mmad gemv 模式); m>1 时 x 由 `k_pack_x` 预打包, 逐切片进 L1/L0A。事件全部用 TPipe `AllocEventID` 分配 |
+| `k_pack_x` | f32 [T][k] → fp16 zZ 切片布局 [kc][mi][ki][16m][16k], 三级双缓冲流水 |
+| `k_gemv_f32t` | alpha/beta (f32 自然行布局) 的 GEMV, 行常驻 UB (每核 8 行), T 个 token 在 kernel 内循环 |
+| `k_dq_{f32,i8,i8b,i4}` | 按行号表反量化整行到自然顺序 f32 (embedding 和自测用, 旧 wave 布局) |
 | `k_add_norm` | x += add (可空) + RMSNorm, 保存最后一个 token 的 hidden; token 分核轮转 |
 | `k_silu_mul` | g = silu(g)·u, 按核均分逐元素 |
 | `k_conv` | 因果 conv1d (核宽 4) + SiLU; 通道均分到核, 状态 3 个平面在 UB 轮转 |
-| `k_deltanet` | 每核 6 个 v 头顺序处理, 状态 S[128][128] 常驻 UB; S^T·k 和 S^T·q 用 `Brcb` 行标量广播 + 两次 Level-0 `Mul` (src1 块跨步 0) + 7 层二分树求和; S 的 rank-1 更新用同样跨步的 `MulAddDst`; β/decay/softplus 每 token 用 48 长度的向量算; q/k 归一化、门控 RMSNorm、silu(z) 都在同一 kernel |
-| `k_qk_rope` | (t, 头) 单元分核; RMSNorm + 交错 MRoPE + 写 KV cache。**cos/sin 不在 device 算** (无 Cos 指令): host 按 pos3 和分段规则算好 `[T][32]` 的 cos/sin 行随 chunk 上传 (与 CPU 版同用 host cosf, 数值一致) |
-| `k_attn` | (t, q头) 单元分核; 64 个 key 一批在线 softmax: 分数用 4 个四分之一段的跨步 `Mul`/`MulAddDst` + `WholeReduceSum`; 合并用 exp 槽位技巧 (sc 第 65 个位置放旧 max, 和分数一起减新 max 求 exp 得到校正系数 c); p·V 用 `Brcb` + 跨步 `Mul` + 树求和; 尾批把 V 的多余行清零 |
-
-Prefill 目前是**占位方案**: host 对每个 token 逐个调用 GEMV kernel (每 token 约 650 次 launch, 每次约 4µs)。正确性没问题但速度差, 真正的 prefill 需要 cube (fp16 GEMM), 见第 9 节。
+| `k_deltanet` | 每核 6 个 v 头顺序处理, 状态 S[128][128] 常驻 UB (与 v1 相同, 未重构) |
+| `k_qk_rope` | (t, 头) 单元分核; RMSNorm + 交错 MRoPE + 写 KV cache; cos/sin 由 host 算好上传 |
+| `k_attn` | **两遍扫描版**: 单元 = (16-query 块, q头), K/V 批 (48 key) 在块内所有 query 间复用; 第一遍只读 K 求每 query 全局 max, 第二遍直接 exp 累加 (无在线重缩放); softmax 全向量化 (max/sum 按 [16][8] 块跨步存放 + 块广播), 热循环无任何标量数据读取; 因果/尾批用 score 置 -3e38 屏蔽 |
 
 ## 4. 310P 的主要限制与踩过的坑
 
-实现中实测确认的 310P (dav_m200) 限制, 直接影响上面的设计:
+v1 实测的坑 (向量部分) 依然成立:
 
-1. 向量单元**没有整数移位指令** (`ShiftLeft/Right` 是 NOT_SUPPORT 且运行不报错输出垃圾) → nibble 用乘法 + RINT 解码
-2. Cast 组合不全: 无 int16→float 直转、half→int16 无 CAST_FLOOR; **不支持的组合同样静默输出垃圾**
-3. `Reciprocal`/`Rsqrt` 是低精度估计指令 (误差 ~4e-3), norm 必须用 `Sqrt`+`Div` (~1e-7)
-4. 同一 kernel 内循环中, **下一轮 DataCopy (MTE2) 不会等上一轮向量读取完成**, `PipeBarrier<PIPE_V>` 拦不住 MTE2; 覆盖正在读的缓冲前必须 `PipeBarrier<PIPE_ALL>` 或用 TQue。这类 bug 在各行数据相似的测试里完全隐形, 必须用随机数据测
-5. UB 未初始化区域可能是 inf/NaN 位型, 0 乘它得 NaN → 所有固定 repeat 数会扫到的 padding 区要清零
-6. 标量 `GetValue`/`SetValue` 走 S 管线, 与向量之间要 `PipeBarrier<PIPE_ALL>`; 同一向量管线内的依赖硬件保序, 无需 barrier
-7. Level-2 API 每次调用重设 mask, 标量开销大; 热路径用 Level-0 + `isSetMask=false`, kernel 开头 `SetVectorMask` 设满 (Level-2 调用结束会把 mask 恢复成满, 混用安全)
-8. `aicore` 函数里禁止 float 与无符号整数直接互转 (编译报错), 经 int64 中转
+1. 向量单元**没有整数移位指令** (`ShiftLeft/Right` 静默输出垃圾) → nibble 用乘法 + RINT 解码
+2. Cast 组合不全, 不支持的组合静默输出垃圾; `Reciprocal`/`Rsqrt` 低精度, norm 用 `Sqrt`+`Div`
+3. 同 kernel 内循环, 下一轮 DataCopy (MTE2) 不等上一轮向量读取, 覆盖前必须 `PipeBarrier<PIPE_ALL>` 或 TQue
+4. 未初始化 UB 可能是 NaN 位型, 固定 repeat 会扫到的 padding 区要清零
+5. 标量 `GetValue`/`SetValue` 走 S 管线, 与向量之间要 `PipeBarrier<PIPE_ALL>`
+6. Level-2 API 每次重设 mask; 热路径用 Level-0 + `isSetMask=false`
+
+v2 (cube 化) 新增的实测结论:
+
+7. **mmad / 数据通路** (dav_m200): `Mmad` 支持 fp16×fp16→f32; 布局 L0A zZ `[M1][K1][16m][16k]`、L0B `[K1][N1][16n][16k]`、L0C `[N1][M1][16m][16n]`; **m=1 时 mmad 进入 gemv 模式, A 按 k 连续读取且按 512B fractal 粒度访问** (A 片偏移必须 512B 对齐, L0A 末尾要留余量, 否则越界 507015); UB→L1 (`copy_ubuf_to_cbuf`)、L1→L0A/B (`LoadData`, 可转置)、CO1→UB 都可用, 但 CO1→UB 的 DataCopy 必须显式 `BlockMode::BLOCK_MODE_MATRIX` (默认 blockMode 走不到任何分支, **静默不拷贝**), blockLen 单位是 fractal
+8. **向量速率** (实测 ns/repeat): Mul/Add f32 和 f16 都是 ~2 周期/repeat (f32 32 元素/周期, f16 64), Cast i8→h ~1.2, BlockReduceSum ~1; **`MulAddDst(f32,h,h)` 5 周期/repeat (很慢)**; **`Brcb` 慢到不可用** (f32 ~3.6 周期/块, f16 ~9.6), **`Gather` 同样慢** (~24 周期/repeat) → 任何按块广播都要用布局技巧 (`src1BlkStride=0`) 而不是展开
+9. **同 V 管线内依赖硬件保序** (微基准证实依赖链与独立指令同速), 热循环里的 `PipeBarrier<PIPE_V>` 不需要; 指令发射开销 ~14ns/调用
+10. **片上共享缓存 ~16MB, 读带宽 ~1TB/s** (错相反复读 ≤16MB 区域实测 1010GB/s, ≥64MB 回落 ~195GB/s) → prefill 时 x/A 的反复读取几乎免费, k_gemm 用 L0C 常驻 [m][256] 的激进 tiling
+11. 手写跨管线事件的 id 必须用 TPipe `AllocEventID` 分配, 自己写死 0/1 会与框架内部冲突 (出现形状相关的"随机"错数)
+12. kernel 启动开销 ~5µs/次 (同 kernel 连发或交替都一样), 一个 decode token ~800 次启动 ≈ 4ms
 
 ## 5. 显存
 
-- 权重约 22GB (第 2 节); KV cache fp32, 每 token 128KB (ctx 4096 时 16 层 × 2 × 16MB = 512MB); DeltaNet 状态 201MB; 激活按 CHUNK = 256
-- 实测 ctx = 4096 时总占用 25.0GB (单芯片可用约 46GB, ECC 已关)
+- 权重约 21.3GB (第 2 节) + tok_embd 0.95GB; KV cache fp32, 每 token 128KB (ctx 4096 时 512MB); DeltaNet 状态 201MB; 激活按 CHUNK = 256; x 打包缓冲 8.9MB
+- 实测 ctx = 4096 时总占用 23.15GB (单芯片可用约 46GB, ECC 已关)
 
 ## 6. 调试接口 (正式功能不依赖, 但保留)
 
-- 环境变量 `QWEN_NPU_STOP=<层号>`: eval 跑完该层后直接返回; `QWEN_NPU_PHASE=<0/1/2/10/11/12>`: 进一步在该层的 FFN (gate/up/silu 后) 或 attention (QKV 矩阵乘 / rope / attn 后) 中途停下
-- `qwen_dbg(name, out, n)`: 把中间激活缓冲 (x / xn / qkv / z / a / b / o / qg / k / v / att / g / u / out) 拷回 host
-- `k_attn` 以 `T=-1` 启动进入 dump 模式 (当 T=1 跑, 每批的 p、树结果、ob 快照写到 att 缓冲之后), 配合独立测试台使用
+- 环境变量 `QWEN_NPU_STOP=<层号>` / `QWEN_NPU_PHASE=<0/1/2/10/11/12>`: 跑完该层 (或该层内某阶段) 直接返回
+- `QWEN_NPU_PROF=1` + `qwen_prof_dump()`: 逐 kernel 同步计时 (会拖慢, 小 kernel 数字被同步开销抬高)
+- `qwen_dbg(name, out, n)`: 把中间激活缓冲拷回 host
+- v1 的 `k_attn` dump 模式 (T=-1) 已随两遍扫描重写移除
 
 ## 7. 验证
 
-测试脚本在仓库外的实验目录 (`tests/npu_port`、`tests/npu_attn`、`tests/npu_api`、`tests/npu_gemv`, 依赖本机绝对路径, 未入库):
+测试脚本在仓库外的实验目录 (`tests/npu_port`、`tests/npu_attn`、`tests/npu_api`、`tests/npu_gemm`、`tests/npu_vlat`、`tests/npu_cube`、`tests/npu_l2`, 依赖本机绝对路径, 未入库):
 
-- `qwen_selftest`: 4 种格式各取真实 tensor, kernel 反量化 vs 标量参考**逐位一致** (最大差 0), GEMV vs 反量化行的 double 点积相对误差 ~1e-9
-- 逐层对比 (同进程加载 CPU 和 NPU 两个库, 对比 `qwen_hidden`): 6 token 和 100 token 下 65 层全部 ~1e-6 级
-- 300 token prefill (跨 chunk, 覆盖 conv/DeltaNet/KV 状态延续): logits 最大差 7.6e-6, top10 完全一致; 随后 20 步贪心解码**逐 token 与 CPU 相同**
-- `k_attn` 独立扫测: 随机 K/V/q, n = 1..192 (覆盖整批/尾批/多批在线 softmax 合并) 全部 < 1e-4; 另有一组"手术"模式 (均匀/批间不同/批内不同分数 + 指示器 V) 用于归因
-- Ascend C 基础 API 行为 (`tests/npu_api`): cast 链、reduce 语义、GatherMask、Brcb、MulAddDst 混合精度、nibble 解码等逐项与 host 参考对比
+- `qwen_selftest`: tok_embd 反量化 vs 标量参考逐位一致; 各 matmul 权重 (含 q4_k/q5_k/q6_k/q8_0/f32) m=1 GEMM vs 保存行的 f32 反量化 double 点积, 相对误差 ~1e-5 (阈值 5e-3)
+- 逐层对比 (`vs_cpu1`): 65 层相对误差 ~1e-3 级 (fp16 计算, 阈值 5e-3), 无 NaN
+- 300 token prefill (跨 chunk) + 20 步贪心解码: **逐 token 与 CPU 相同**; logits 最大绝对差 ~0.16 (CPU 最大值 10.5)
+- `tests/npu_gemm`: k_gemm 独立测试台 (三种格式 × m=1/5/16/33/100/256 × 各形状), 与 host 模拟 fp16 反量化的参考对比
+- `tests/npu_vlat`: 向量指令速率/发射开销/启动开销微基准 (第 4 节第 8/9/12 条的出处)
+- `tests/npu_cube`: mmad fractal 布局验证 (第 4 节第 7 条的出处)
 
-## 8. 性能 (v1, Atlas 300I Duo 单颗 310P3, ECC 关)
+## 8. 性能 (v2, Atlas 300I Duo 单颗 310P3, ECC 关)
 
-| 项目 | 速度 |
-|---|---|
-| prefill (300 token) | 1.9 tok/s |
-| decode (ctx ~320) | 1.8 tok/s |
-| 模型加载 (重打包 + 上传) | 14s |
+| 项目 | v2 | v1 |
+|---|---|---|
+| prefill (第一个 256 chunk) | ~230 tok/s | 1.9 tok/s |
+| prefill (1024 token) | 178 tok/s | - |
+| decode (ctx ~300) | 5.2 tok/s | 1.8 tok/s |
+| decode (ctx ~1024 / ~3100) | 5.1 / 4.8 tok/s | - |
+| 模型加载 (重打包 + 上传) | 21s | 14s |
 
-对比: CPU 版 decode 3.6 tok/s (16 线程), CUDA 第一版 62 tok/s。单颗 310P3 纯读显存带宽实测 204GB/s, 权重 22GB → decode 理论上限约 9-10 tok/s。目前 GEMV 有效带宽只有约 40GB/s: 纯向量管线约 70-93GB/s (独立压测), 加上每 token 约 650 次 kernel launch (~4µs/次) 和 attention/DeltaNet 的标量同步开销进一步拉低。
+分解 (QWEN_NPU_PROF, 数字含同步开销):
+
+- decode ~192ms/token: 基本全是 k_gemm 的权重 DMA。I8F/I8BF 独立压测有效带宽 ~195GB/s (纯读上限 204), I4F 受向量反量化限制只有 ~95GB/s (nibble 解码本身 191GB/s, scale/bias 的逐元素乘加把向量预算打爆); 混合后整体 ~145GB/s, 加上 lm_head 1.43GB 和 ~800 次启动
+- prefill 256-chunk ~1.35s: deltanet 430ms + attn 372ms + gemm 337ms (独立压测 25-35 TFLOPS, fp16 峰值 70T) + alpha/beta 92ms + pack_x 76ms + 小 kernel ~90ms。attn/deltanet 是 fp32 向量计算, 向量峰值只有 0.55 TFLOPS, 已接近其理论下限 → 下一步必须上 cube
 
 ## 9. 已知不足与下一步
 
-1. **prefill 换 cube**: 逐 token GEMV 只是正确性占位, cube fp16 GEMM 是数量级提升 (对应 CUDA 版 fp16+TC 的演进路线)
-2. **decode GEMV 优化**: R 行分组布局摊薄指令发射、x 转 half 走 `MulAddDst(float, half, half)`、kernel 融合减少 launch 数; 目标把有效带宽从 ~40 提到 150+ GB/s, decode 到 7-10 tok/s
-3. 双芯片张量并行 (每颗一半权重, 利用两倍显存带宽)、KV cache 量化、与 python 服务 (`qwen.py` / `server.py` / `router.py`) 的接入
-4. 自定义采样 (wasm) 未移植; 图片按计划固定走 CPU / CUDA, 不上 NPU
+1. **attention 上 cube** (最大的 prefill 瓶颈, 长上下文时也拖 decode): Q·K^T 和 P·V 都改成 fp16 mmad (flash 风格 tile), KV cache 顺势改 fp16 (显存减半); 向量只做 softmax。预计 attn 从 ~23ms/层降到 ~2ms/层
+2. **DeltaNet 重构** (第二大 prefill 瓶颈): 至少把 beta/decay/softplus/范数的逐 token 小向量操作在 chunk 内批量预计算, S 递推做双缓冲预取; 彻底方案是 chunk 化 (WY 表示) 上 cube
+3. **I4F 反量化向量瓶颈**: And 平面解码 (int16 视图 4 平面 + scale 预除) 约 -14% 向量量; 或者干脆 q4_k 也存成 I8BF (字节 +0.5/权重但 DMA-bound, decode 反而省 ~8ms, 代价显存 +2.8GB)
+4. 小 kernel 吞吐 (conv/silu/add_norm/f32t 的串行 barrier 循环)、alpha/beta 批量化
+5. 双芯片张量并行 (每颗一半权重, 两倍带宽)、KV cache 量化 (fp16→q8_0, 对应 CUDA 版演进)、与 python 服务接入
+6. 自定义采样 (wasm) 未移植; 图片按计划固定走 CPU / CUDA, 不上 NPU

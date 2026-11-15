@@ -19,7 +19,7 @@
 namespace {
 namespace Repack {
 
-enum { FMT_F32 = 0, FMT_I8 = 1, FMT_I8B = 2, FMT_I4 = 3 };
+enum { FMT_F32 = 0, FMT_I8 = 1, FMT_I8B = 2, FMT_I4 = 3, FMT_I8F = 4, FMT_I8BF = 5, FMT_I4F = 6 };
 
 int fmt_for(uint32_t t) {
     switch (t) {
@@ -31,6 +31,42 @@ int fmt_for(uint32_t t) {
     }
     fprintf(stderr, "❌ 不支持重打包的量化类型 %u\n", t);
     _Exit(1);
+}
+
+// cube GEMM 用的 fractal 布局格式 (matmul 权重)
+int fmt2_for(uint32_t t) {
+    switch (t) {
+        case Gguf::T_F32: return FMT_F32;
+        case Gguf::T_Q8_0: return FMT_I8F;
+        case Gguf::T_Q6_K: return FMT_I8F;
+        case Gguf::T_Q5_K: return FMT_I8BF;
+        case Gguf::T_Q4_K: return FMT_I4F;
+    }
+    fprintf(stderr, "❌ 不支持重打包的量化类型 %u\n", t);
+    _Exit(1);
+}
+
+int sb2_ni(int fmt) { return fmt == FMT_I8F ? 2304 : (fmt == FMT_I8BF ? 2560 : 1536); } // 每 16 行每 128k 字节
+int qb2_ni(int fmt) { return fmt == FMT_I4F ? 1024 : 2048; }
+
+inline uint16_t f2h(float f) { // f32 -> fp16 (RNE)
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    uint32_t sg = (u >> 16) & 0x8000, e = (u >> 23) & 0xFF, mnt = u & 0x7FFFFF;
+    if (e == 0) return (uint16_t)sg;
+    int ne = (int)e - 127 + 15;
+    if (ne <= 0) { // subnormal / 0
+        if (ne < -10) return (uint16_t)sg;
+        uint32_t full = mnt | 0x800000;
+        int shift = 14 - ne;
+        uint32_t mant = full >> shift, rest = full & ((1u << shift) - 1), halfbit = 1u << (shift - 1);
+        if (rest > halfbit || (rest == halfbit && (mant & 1))) mant++;
+        return (uint16_t)(sg | mant);
+    }
+    if (ne >= 31) return (uint16_t)(sg | 0x7BFF); // 溢出按最大值截断 (量化 scale 不会出现)
+    uint32_t mant = mnt >> 13, rest = mnt & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (mant & 1))) mant++;
+    return (uint16_t)(sg | ((uint32_t)(ne << 10) + mant)); // mant 上溢到 1024 时正确进位
 }
 
 uint64_t pad64(uint64_t x) { return (x + 63) / 64 * 64; }
@@ -79,19 +115,12 @@ inline void pack_row(int fmt, int k, const int8_t* nat, const float* s, const fl
     _Exit(1);
 }
 
-// 把 src (GGUF 原始格式) 的第 row0 起 nrows 行重打包到 dst (连续 nrows 行)
-inline void repack_rows(uint32_t t, const uint8_t* src, int k, int row0, int nrows, uint8_t* dst) {
-    int fmt = fmt_for(t);
-    uint64_t srb = Quants::row_bytes(t, k), drb = row_stride(fmt, k);
-    std::vector<int8_t> nat(k);
-    std::vector<float> s(k / 16 + 1), b(k / 16 + 1);
-    for (int r = 0; r < nrows; r++) {
-        const uint8_t* sp = src + (uint64_t)(row0 + r) * srb;
-        uint8_t* dp = dst + (uint64_t)r * drb;
-        if (t == Gguf::T_F32) {
-            memcpy(dp, sp, (uint64_t)k * 4);
-            continue;
-        }
+// 解码一行 GGUF 量化数据: nat 为整数值 (q4_k 为 0..15), s/b 为 per-16 的 f32 scale/bias
+inline void decode_row(uint32_t t, const uint8_t* sp, int k, int8_t* nat_p, float* s_p, float* b_p) {
+    int8_t* nat = nat_p;
+    float* s = s_p;
+    float* b = b_p;
+    {
         if (t == Gguf::T_Q8_0) { // 32 一块: d; per-16 scale 重复两份
             for (int i = 0; i < k / 32; i++) {
                 const Quants::BlockQ8_0* x = (const Quants::BlockQ8_0*)sp + i;
@@ -165,10 +194,73 @@ inline void repack_rows(uint32_t t, const uint8_t* src, int k, int row0, int nro
                 }
             }
         } else {
-            fprintf(stderr, "❌ repack_rows 不支持类型 %u\n", t);
+            fprintf(stderr, "❌ decode_row 不支持类型 %u\n", t);
             _Exit(1);
         }
+    }
+}
+
+// 把 src (GGUF 原始格式) 的第 row0 起 nrows 行重打包到 dst (连续 nrows 行, 旧 wave 布局, tok_embd 用)
+inline void repack_rows(uint32_t t, const uint8_t* src, int k, int row0, int nrows, uint8_t* dst) {
+    int fmt = fmt_for(t);
+    uint64_t srb = Quants::row_bytes(t, k), drb = row_stride(fmt, k);
+    std::vector<int8_t> nat(k);
+    std::vector<float> s(k / 16 + 1), b(k / 16 + 1);
+    for (int r = 0; r < nrows; r++) {
+        const uint8_t* sp = src + (uint64_t)(row0 + r) * srb;
+        uint8_t* dp = dst + (uint64_t)r * drb;
+        if (t == Gguf::T_F32) {
+            memcpy(dp, sp, (uint64_t)k * 4);
+            continue;
+        }
+        decode_row(t, sp, k, nat.data(), s.data(), b.data());
         pack_row(fmt, k, nat.data(), s.data(), b.data(), dp);
+    }
+}
+
+// 把第 row0 起 nb 行 (16 的倍数) 重打包为 k_gemm 的 fractal 布局块 (k/128 个切片) 写入 dst
+// 切片 = [8 ki][NI ni] 个 512B fractal ([16k][16r] k 主序) + scale [ki][ni][16 half] (+bias 同样)
+// I4F: 切片按半片组织 (半片 = 4 个 ki), 字节 i = lo(半片前 2ki 元素 i) | hi(后 2ki 元素 i)<<4
+inline void repack2_block(uint32_t t, const uint8_t* src, int k, int row0, int nb, uint8_t* dst) {
+    int fmt = fmt2_for(t);
+    int KS = k / 128, NI = nb / 16, ng = k / 16;
+    uint64_t srb = Quants::row_bytes(t, k);
+    int SB = sb2_ni(fmt), QB = qb2_ni(fmt);
+    std::vector<int8_t> nat((size_t)16 * k);
+    std::vector<float> s((size_t)16 * ng), b((size_t)16 * ng, 0);
+    for (int ni = 0; ni < NI; ni++) {
+        for (int rr = 0; rr < 16; rr++)
+            decode_row(t, src + (uint64_t)(row0 + ni * 16 + rr) * srb, k, &nat[(size_t)rr * k], &s[(size_t)rr * ng], &b[(size_t)rr * ng]);
+        for (int kc = 0; kc < KS; kc++) {
+            uint8_t* sl = dst + (uint64_t)kc * NI * SB;
+            if (fmt != FMT_I4F) {
+                for (int ki = 0; ki < 8; ki++) {
+                    int8_t* fp2 = (int8_t*)sl + (ki * NI + ni) * 256;
+                    for (int kk = 0; kk < 16; kk++)
+                        for (int rr = 0; rr < 16; rr++) fp2[kk * 16 + rr] = nat[(size_t)rr * k + kc * 128 + ki * 16 + kk];
+                }
+            } else {
+                for (int h = 0; h < 2; h++) {
+                    uint8_t* hb = sl + (size_t)h * NI * 512;
+                    for (int kil = 0; kil < 2; kil++)
+                        for (int kk = 0; kk < 16; kk++)
+                            for (int rr = 0; rr < 16; rr++) {
+                                int lo = nat[(size_t)rr * k + kc * 128 + (h * 4 + kil) * 16 + kk];
+                                int hi = nat[(size_t)rr * k + kc * 128 + (h * 4 + 2 + kil) * 16 + kk];
+                                hb[((kil * NI + ni) * 16 + kk) * 16 + rr] = (uint8_t)(lo | (hi << 4));
+                            }
+                }
+            }
+            int gdiv = fmt == FMT_I4F ? 32 : 16; // q4_k 的 decode_row 产出 per-32 scale, 其余 per-16
+            uint16_t* sp2 = (uint16_t*)(sl + (size_t)NI * QB);
+            for (int ki = 0; ki < 8; ki++)
+                for (int rr = 0; rr < 16; rr++) sp2[(ki * NI + ni) * 16 + rr] = f2h(s[(size_t)rr * ng + (kc * 128 + ki * 16) / gdiv]);
+            if (fmt != FMT_I8F) {
+                uint16_t* bp2 = sp2 + 8 * NI * 16;
+                for (int ki = 0; ki < 8; ki++)
+                    for (int rr = 0; rr < 16; rr++) bp2[(ki * NI + ni) * 16 + rr] = f2h(b[(size_t)rr * ng + (kc * 128 + ki * 16) / gdiv]);
+            }
+        }
     }
 }
 
