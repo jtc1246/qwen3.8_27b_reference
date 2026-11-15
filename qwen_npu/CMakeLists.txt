@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.16)
+project(qwen_npu LANGUAGES CXX)
+# 需要链接 CANN 的 glibc 动态库, 无法 musl 静态链接; so 通过 RPATH 自带依赖路径
+set(CANN_HOME "$ENV{CANN_HOME}")
+if(NOT CANN_HOME)
+    message(FATAL_ERROR "❌ 需要设置环境变量 CANN_HOME")
+endif()
+set(ASCEND_CANN_PACKAGE_PATH "${CANN_HOME}" CACHE STRING "CANN installation directory")
+set(SOC_VERSION "Ascend310P3" CACHE STRING "Target Ascend SoC")
+set(RUN_MODE "npu")
+set(ASCEND_KERNEL_LAUNCH_ONLY ON)
+include("${CANN_HOME}/x86_64-linux/tikcpp/ascendc_kernel_cmake/ascendc.cmake")
+ascendc_library(qwen_npu_kernels STATIC kernels_npu.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/qwen.cpp")
+    add_library(qwen_npu SHARED qwen.cpp)
+    target_compile_features(qwen_npu PRIVATE cxx_std_17)
+    target_include_directories(qwen_npu PRIVATE "${CANN_HOME}/x86_64-linux/include")
+    target_link_directories(qwen_npu PRIVATE "${CANN_HOME}/x86_64-linux/lib64")
+    target_link_libraries(qwen_npu PRIVATE qwen_npu_kernels ascendcl)
+    target_link_options(qwen_npu PRIVATE
+        -Wl,-rpath,${CANN_HOME}/x86_64-linux/lib64
+        -Wl,-rpath,/usr/local/Ascend/driver/lib64/driver
+        -Wl,-rpath,/usr/local/Ascend/driver/lib64/common
+        -Wl,-rpath-link,${CANN_HOME}/x86_64-linux/lib64
+        -Wl,-rpath-link,/usr/local/Ascend/driver/lib64/driver
+        -Wl,-rpath-link,/usr/local/Ascend/driver/lib64/common)
+    set_target_properties(qwen_npu PROPERTIES OUTPUT_NAME qwen_npu PREFIX "lib")
+endif()

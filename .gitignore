@@ -1,4 +1,5 @@
 cmake_build/
+compile.log
 __pycache__/
 *.gguf
 /logs/

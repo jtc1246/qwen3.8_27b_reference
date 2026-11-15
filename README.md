@@ -1,4 +1,4 @@
-# Qwen3.8-27B 参考实现 (CPU / CUDA)
+# Qwen3.8-27B 参考实现 (CPU / CUDA / NPU)
 
 从零实现的 Qwen3.8-27B 推理。C++ 部分没有第三方依赖, 直接读取 GGUF 量化模型 (目前使用 [bartowski/Qwen3.8-27B-GGUF](https://huggingface.co/bartowski/Qwen3.8-27B-GGUF) 的 `Q4_K_M`), 完成文本主干的前向和采样; python 部分负责 tokenizer、图片和 OpenAI 兼容服务。
 
@@ -7,6 +7,7 @@
 - [docs/model.md](docs/model.md): 模型结构、计算公式、GGUF 格式与 Q4_K_M 量化方式
 - [docs/cpu_impl.md](docs/cpu_impl.md): C++ 实现细节
 - [docs/cuda_impl.md](docs/cuda_impl.md): CUDA 实现 (`qwen_cuda/`, 只依赖驱动的 driver API) 与 CPU 版的差异、验证和性能
+- [docs/npu_impl.md](docs/npu_impl.md): 华为昇腾 310P 实现 (`qwen_npu/`, 当前为正确性完成的 v1, 性能未优化, 未接入 python 服务)
 - [docs/benchmark.md](docs/benchmark.md): 与 llama.cpp、vLLM 的速度对比 (环境、版本、方法), 以及 llama.cpp 激活量化的精度实测
 - [docs/python_impl.md](docs/python_impl.md): python 部分 (服务、路由、tokenizer、拼 prompt、缓存) 的完整实现和内部机制
 - [docs/custom_sampler.md](docs/custom_sampler.md): 自定义采样 (CUDA) 的使用方式 (接口、代码写法、token 范围、样例) 和内部实现
@@ -88,6 +89,15 @@ export WAMR_DIR=/path/to/wasm-micro-runtime-WAMR-2.4.5 # 可选 (环境准备第
 ```
 
 产物是 `qwen_cuda/cmake_build/libqwen_cuda.so`, 唯一的动态依赖是驱动的 `libcuda.so.1`。
+
+NPU 版本 (需要昇腾驱动和 CANN toolkit + ops 包, 用系统 g++ 而不是 musl, 详见 [docs/npu_impl.md](docs/npu_impl.md)):
+
+```bash
+export CANN_HOME=/path/to/ascend-toolkit/latest
+./qwen_npu/compile.sh
+```
+
+产物是 `qwen_npu/cmake_build/libqwen_npu.so`, 运行前需 `source $CANN_HOME/set_env.sh`; 目前通过 ctypes 直接加载使用, 尚未接入 server.py。
 
 ## 运行
 
