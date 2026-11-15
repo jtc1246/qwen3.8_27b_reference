@@ -905,3 +905,404 @@ extern "C" __global__ __aicore__ void k_gemv_f32t(GM_ADDR w, GM_ADDR x, GM_ADDR 
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 }
+
+// ==================== W4A8 路径 (int4 权重 + u8 x, u8xu8 mmad; 布局与推导见 docs/npu_impl.md) ====================
+// 权重布局: 每核连续, 每 256 行块: 每 sp (组对 2u,2u+1): [4t][NI][512B 包字节] + meta [s'_lo fp16 NI*32B][s'_hi=s/16][W2_lo f32 NI*64B][W2_hi]
+// 包字节 (fractal 内 32r+2n+p) = lo:q(组2u, k=t*32+p*16+r)+8 | hi:q(组2u+1, 同k)+8 << 4; W2 = h2f(存储s')*Sum(存储nib)
+// decode (k_gemm_w8d): And x2 提两组转置源 fractal -> b8 转置加载 -> u8xu8 mmad 组内 s32 精确累加 -> 组 scale/修正到 f32
+// prefill (k_gemm_w8p): 五平面 And 拆解反量化 fp16 -> mmad (同老路径精度); x 用 k_pack_x 的 fp16 zZ
+// x 量化 (k_qx8): per-token per-128 组对称 int8 (存 u8, 零点 128), f32 域 RINT 与 host lrintf 逐字节一致
+
+extern "C" __global__ __aicore__ void k_qx8(GM_ADDR x, GM_ADDR xrep, GM_ADDR xaux, int32_t k)
+{
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tb;
+    pipe.InitBuffer(tb, 230 * 1024);
+    LocalTensor<uint8_t> ub = tb.Get<uint8_t>();
+    int KS = k / 128, KH = k >= 16384 ? 2 : 1, khalf = k / KH, KSH = KS / KH;
+    // UB: xf [k]f32 70KB | ab [k]f32 70KB (abs/v/求和复用) | xh [k]half 35KB | m64 [KS][64]f32 35KB | xu [k]u8 17.5KB | sc 小量
+    LocalTensor<float> xf = ub.ReinterpretCast<float>();
+    LocalTensor<float> ab = ub[71680].ReinterpretCast<float>();
+    LocalTensor<half> xh = ub[143360].ReinterpretCast<half>();
+    LocalTensor<float> m64 = ub[178688].ReinterpretCast<float>();
+    LocalTensor<uint8_t> xu = ub[214016];
+    LocalTensor<float> sc = ub[231936].ReinterpretCast<float>(); // 到 235520 只有 896 f32: amax/sx/... 分开放
+    LocalTensor<float> amax = sc; // [KS<=136]
+    LocalTensor<float> sx = sc[160];
+    LocalTensor<float> c127 = sc[320];
+    LocalTensor<float> tt = sc[480]; // sinv -> 组和 -> ncx1
+    LocalTensor<float> nc2 = sc[640];
+    LocalTensor<float> sinvd = m64; // [KS][8] 借 m64 区 (与 m64 生命期错开: m64 第二次使用前 sinvd 已消费...) 不行, 放 xh 后段? 直接借 xu 后空间也不够 -- 用 m64 区尾部
+    GlobalTensor<float> gx, ga;
+    GlobalTensor<uint8_t> gr;
+    gx.SetGlobalBuffer((__gm__ float*)x, k);
+    gr.SetGlobalBuffer((__gm__ uint8_t*)xrep, (uint64_t)KH * 4 * khalf);
+    ga.SetGlobalBuffer((__gm__ float*)xaux, (uint64_t)KS * 8 * 3);
+    AscendC::DataCopy(xf, gx, k);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::SetVectorMask<float>(FULL, FULL);
+    AscendC::Abs(ab, xf, k);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Max<float, false>(m64, ab, ab[64], FULL, (uint8_t)KS, AscendC::BinaryRepeatParams(1, 1, 1, 8, 16, 16)); // 组内两半逐元素 max
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::BlockReduceMax<float>(ab, m64, KS, 64, 1, 1, 8); // [KS][8] (借 ab 区, abs 已折叠进 m64)
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::BlockReduceMax<float>(amax, ab, KS / 8, 64, 1, 1, 8); // [KS]
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Maxs(amax, amax, 1e-30f, KS);
+    AscendC::Duplicate(c127, 127.0f, KS);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(sx, amax, 1.0f / 127.0f, KS);
+    AscendC::Div(tt, c127, amax, KS); // sinv
+    AscendC::PipeBarrier<PIPE_V>();
+    sinvd = m64; // [KS][8], m64 的 amax 内容已消费
+    AscendC::Brcb(sinvd, tt, (uint8_t)(KS / 8), AscendC::BrcbRepeatParams(1, 8));
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::BinaryRepeatParams bgs(1, 1, 0, 16, 16, 1); // 每 repeat 半组 (64), src1 块内复用, 每 repeat 前进一块
+    AscendC::Mul<float, false>(ab, xf, sinvd, FULL, (uint8_t)KS, bgs);
+    AscendC::Mul<float, false>(ab[64], xf[64], sinvd, FULL, (uint8_t)KS, bgs);
+    AscendC::PipeBarrier<PIPE_V>();
+    // f32 域 RINT 取整, 整数链全程精确 (与 host lrintf 逐字节一致)
+    AscendC::Cast(xf.ReinterpretCast<int32_t>(), ab, RoundMode::CAST_RINT, k); // x 已消费, 借 xf 放 i32
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(ab, xf.ReinterpretCast<int32_t>(), RoundMode::CAST_NONE, k);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Adds(ab, ab, 128.0f, k);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(xh, ab, RoundMode::CAST_NONE, k); // 整数 <=255, 精确
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(xu, xh, RoundMode::CAST_NONE, k);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(xh, xu, RoundMode::CAST_NONE, k); // u8 -> half (精确), 求 Sx
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(ab, xh, RoundMode::CAST_NONE, k);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Add<float, false>(m64, ab, ab[64], FULL, (uint8_t)KS, AscendC::BinaryRepeatParams(1, 1, 1, 8, 16, 16));
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::WholeReduceSum<float>(tt, m64, 64, KS, 1, 1, 8); // sum(xu) 每组
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Adds(tt, tt, -16384.0f, KS); // Sx = sum - 128*128
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls(tt, tt, -8.0f, KS);
+    AscendC::Muls(nc2, sx, -128.0f, KS);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Mul(tt, tt, sx, KS); // -8*Sx*sx
+    AscendC::PipeBarrier<PIPE_V>();
+    LocalTensor<float> aux = ab; // [KS*8*3] <= 3264 f32, ab 区已消费完
+    AscendC::Brcb(aux, sx, (uint8_t)(KS / 8), AscendC::BrcbRepeatParams(1, 8));
+    AscendC::Brcb(aux[(uint32_t)KS * 8], tt, (uint8_t)(KS / 8), AscendC::BrcbRepeatParams(1, 8));
+    AscendC::Brcb(aux[(uint32_t)KS * 16], nc2, (uint8_t)(KS / 8), AscendC::BrcbRepeatParams(1, 8));
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::DataCopy(ga, aux, KS * 8 * 3);
+    for (int h = 0; h < KH; h++)
+        for (int c = 0; c < 4; c++) // 副本 c: 半内组 g'=4j+c 的 128B 放到 512*j
+            AscendC::DataCopy(gr[(uint64_t)(h * 4 + c) * khalf], xu[(h * KSH + c) * 128], AscendC::DataCopyParams((uint16_t)(KSH / 4), 4, 12, 12));
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+extern "C" __global__ __aicore__ void k_gemm_w8d(GM_ADDR w, GM_ADDR xrep, GM_ADDR xaux, GM_ADDR y, int32_t n, int32_t k)
+{
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ub_buf;
+    AscendC::TBuf<AscendC::TPosition::A1> l1_buf;
+    AscendC::TBuf<AscendC::TPosition::A2> l0a_buf;
+    AscendC::TBuf<AscendC::TPosition::B2> l0b_buf;
+    AscendC::TBuf<AscendC::TPosition::CO1> l0c_buf;
+    pipe.InitBuffer(ub_buf, 230 * 1024);
+    pipe.InitBuffer(l1_buf, 200 * 1024);
+    pipe.InitBuffer(l0a_buf, 64 * 1024);
+    pipe.InitBuffer(l0b_buf, 64 * 1024);
+    pipe.InitBuffer(l0c_buf, 256 * 1024);
+    LocalTensor<uint8_t> ub = ub_buf.Get<uint8_t>();
+    LocalTensor<uint8_t> l1 = l1_buf.Get<uint8_t>();
+    LocalTensor<uint8_t> l0a = l0a_buf.Get<uint8_t>();
+    LocalTensor<uint8_t> l0b = l0b_buf.Get<uint8_t>();
+    LocalTensor<int32_t> l0c = l0c_buf.Get<int32_t>();
+    int cores = (int)AscendC::GetBlockNum(), core = (int)AscendC::GetBlockIdx();
+    int nr = n / cores, KS = k / 128, SP = KS / 2;
+    int KH = k >= 16384 ? 2 : 1, khalf = k / KH, KSH = KS / KH; // k 两半时 L0A 重载
+    // UB 布局
+    LocalTensor<uint8_t> qbuf0 = ub, qbuf1 = ub[36864]; // 每 sp 最大 16*2176=34816
+    LocalTensor<uint8_t> wb0 = ub[73728], wb1 = ub[106496]; // And 输出, 每组 32KB
+    LocalTensor<int32_t> co0 = ub[139264].ReinterpretCast<int32_t>(), co1 = ub[155648].ReinterpretCast<int32_t>(); // drain 每组 16KB
+    LocalTensor<float> acc = ub[172032].ReinterpretCast<float>(); // y 累加 [256]
+    LocalTensor<float> cp = ub[173056].ReinterpretCast<float>(); // 紧凑 C f32 [256]
+    LocalTensor<float> sf = ub[174080].ReinterpretCast<float>(); // s' f32 [256]
+    LocalTensor<float> wf = ub[175104].ReinterpretCast<float>(); // W2 f32 [256]
+    LocalTensor<float> sr = ub[176128].ReinterpretCast<float>(); // s_raw f32 [256]
+    LocalTensor<float> xa = ub[177152].ReinterpretCast<float>(); // xaux 常驻 [KS][8]*3 <= 13056B
+    LocalTensor<uint16_t> mk = ub[190464].ReinterpretCast<uint16_t>(); // And 掩码 [16]+[16]
+    GlobalTensor<uint8_t> gw, gx;
+    GlobalTensor<float> ga, gy;
+    uint64_t wtotal = 0;
+    int nblk = (nr + 255) / 256;
+    for (int b = 0; b < nblk; b++) {
+        int nb = nr - b * 256 < 256 ? nr - b * 256 : 256;
+        wtotal += (uint64_t)SP * (nb / 16) * 2240;
+    }
+    gw.SetGlobalBuffer((__gm__ uint8_t*)w + (uint64_t)core * wtotal, wtotal);
+    gx.SetGlobalBuffer((__gm__ uint8_t*)xrep, (uint64_t)KH * 4 * khalf);
+    ga.SetGlobalBuffer((__gm__ float*)xaux, (uint64_t)KS * 8 * 3);
+    gy.SetGlobalBuffer((__gm__ float*)y, n);
+    AscendC::SetVectorMask<half>(FULL, FULL);
+    AscendC::Duplicate(mk, (uint16_t)0x0F0F, 16);
+    AscendC::Duplicate(mk[16], (uint16_t)0xF0F0, 16);
+    AscendC::DataCopy(xa, ga, KS * 8 * 3);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::BinaryRepeatParams bmk(1, 1, 0, 8, 8, 0); // src1 单块复用不前进 (And 掩码 / 组标量广播)
+    AscendC::BinaryRepeatParams bpp(1, 1, 1, 8, 8, 8);
+    AscendC::UnaryRepeatParams cp8(1, 1, 8, 4);
+    AscendC::UnaryRepeatParams cpa(1, 1, 8, 8);
+    AscendC::UnaryRepeatParams cps(1, 1, 2, 32); // C fractal 行0 紧凑化: src 跨 1KB, dst 跨 64B
+    int cur_h = -1;
+    AscendC::TEventID eq[2], eqf[2], ewb[2], ewbf[2], ebl[2], eblf[2], em[2], emf[2], ec[2], ecf[2];
+    for (int i = 0; i < 2; i++) {
+        eq[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>();
+        eqf[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>();
+        ewb[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE3>();
+        ewbf[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_V>();
+        ebl[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE1>();
+        eblf[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE1_MTE3>();
+        em[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE1_M>();
+        emf[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::M_MTE1>();
+        ec[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_M>(); // drain 读完 -> L0C 槽可重用
+        ecf[i] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::M_V>(); // mmad 完成 -> 可 drain
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eqf[i]);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ewbf[i]);
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE3>(eblf[i]);
+        AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(emf[i]);
+        AscendC::SetFlag<AscendC::HardEvent::V_M>(ec[i]);
+    }
+    uint64_t woff = 0;
+    for (int b = 0; b < nblk; b++) {
+        int nb = nr - b * 256 < 256 ? nr - b * 256 : 256;
+        int NI = nb / 16, nfr = 4 * NI; // 每组 fractal 数
+        int spb = nfr * 512 + NI * 192;
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate(acc, 0.0f, 256); // Level-2, 结束会把 mask 恢复为满
+        AscendC::PipeBarrier<PIPE_V>();
+        int pg[2][3], npend = 0; // 待 drain 组队列 {g, gi, qbuf 奇偶}, 滞后 2 组发射, 避免 drain 的 WaitFlag 挡住后续 And
+// drain + epilogue (V); 宏展开 (aicore 不支持 lambda)
+#define DRAIN(g_, gi_, qp_) { \
+            int p2_ = (g_) & 1; \
+            LocalTensor<uint8_t> qb_ = (qp_) ? qbuf1 : qbuf0; \
+            LocalTensor<int32_t> co_ = p2_ ? co1 : co0; \
+            AscendC::WaitFlag<AscendC::HardEvent::M_V>(ecf[p2_]); \
+            AscendC::DataCopyEnhancedParams ep_; \
+            ep_.blockMode = AscendC::BlockMode::BLOCK_MODE_MATRIX; \
+            AscendC::DataCopy(co_, l0c[p2_ * 16 * 256], AscendC::DataCopyParams(1, (uint16_t)NI, 0, 0), ep_); \
+            AscendC::SetFlag<AscendC::HardEvent::V_M>(ec[p2_]); \
+            AscendC::SetVectorMask<float>(0, 0xFFFF); \
+            AscendC::Cast<float, int32_t, false>(cp, co_, RoundMode::CAST_NONE, FULL, (uint8_t)NI, cps); \
+            AscendC::SetVectorMask<float>(FULL, FULL); \
+            LocalTensor<half> mh_ = qb_[nfr * 512].ReinterpretCast<half>(); \
+            LocalTensor<float> mw_ = qb_[nfr * 512 + NI * 64 + (gi_) * NI * 64].ReinterpretCast<float>(); \
+            AscendC::Cast<float, half, false>(sf, mh_[(gi_) * NI * 16], RoundMode::CAST_NONE, FULL, (uint8_t)(NI / 4), cp8); \
+            AscendC::PipeBarrier<PIPE_V>(); \
+            AscendC::Mul<float, false>(sr, sf, xa[KS * 8 + (g_) * 8], FULL, (uint8_t)(NI / 4), bmk); /* s_raw*(-cx1) */ \
+            AscendC::Muls<float, false>(sf, sf, (gi_) ? 1.0f / 16.0f : 1.0f, FULL, (uint8_t)(NI / 4), cpa); /* hi 组的 /16 在 f32 域派生 (fp16 存 s/16 会掉次正规被 flush) */ \
+            AscendC::Mul<float, false>(wf, mw_, xa[2 * KS * 8 + (g_) * 8], FULL, (uint8_t)(NI / 4), bmk); \
+            AscendC::PipeBarrier<PIPE_V>(); \
+            AscendC::Mul<float, false>(sf, sf, xa[(g_) * 8], FULL, (uint8_t)(NI / 4), bmk); \
+            AscendC::MulAddDst<float, float, false>(acc, cp, sf, FULL, (uint8_t)(NI / 4), bpp); \
+            AscendC::Add<float, false>(acc, acc, wf, FULL, (uint8_t)(NI / 4), bpp); \
+            AscendC::PipeBarrier<PIPE_V>(); \
+            AscendC::Add<float, false>(acc, acc, sr, FULL, (uint8_t)(NI / 4), bpp); \
+            AscendC::SetVectorMask<half>(FULL, FULL); \
+            if ((gi_) == 1) AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eqf[qp_]); \
+        }
+        for (int sp = 0; sp < SP; sp++) {
+            int p = sp & 1;
+            int g0 = 2 * sp, h = g0 / KSH;
+            if (h != cur_h) { // 装入该 k 半的 xrep 到 L0A (整段驻留)
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::DataCopy(l1[131072], gx[(uint64_t)h * 4 * khalf], 4 * khalf);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::LoadData(l0a, l1[131072], AscendC::LoadData2DParams(0, (uint16_t)(4 * khalf / 512), 1, 0, 0, false, 0));
+                AscendC::PipeBarrier<PIPE_ALL>();
+                cur_h = h;
+            }
+            LocalTensor<uint8_t> qb = p ? qbuf1 : qbuf0;
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eqf[p]);
+            AscendC::DataCopy(qb, gw[woff + (uint64_t)sp * spb], spb);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(eq[p]);
+            for (int gi = 0; gi < 2; gi++) { // 组 2sp+gi: And -> L1 -> L0B -> mmad
+                int g = g0 + gi, gh = g - h * KSH, p2 = g & 1;
+                if (npend == 2) { // 先发滞后的 drain (不依赖本 sp 数据)
+                    DRAIN(pg[0][0], pg[0][1], pg[0][2]);
+                    pg[0][0] = pg[1][0];
+                    pg[0][1] = pg[1][1];
+                    pg[0][2] = pg[1][2];
+                    npend = 1;
+                }
+                if (gi == 0) AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eq[p]);
+                LocalTensor<uint8_t> wbx = p2 ? wb1 : wb0;
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ewbf[p2]);
+                AscendC::And<uint16_t, false>(wbx.ReinterpretCast<uint16_t>(), qb.ReinterpretCast<uint16_t>(), mk[gi * 16], FULL, (uint8_t)(nfr * 2), bmk);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ewb[p2]);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ewb[p2]);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE3>(eblf[p2]);
+                AscendC::DataCopy(l1[p2 * 32768], wbx, nfr * 512);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ewbf[p2]);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE1>(ebl[p2]);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE1>(ebl[p2]);
+                AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(emf[p2]);
+                AscendC::LoadData(l0b[p2 * 32768], l1[p2 * 32768], AscendC::LoadData2DParams(0, (uint16_t)nfr, 1, 0, 0, true, 0));
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE3>(eblf[p2]);
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(em[p2]);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(em[p2]);
+                AscendC::WaitFlag<AscendC::HardEvent::V_M>(ec[p2]);
+                AscendC::MmadParams mm(1, (uint16_t)nb, 128, 0, false, true);
+                AscendC::Mmad(l0c[p2 * 16 * 256], l0a[(gh & 3) * khalf + 512 * (gh >> 2)], l0b[p2 * 32768], mm);
+                AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(emf[p2]);
+                AscendC::SetFlag<AscendC::HardEvent::M_V>(ecf[p2]);
+                pg[npend][0] = g;
+                pg[npend][1] = gi;
+                pg[npend][2] = p;
+                npend++;
+            }
+        }
+        for (int i = 0; i < npend; i++) DRAIN(pg[i][0], pg[i][1], pg[i][2]); // 清尾
+#undef DRAIN
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::DataCopy(gy[(uint64_t)core * nr + b * 256], acc, nb);
+        AscendC::PipeBarrier<PIPE_ALL>();
+        woff += (uint64_t)SP * spb;
+    }
+    for (int i = 0; i < 2; i++) {
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(eqf[i]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ewbf[i]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE3>(eblf[i]);
+        AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(emf[i]);
+        AscendC::WaitFlag<AscendC::HardEvent::V_M>(ec[i]);
+    }
+    AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+// m>1 prefill: W4A8 布局 -> 五平面拆解反量化 fp16 -> mmad (fp16, fp32 累加整个 k)
+// xp: k_pack_x 的 fp16 zZ [kc][mi][ki][16m][16k]; y [m][n] f32
+extern "C" __global__ __aicore__ void k_gemm_w8p(GM_ADDR w, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k)
+{
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ub_buf;
+    AscendC::TBuf<AscendC::TPosition::A1> l1_buf;
+    AscendC::TBuf<AscendC::TPosition::A2> l0a_buf;
+    AscendC::TBuf<AscendC::TPosition::B2> l0b_buf;
+    AscendC::TBuf<AscendC::TPosition::CO1> l0c_buf;
+    pipe.InitBuffer(ub_buf, 230 * 1024);
+    pipe.InitBuffer(l1_buf, 256 * 1024);
+    pipe.InitBuffer(l0a_buf, 64 * 1024);
+    pipe.InitBuffer(l0b_buf, 64 * 1024);
+    pipe.InitBuffer(l0c_buf, 256 * 1024);
+    LocalTensor<uint8_t> ub = ub_buf.Get<uint8_t>();
+    LocalTensor<uint8_t> l1 = l1_buf.Get<uint8_t>();
+    LocalTensor<half> l0a = l0a_buf.Get<half>();
+    LocalTensor<half> l0b = l0b_buf.Get<half>();
+    LocalTensor<float> l0c = l0c_buf.Get<float>();
+    int cores = (int)AscendC::GetBlockNum(), core = (int)AscendC::GetBlockIdx();
+    int nr = n / cores, KS = k / 128, SP = KS / 2, M1 = (m + 15) / 16;
+    // UB: qbuf 单缓冲 35KB | tmp_i16 32KB | t2 32KB | S_even 32KB | S_odd 32KB | sdup 2KB | co 2x16KB
+    LocalTensor<uint8_t> qb = ub;
+    LocalTensor<int16_t> ti = ub[36864].ReinterpretCast<int16_t>();
+    LocalTensor<half> t2 = ub[69632].ReinterpretCast<half>();
+    LocalTensor<half> se = ub[102400].ReinterpretCast<half>();
+    LocalTensor<half> so = ub[135168].ReinterpretCast<half>();
+    LocalTensor<half> sd = ub[167936].ReinterpretCast<half>(); // sdup [4NI][16]
+    LocalTensor<half> sr16 = ub[172032].ReinterpretCast<half>(); // s_raw 临时 [NI*16]
+    LocalTensor<float> co0 = ub[176128].ReinterpretCast<float>(), co1 = ub[192512].ReinterpretCast<float>();
+    LocalTensor<uint16_t> mk = ub[225280].ReinterpretCast<uint16_t>(); // 掩码 [16]x5: 0x000F 0x0F00 0x00F0 0x7000 0x8000
+    uint64_t wtotal = 0;
+    int nblk = (nr + 255) / 256;
+    for (int b = 0; b < nblk; b++) {
+        int nb = nr - b * 256 < 256 ? nr - b * 256 : 256;
+        wtotal += (uint64_t)SP * (nb / 16) * 2240;
+    }
+    GlobalTensor<uint8_t> gw;
+    GlobalTensor<half> gxp;
+    GlobalTensor<float> gy;
+    gw.SetGlobalBuffer((__gm__ uint8_t*)w + (uint64_t)core * wtotal, wtotal);
+    gxp.SetGlobalBuffer((__gm__ half*)xp, (uint64_t)KS * M1 * 2048);
+    gy.SetGlobalBuffer((__gm__ float*)y, (uint64_t)m * n);
+    AscendC::SetVectorMask<half>(FULL, FULL);
+    AscendC::Duplicate(mk, (uint16_t)0x000F, 16);
+    AscendC::Duplicate(mk[16], (uint16_t)0x0F00, 16);
+    AscendC::Duplicate(mk[32], (uint16_t)0x00F0, 16);
+    AscendC::Duplicate(mk[48], (uint16_t)0x7000, 16);
+    AscendC::Duplicate(mk[64], (uint16_t)0x8000, 16);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::BinaryRepeatParams bmk(1, 1, 0, 8, 8, 0); // And: src1 单块复用
+    AscendC::BinaryRepeatParams bph(1, 1, 1, 8, 8, 8);
+    AscendC::BinaryRepeatParams bsc(1, 1, 0, 16, 16, 1); // scale: 每 fractal 一块
+    AscendC::UnaryRepeatParams cpa(1, 1, 8, 8);
+    uint64_t woff = 0;
+    for (int b = 0; b < nblk; b++) {
+        int nb = nr - b * 256 < 256 ? nr - b * 256 : 256;
+        int NI = nb / 16, nfr = 4 * NI; // 每 sp 的 chunk 数 (= 每组每平面 fractal 数)
+        int spb = nfr * 512 + NI * 192;
+        for (int g = 0; g < KS; g++) {
+            int sp = g / 2, gi = g & 1;
+            if (gi == 0) {
+                AscendC::PipeBarrier<PIPE_ALL>(); // 单缓冲: 等上一 sp 的向量消费完
+                AscendC::DataCopy(qb, gw[woff + (uint64_t)sp * spb], spb);
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
+            int nby2 = nfr * 256; // u16 lane 数
+            if (gi == 0) { // lo 组: And 0x000F -> se (x1), And 0x0F00 -> so (x256)
+                AscendC::And<uint16_t, false>(ti.ReinterpretCast<uint16_t>(), qb.ReinterpretCast<uint16_t>(), mk, FULL, (uint8_t)(nby2 / 128), bmk);
+                AscendC::Cast<half, int16_t, false>(se, ti, RoundMode::CAST_NONE, FULL, (uint8_t)(nby2 / 128), cpa);
+                AscendC::And<uint16_t, false>(ti.ReinterpretCast<uint16_t>(), qb.ReinterpretCast<uint16_t>(), mk[16], FULL, (uint8_t)(nby2 / 128), bmk);
+                AscendC::Cast<half, int16_t, false>(so, ti, RoundMode::CAST_NONE, FULL, (uint8_t)(nby2 / 128), cpa);
+                AscendC::Muls<half, false>(so, so, (half)(1.0f / 256.0f), FULL, (uint8_t)(nby2 / 128), cpa);
+            } else { // hi 组: And 0x00F0 -> se (x16); 0x7000/0x8000 相减 -> so (x4096)
+                AscendC::And<uint16_t, false>(ti.ReinterpretCast<uint16_t>(), qb.ReinterpretCast<uint16_t>(), mk[32], FULL, (uint8_t)(nby2 / 128), bmk);
+                AscendC::Cast<half, int16_t, false>(se, ti, RoundMode::CAST_NONE, FULL, (uint8_t)(nby2 / 128), cpa);
+                AscendC::Muls<half, false>(se, se, (half)(1.0f / 16.0f), FULL, (uint8_t)(nby2 / 128), cpa);
+                AscendC::And<uint16_t, false>(ti.ReinterpretCast<uint16_t>(), qb.ReinterpretCast<uint16_t>(), mk[48], FULL, (uint8_t)(nby2 / 128), bmk);
+                AscendC::Cast<half, int16_t, false>(t2, ti, RoundMode::CAST_NONE, FULL, (uint8_t)(nby2 / 128), cpa);
+                AscendC::And<uint16_t, false>(ti.ReinterpretCast<uint16_t>(), qb.ReinterpretCast<uint16_t>(), mk[64], FULL, (uint8_t)(nby2 / 128), bmk);
+                AscendC::Cast<half, int16_t, false>(so, ti, RoundMode::CAST_NONE, FULL, (uint8_t)(nby2 / 128), cpa);
+                AscendC::Sub<half, false>(so, t2, so, FULL, (uint8_t)(nby2 / 128), bph); // hi(p1)*4096
+                AscendC::Muls<half, false>(so, so, (half)(1.0f / 4096.0f), FULL, (uint8_t)(nby2 / 128), cpa);
+            }
+            AscendC::Adds<half, false>(se, se, (half)-8.0f, FULL, (uint8_t)(nby2 / 128), cpa);
+            AscendC::Adds<half, false>(so, so, (half)-8.0f, FULL, (uint8_t)(nby2 / 128), cpa);
+            // s_raw -> sdup [4t][NI][16]
+            LocalTensor<half> ms = qb[nfr * 512 + gi * NI * 32].ReinterpretCast<half>(); // meta 存的就是原始 s (平面值已被 Muls 2^-j 还原为 q+8)
+            for (int t = 0; t < 4; t++) AscendC::Adds(sd[t * NI * 16], ms, (half)0.0f, NI * 16);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul<half, false>(se, se, sd, FULL, (uint8_t)nfr, bsc);
+            AscendC::Mul<half, false>(se[128], se[128], sd, FULL, (uint8_t)nfr, bsc);
+            AscendC::Mul<half, false>(so, so, sd, FULL, (uint8_t)nfr, bsc);
+            AscendC::Mul<half, false>(so[128], so[128], sd, FULL, (uint8_t)nfr, bsc);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            // MTE3: se -> L1 偶 ki 行, so -> 奇 ki 行 (fractal 顺序 [8ki][NI])
+            AscendC::DataCopy(l1.ReinterpretCast<half>(), se, AscendC::DataCopyParams(4, (uint16_t)(NI * 512 / 32), 0, (uint16_t)(NI * 512 / 32)));
+            AscendC::DataCopy(l1[(uint32_t)NI * 512].ReinterpretCast<half>(), so, AscendC::DataCopyParams(4, (uint16_t)(NI * 512 / 32), 0, (uint16_t)(NI * 512 / 32)));
+            // x 切片 -> L1 -> L0A
+            AscendC::DataCopy(l1[131072].ReinterpretCast<half>(), gxp[(uint64_t)g * M1 * 2048], M1 * 2048);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::LoadData(l0a, l1[131072].ReinterpretCast<half>(), AscendC::LoadData2DParams(0, (uint16_t)(M1 * 8), 1, 0, 0, false, 0));
+            AscendC::LoadData(l0b, l1.ReinterpretCast<half>(), AscendC::LoadData2DParams(0, (uint16_t)(8 * NI), 1, 0, 0, true, 0));
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::MmadParams mm((uint16_t)m, (uint16_t)nb, 128, 0, false, g == 0);
+            AscendC::Mmad(l0c, l0a, l0b, mm);
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
+        // 输出: C [N1][M1][16m][16n] -> y [m][n] (与 fp16 kernel 相同)
+        AscendC::DataCopyEnhancedParams ep;
+        ep.blockMode = AscendC::BlockMode::BLOCK_MODE_MATRIX;
+        for (int ni = 0; ni < nb / 16; ni++) {
+            int c = ni & 1;
+            LocalTensor<float> co = c ? co1 : co0;
+            AscendC::DataCopy(co, l0c[(ni * M1) * 256], AscendC::DataCopyParams(1, (uint16_t)M1, 0, 0), ep);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            for (int mi = 0; mi < M1; mi++) {
+                int mrows = m - mi * 16 < 16 ? m - mi * 16 : 16;
+                AscendC::DataCopy(gy[(uint64_t)(mi * 16) * n + core * nr + b * 256 + ni * 16], co[mi * 256], AscendC::DataCopyParams((uint16_t)mrows, 2, 0, (uint16_t)(n / 8 - 2)));
+            }
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
+        woff += (uint64_t)SP * spb;
+    }
+    AscendC::PipeBarrier<PIPE_ALL>();
+}

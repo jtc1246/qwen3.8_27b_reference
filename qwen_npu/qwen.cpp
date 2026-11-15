@@ -1,7 +1,7 @@
 // Qwen3.8-27B NPU (Ascend 310P) 推理, 输入 RedHatAI/Qwen3.8-27B-INT4 的 model.safetensors
 // (compressed-tensors int4 对称 group128, AWQ 平滑 + GPTQ), 通过 extern "C" 给 python ctypes 调用
-// matmul 权重重打包成 fractal 量化布局走 cube (k_gemm, fp16 反量化 + mmad), decode 和 prefill 同一 kernel
-// 主干 int4 为 I4SF; lm_head/tok_embd 由 bf16 在 host 按 per-16 RTN 转 int8; alpha/beta (f32) 走 k_gemv_f32t
+// 主干 int4 重打包成 W4A8 布局: decode 走 u8xu8 整数 mmad (x 由 k_qx8 动态量化 int8), prefill 五平面 And 反量化 fp16 走 mmad
+// lm_head/tok_embd 由 bf16 在 host 按 per-16 RTN 转 int8 (lm_head 走 I8F fp16 路径); alpha/beta (f32) 走 k_gemv_f32t
 // HF -> 本实现的权重变换 (与 GGUF 转换一致, 见 docs/model.md 第 11 节): norm +1 (ssm_norm 除外)、
 // ssm_a = -exp(A_log)、DeltaNet v 头 grouped -> tiled 重排 (第 j 个 v 头用第 j%16 个 qk 头)
 #include <algorithm>
@@ -17,7 +17,9 @@
 #include "st.h"
 #include "repack.h"
 #include "aclrtlaunch_k_gemm_i8.h"
-#include "aclrtlaunch_k_gemm_i4s.h"
+#include "aclrtlaunch_k_gemm_w8d.h"
+#include "aclrtlaunch_k_gemm_w8p.h"
+#include "aclrtlaunch_k_qx8.h"
 #include "aclrtlaunch_k_pack_x.h"
 #include "aclrtlaunch_k_gemv_f32t.h"
 #include "aclrtlaunch_k_dq_i8.h"
@@ -87,6 +89,7 @@ void *G_d_x = nullptr, *G_d_xn = nullptr, *G_d_out = nullptr, *G_d_qkv = nullptr
 void *G_d_qg = nullptr, *G_d_att = nullptr, *G_d_g = nullptr, *G_d_u = nullptr;
 void *G_d_logits = nullptr, *G_d_hidden = nullptr, *G_d_tok = nullptr, *G_d_cos = nullptr, *G_d_sin = nullptr;
 void *G_d_xp = nullptr; // k_pack_x 的 fp16 zZ 布局 x
+void *G_d_xrep = nullptr, *G_d_xaux = nullptr; // k_qx8 输出 (decode 的 u8 x 旋转副本 + 组 scale/修正量)
 float G_inv_freq[ROT / 2];
 float* G_logits = nullptr;
 vector<float> G_hidden;
@@ -165,16 +168,16 @@ Weight get_w_q4_cat(const vector<QSeg>& segs, int k, const int* kblk_map = nullp
         soff.push_back(soff.back() + g.n);
     }
     int n = soff.back();
-    if (k % 128 || n % 128) {
-        fprintf(stderr, "❌ %s 形状 [%d, %d] 不满足 fractal 布局要求\n", segs[0].base.c_str(), k, n);
+    if (k % 256 || n % 128) { // W4A8: k 按 128 分组且组对打包, 需为 256 倍数
+        fprintf(stderr, "❌ %s 形状 [%d, %d] 不满足 W4A8 布局要求\n", segs[0].base.c_str(), k, n);
         _Exit(1);
     }
     Weight w;
-    w.fmt = Repack::FMT_I4SF;
+    w.fmt = Repack::FMT_I4W8;
     w.k = k;
     w.n = n;
-    int SB = Repack::sb2_ni(w.fmt), KS = k / 128, nr = n / 8;
-    w.data = Acl::alloc((uint64_t)(n / 16) * KS * SB);
+    int KS = k / 128, SP = KS / 2, nr = n / 8;
+    w.data = Acl::alloc((uint64_t)(n / 16) * SP * 2240);
     vector<uint8_t> staging;
     vector<int8_t> nat((size_t)16 * k);
     vector<float> s16((size_t)16 * (k / 16));
@@ -182,7 +185,7 @@ Weight get_w_q4_cat(const vector<QSeg>& segs, int k, const int* kblk_map = nullp
     for (int c = 0; c < 8; c++) { // 每核的行连续存放, 核内按 256 行分块
         for (int r0 = 0; r0 < nr; r0 += 256) {
             int nb = std::min(256, nr - r0), NI = nb / 16;
-            uint64_t bb = (uint64_t)KS * NI * SB;
+            uint64_t bb = (uint64_t)SP * NI * 2240;
             staging.resize(bb);
             for (int ni = 0; ni < NI; ni++) {
                 for (int rr = 0; rr < 16; rr++) {
@@ -190,7 +193,7 @@ Weight get_w_q4_cat(const vector<QSeg>& segs, int k, const int* kblk_map = nullp
                     while (r >= soff[si + 1]) si++;
                     decode_q4_row(qs[si], r - soff[si], &nat[(size_t)rr * k], &s16[(size_t)rr * (k / 16)]);
                 }
-                Repack::pack2_16rows(w.fmt, k, NI, ni, nat.data(), s16.data(), staging.data());
+                Repack::pack_w8_16rows(k, NI, ni, nat.data(), s16.data(), staging.data());
             }
             Acl::h2d((uint8_t*)w.data + off, staging.data(), bb);
             off += bb;
@@ -358,10 +361,15 @@ void save_ref_i8(const string& name, const Weight* w) { // lm_head / tok_embd: �
 
 const void* G_pack_src = nullptr; // k_pack_x 结果缓存 (同一 x 的多个 matmul 只打包一次)
 int G_pack_t = 0, G_pack_k = 0;
-void pack_invalidate() { G_pack_src = nullptr; }
+const void* G_qx_src = nullptr; // k_qx8 结果缓存 (decode 时同一 x 只量化一次)
+int G_qx_k = 0;
+void pack_invalidate() {
+    G_pack_src = nullptr;
+    G_qx_src = nullptr;
+}
 
 // QWEN_NPU_PROF=1 时逐 kernel 同步计时 (调试用, 会拖慢)
-const char* G_prof_names[] = {"gemm", "pack_x", "gemv_f32t", "conv", "deltanet", "qk_rope", "attn", "add_norm", "silu", "misc"};
+const char* G_prof_names[] = {"gemm", "pack_x/qx8", "gemv_f32t", "conv", "deltanet", "qk_rope", "attn", "add_norm", "silu", "misc"};
 double G_prof_ms[10];
 bool G_prof_on = false;
 std::chrono::steady_clock::time_point G_prof_t0;
@@ -391,11 +399,18 @@ void matmul(const Weight& w, void* x, int T, void* y) { // x: [T][k] f32, y: [T]
             G_pack_k = w.k;
         }
         xp = G_d_xp;
+    } else if (w.fmt == Repack::FMT_I4W8 && (x != G_qx_src || w.k != G_qx_k)) { // decode: x 量化 int8, 同一 x 只做一次
+        prof_mark(9);
+        Acl::ck(ACLRT_LAUNCH_KERNEL(k_qx8)(1, Acl::G_stream, x, G_d_xrep, G_d_xaux, w.k), "launch qx8");
+        prof_mark(1);
+        G_qx_src = x;
+        G_qx_k = w.k;
     }
     prof_mark(9);
     aclError e;
     if (w.fmt == Repack::FMT_I8F) e = ACLRT_LAUNCH_KERNEL(k_gemm_i8)(8, Acl::G_stream, w.data, x, xp, y, T, w.n, w.k);
-    else e = ACLRT_LAUNCH_KERNEL(k_gemm_i4s)(8, Acl::G_stream, w.data, x, xp, y, T, w.n, w.k);
+    else if (T == 1) e = ACLRT_LAUNCH_KERNEL(k_gemm_w8d)(8, Acl::G_stream, w.data, G_d_xrep, G_d_xaux, y, w.n, w.k);
+    else e = ACLRT_LAUNCH_KERNEL(k_gemm_w8p)(8, Acl::G_stream, w.data, xp, y, T, w.n, w.k);
     Acl::ck(e, "launch gemm");
     prof_mark(0);
 }
@@ -589,6 +604,8 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_d_hidden = Acl::alloc((size_t)(N_LAYER + 1) * D * 4);
     G_d_tok = Acl::alloc((size_t)CHUNK * 4 + 64);
     G_d_xp = Acl::alloc((size_t)(FF / 128) * (CHUNK / 16) * 2048 * 2); // 最大 k=FF, m=CHUNK
+    G_d_xrep = Acl::alloc((size_t)2 * 4 * 8704 + PAD); // 最大 k=17408 (两半)
+    G_d_xaux = Acl::alloc((size_t)(FF / 128) * 8 * 3 * 4 + PAD);
     G_d_cos = Acl::alloc((size_t)CHUNK * 128);
     G_d_sin = Acl::alloc((size_t)CHUNK * 128);
     Acl::ck(aclrtMallocHost((void**)&G_logits, (size_t)VOCAB * 4), "aclrtMallocHost");
@@ -735,9 +752,18 @@ int qwen_selftest() { // tok_embd: 反量化 vs host 参考逐位; matmul 权重
         vector<float> x(k), y((size_t)w->n);
         for (auto& v : x) v = (float)((rng_next() >> 11) * (1.0 / 9007199254740992.0) * 2 - 1);
         Acl::h2d(G_d_g, x.data(), (size_t)k * 4);
+        pack_invalidate(); // x 内容换了, 指针没换, 需失效 qx8 缓存
         matmul_tok(*w, G_d_g, G_d_u);
         Acl::sync();
         Acl::d2h(y.data(), G_d_u, (size_t)w->n * 4);
+        if (w->fmt == Repack::FMT_I4W8) { // W4A8 路径 x 会被量化, 参考也按同样规则量化 (与 k_qx8 逐字节一致)
+            for (int g = 0; g < k / 128; g++) {
+                float amax = 1e-30f;
+                for (int i = 0; i < 128; i++) amax = std::max(amax, std::fabs(x[g * 128 + i]));
+                float sx = amax / 127.0f, inv = 127.0f / amax;
+                for (int i = 0; i < 128; i++) x[g * 128 + i] = (float)lrintf(x[g * 128 + i] * inv) * sx;
+            }
+        }
         double max_rel = 0;
         for (int r = 0; r < 8; r++) {
             const float* ref = &s.ref[(size_t)r * k];

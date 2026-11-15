@@ -18,7 +18,7 @@
 namespace {
 namespace Repack {
 
-enum { FMT_F32 = 0, FMT_I8 = 1, FMT_I8B = 2, FMT_I4 = 3, FMT_I8F = 4, FMT_I8BF = 5, FMT_I4F = 6, FMT_I4SF = 7 };
+enum { FMT_F32 = 0, FMT_I8 = 1, FMT_I8B = 2, FMT_I4 = 3, FMT_I8F = 4, FMT_I8BF = 5, FMT_I4F = 6, FMT_I4SF = 7, FMT_I4W8 = 8 };
 
 int sb2_ni(int fmt) { // 每 16 行每 128k 字节
     if (fmt == FMT_I8F) return 2304;
@@ -30,6 +30,22 @@ int qb2_ni(int fmt) { return fmt == FMT_I4SF ? 1024 : 2048; }
 
 inline float bf2f(uint16_t b) { // bf16 -> f32 (精确)
     uint32_t u = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+inline float h2f(uint16_t h) { // fp16 -> f32 (精确)
+    uint32_t s = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    uint32_t u;
+    if (e == 0) {
+        if (!m) u = s;
+        else {
+            int sh = 0;
+            while (!(m & 0x400)) { m <<= 1; sh++; }
+            u = s | ((uint32_t)(127 - 15 - sh) << 23) | ((m & 0x3FF) << 13);
+        }
+    } else u = s | ((e + 112) << 23) | (m << 13);
     float f;
     memcpy(&f, &u, 4);
     return f;
@@ -121,6 +137,40 @@ inline void pack2_16rows(int fmt, int k, int NI, int ni, const int8_t* nat, cons
             float div = (fmt == FMT_I4SF && (ki & 2)) ? 0.0625f : 1.0f; // I4SF hi 平面 (ki%4 为 2/3) And 解码后带 x16, scale 预除
             for (int rr = 0; rr < 16; rr++) sp2[(ki * NI + ni) * 16 + rr] = f2h(s[(size_t)rr * ng + kc * 8 + ki] * div);
         }
+    }
+}
+
+// 16 行 (块内组号 ni) 写入 W4A8 布局块 dst (覆盖该块全部 sp): nat [16][k] 为 0..15 nibble (q+8), s16 [16][k/16] f32 (per-128 组复制)
+// 每 sp (组对 2u,2u+1): [4t][NI][512B 包字节] + meta [s'_lo fp16 NI*32B][s'_hi=s/16 fp16][W2_lo f32 NI*64B][W2_hi]
+// 包字节 (fractal 内 32r+2n+p) = lo:nat(组2u, k=t*32+p*16+r) | hi:nat(组2u+1, 同k)<<4 — b8 LoadData 转置源序
+// W2 = h2f(存储的 s') * Sum(存储 nib 值) 用 f32 存, 保证 kernel 里 128*Swu 偏置与修正项精确相消
+inline void pack_w8_16rows(int k, int NI, int ni, const int8_t* nat, const float* s16, uint8_t* dst) {
+    int KS = k / 128, SP = KS / 2, ng = k / 16;
+    uint64_t spb = (uint64_t)NI * (4 * 512 + 192);
+    for (int sp = 0; sp < SP; sp++) {
+        uint8_t* pk = dst + (uint64_t)sp * spb;
+        for (int t = 0; t < 4; t++)
+            for (int r = 0; r < 16; r++)
+                for (int n0 = 0; n0 < 16; n0++)
+                    for (int p = 0; p < 2; p++) {
+                        int kk = t * 32 + p * 16 + r;
+                        int lo = nat[(size_t)n0 * k + (2 * sp) * 128 + kk];
+                        int hi = nat[(size_t)n0 * k + (2 * sp + 1) * 128 + kk];
+                        pk[(size_t)(t * NI + ni) * 512 + 32 * r + 2 * n0 + p] = (uint8_t)(lo | (hi << 4));
+                    }
+        uint16_t* mt = (uint16_t*)(pk + (size_t)NI * 2048);
+        float* mw = (float*)(pk + (size_t)NI * 2048 + (size_t)NI * 64);
+        for (int gi = 0; gi < 2; gi++)
+            for (int n0 = 0; n0 < 16; n0++) {
+                int g = 2 * sp + gi;
+                float sv = s16[(size_t)n0 * ng + g * 8];
+                int swu = 0;
+                for (int i = 0; i < 128; i++) swu += nat[(size_t)n0 * k + g * 128 + i];
+                uint16_t sh = f2h(sv); // 两组都存原始 s (不预除 16): hi 组的 /16 由 decode 在 f32 域派生, prefill 直接用 s
+                if ((sh & 0x7C00) == 0) sh = 0; // fp16 次正规 scale 钳为 0 (设备向量单元会 flush, 钳死保证与 W2 精确相消; |w|<5e-4 可忽略)
+                mt[(size_t)gi * NI * 16 + ni * 16 + n0] = sh;
+                mw[(size_t)gi * NI * 16 + ni * 16 + n0] = h2f(sh) * (float)swu; // W2 = s'_used*Sum(存储nib) 对 lo/hi 同式 (hi 的 1/16 与 x16 相消)
+            }
     }
 }
 
