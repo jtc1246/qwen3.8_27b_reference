@@ -29,6 +29,7 @@
 #include "aclrtlaunch_k_deltanet.h"
 #include "aclrtlaunch_k_qk_rope.h"
 #include "aclrtlaunch_k_attn.h"
+#include "aclrtlaunch_k_attn_merge.h"
 
 using std::string;
 using std::vector;
@@ -67,8 +68,10 @@ struct Layer {
     Weight wqkv, wo; // wqkv = q+k+v 行拼接 [QKVC][D]
     void* q_norm = nullptr;
     void* k_norm = nullptr;
-    void* k_cache = nullptr; // [max_ctx][1024] f32
-    void* v_cache = nullptr;
+    void* kq = nullptr; // KV cache q8: u8 [N_KV][max_ctx][256] + scale half [N_KV][max_ctx][2][16]
+    void* ksc = nullptr;
+    void* vq = nullptr;
+    void* vsc = nullptr;
 };
 
 struct SelfRef { string name; const Weight* w; int rows[8]; vector<float> ref; }; // 自测: 8 行反量化参考值 (重排后语义, [8][k])
@@ -90,6 +93,7 @@ void *G_d_qg = nullptr, *G_d_att = nullptr, *G_d_g = nullptr, *G_d_u = nullptr;
 void *G_d_logits = nullptr, *G_d_hidden = nullptr, *G_d_tok = nullptr, *G_d_cos = nullptr, *G_d_sin = nullptr;
 void *G_d_xp = nullptr; // k_pack_x 的 fp16 zZ 布局 x
 void *G_d_xrep = nullptr, *G_d_xaux = nullptr; // k_qx8 输出 (decode 的 u8 x 旋转副本 + 组 scale/修正量)
+void* G_d_attp = nullptr; // decode attention 两段部分结果 (O [8][16][256] + m/l 各 [8][16])
 float G_inv_freq[ROT / 2];
 float* G_logits = nullptr;
 vector<float> G_hidden;
@@ -467,10 +471,11 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
             matmul(L.wqkv, G_d_xn, T, G_d_qg);
             const char* ph2 = getenv("QWEN_NPU_PHASE");
             if (ph2 && l == stop_l && atoi(ph2) == 10) { Acl::sync(); return; }
-            Acl::ck(ACLRT_LAUNCH_KERNEL(k_qk_rope)(8, Acl::G_stream, G_d_qg, L.q_norm, L.k_norm, G_d_cos, G_d_sin, L.k_cache, L.v_cache, G_n_past, T), "launch qk_rope");
+            Acl::ck(ACLRT_LAUNCH_KERNEL(k_qk_rope)(8, Acl::G_stream, G_d_qg, L.q_norm, L.k_norm, G_d_cos, G_d_sin, L.kq, L.ksc, L.vq, L.vsc, G_n_past, T, G_max_ctx), "launch qk_rope");
             prof_mark(5);
             if (ph2 && l == stop_l && atoi(ph2) == 11) { Acl::sync(); return; }
-            Acl::ck(ACLRT_LAUNCH_KERNEL(k_attn)(8, Acl::G_stream, G_d_qg, L.k_cache, L.v_cache, G_d_att, G_n_past, T), "launch attn");
+            Acl::ck(ACLRT_LAUNCH_KERNEL(k_attn)(8, Acl::G_stream, G_d_qg, L.kq, L.ksc, L.vq, L.vsc, G_d_att, G_d_attp, G_n_past, T, G_max_ctx), "launch attn");
+            if (T == 1) Acl::ck(ACLRT_LAUNCH_KERNEL(k_attn_merge)(4, Acl::G_stream, G_d_qg, G_d_attp, G_d_att), "launch attn_merge");
             prof_mark(6);
             if (ph2 && l == stop_l && atoi(ph2) == 12) { Acl::sync(); return; }
             pack_invalidate();
@@ -583,8 +588,10 @@ int qwen_init(const char* path, int device, int max_ctx) {
         L.wo = get_w_q4(p + "self_attn.o_proj", ATT_DIM, D);
         L.q_norm = get_norm(p + "self_attn.q_norm.weight", HD, true);
         L.k_norm = get_norm(p + "self_attn.k_norm.weight", HD, true);
-        L.k_cache = Acl::alloc((size_t)max_ctx * KV_DIM * 4);
-        L.v_cache = Acl::alloc((size_t)max_ctx * KV_DIM * 4);
+        L.kq = Acl::alloc((size_t)N_KV * max_ctx * HD + 16384); // 末尾留 48 行 tile 读越量余量
+        L.ksc = Acl::alloc((size_t)N_KV * max_ctx * 64 + 16384);
+        L.vq = Acl::alloc((size_t)N_KV * max_ctx * HD + 16384);
+        L.vsc = Acl::alloc((size_t)N_KV * max_ctx * 64 + 16384);
     }
     double up = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     fprintf(stderr, "ℹ️ 权重重打包并上传完成, %.1fs\n", up);
@@ -606,6 +613,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_d_xp = Acl::alloc((size_t)(FF / 128) * (CHUNK / 16) * 2048 * 2); // 最大 k=FF, m=CHUNK
     G_d_xrep = Acl::alloc((size_t)2 * 4 * 8704 + PAD); // 最大 k=17408 (两半)
     G_d_xaux = Acl::alloc((size_t)(FF / 128) * 8 * 3 * 4 + PAD);
+    G_d_attp = Acl::alloc((size_t)8 * 16 * HD * 4 + 1024 + PAD);
     G_d_cos = Acl::alloc((size_t)CHUNK * 128);
     G_d_sin = Acl::alloc((size_t)CHUNK * 128);
     Acl::ck(aclrtMallocHost((void**)&G_logits, (size_t)VOCAB * 4), "aclrtMallocHost");
