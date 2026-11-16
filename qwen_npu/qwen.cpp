@@ -26,6 +26,7 @@
 #include "aclrtlaunch_k_add_norm.h"
 #include "aclrtlaunch_k_silu_mul.h"
 #include "aclrtlaunch_k_conv.h"
+#include "aclrtlaunch_k_dn_pre.h"
 #include "aclrtlaunch_k_deltanet.h"
 #include "aclrtlaunch_k_qk_rope.h"
 #include "aclrtlaunch_k_attn.h"
@@ -88,7 +89,7 @@ void* G_output_norm = nullptr;
 int G_max_ctx = 0, G_n_past = 0, G_next_pos = 0;
 bool G_inited = false;
 uint64_t G_rng = 0x853c49e6748fea9bULL;
-void *G_d_x = nullptr, *G_d_xn = nullptr, *G_d_out = nullptr, *G_d_qkv = nullptr, *G_d_ab = nullptr, *G_d_o = nullptr;
+void *G_d_x = nullptr, *G_d_xn = nullptr, *G_d_out = nullptr, *G_d_qkv = nullptr, *G_d_ab = nullptr, *G_d_bd = nullptr, *G_d_o = nullptr;
 void *G_d_qg = nullptr, *G_d_att = nullptr, *G_d_g = nullptr, *G_d_u = nullptr;
 void *G_d_logits = nullptr, *G_d_hidden = nullptr, *G_d_tok = nullptr, *G_d_cos = nullptr, *G_d_sin = nullptr;
 void *G_d_xp = nullptr; // k_pack_x 的 fp16 zZ 布局 x
@@ -444,6 +445,7 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
             snr[t * 32 + f] = sinf(ang);
         }
     }
+    Acl::sync(); // h2d 会绕开 stream 顺序, 必须等上一 chunk 的 kernel (qk_rope 读 cos/sin) 全部完成
     Acl::h2d(G_d_tok, tokens, (size_t)T * 4);
     Acl::h2d(G_d_cos, csr, (size_t)T * 128);
     Acl::h2d(G_d_sin, snr, (size_t)T * 128);
@@ -463,7 +465,8 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
             matmul(L.ab, G_d_xn, T, G_d_ab);
             Acl::ck(ACLRT_LAUNCH_KERNEL(k_conv)(8, Acl::G_stream, G_d_qkv, L.conv_state, L.conv_w, T), "launch conv");
             prof_mark(3);
-            Acl::ck(ACLRT_LAUNCH_KERNEL(k_deltanet)(8, Acl::G_stream, G_d_qkv, G_d_ab, L.ssm_a, L.dt_bias, L.ssm_norm, L.ssm_state, G_d_o, T), "launch deltanet");
+            Acl::ck(ACLRT_LAUNCH_KERNEL(k_dn_pre)(8, Acl::G_stream, G_d_qkv, G_d_ab, L.ssm_a, L.dt_bias, G_d_bd, T), "launch dn_pre");
+            Acl::ck(ACLRT_LAUNCH_KERNEL(k_deltanet)(8, Acl::G_stream, G_d_qkv, G_d_bd, L.ssm_norm, L.ssm_state, G_d_o, T), "launch deltanet");
             prof_mark(4);
             pack_invalidate();
             matmul(L.ssm_out, G_d_o, T, G_d_out);
@@ -494,6 +497,10 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
         matmul(L.ffn_down, G_d_g, T, G_d_out);
         if (l == stop_l) {
             Acl::sync();
+            int mx0 = G_next_pos - 1; // 提前返回也推进位置, 保持多 chunk 的 n_past 语义
+            for (int i = 0; i < T * 3; i++) mx0 = std::max(mx0, G_pos[i]);
+            G_next_pos = mx0 + 1;
+            G_n_past += T;
             return;
         }
     }
@@ -616,6 +623,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
     G_d_attp = Acl::alloc((size_t)8 * 16 * HD * 4 + 1024 + PAD);
     G_d_cos = Acl::alloc((size_t)CHUNK * 128);
     G_d_sin = Acl::alloc((size_t)CHUNK * 128);
+    G_d_bd = Acl::alloc((size_t)CHUNK * 2 * LV * 4 + PAD); // k_dn_pre 的 beta/decay [T][96] (放最后, 不动原有布局)
     Acl::ck(aclrtMallocHost((void**)&G_logits, (size_t)VOCAB * 4), "aclrtMallocHost");
     memset(G_logits, 0, (size_t)VOCAB * 4);
     G_hidden.resize((size_t)(N_LAYER + 1) * D);
