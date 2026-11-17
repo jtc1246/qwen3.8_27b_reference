@@ -12,6 +12,7 @@ Atlas 300I Duo (双 310P3) 上与本项目直接相关的硬件数字, 以及它
 | vector 算力 | fp32 乘加折算仅 **~0.55 TFLOPS** (与 cube 差 128 倍) |
 | 可用显存 | 单颗 ~46.2GB (48GB 减去设备侧预留; 关 ECC 比开多 3GB) |
 | kernel 启动 | ~5 µs/次 (连续提交) |
+| launch + 等完成往返 | ~26 µs (FAST_SYNC 忙等); GM 标志位 doorbell 往返 ~12 µs |
 | 向量指令发射 | ~14 ns/调用; 同 V 管线依赖硬件保序 (零停顿) |
 
 ## 2. 这些数字如何决定设计
@@ -50,7 +51,7 @@ prefill 时 x (fp16 ~2.6MB) 被各核各块反复读, 全部命中共享缓存�
 
 ### 启动开销可忽略但次数要有数
 
-decode 每 token ~800 次 kernel 启动 × 5µs ≈ 4ms (占 ~2%); 不构成当前瓶颈, 但 kernel 进一步拆小前要算这笔账。
+decode 每 token ~800 次 kernel 启动 × 5µs ≈ 4ms (占 ~2%); 不构成当前瓶颈, 但 kernel 进一步拆小前要算这笔账。另一笔账是**汇合点的往返**: 每次 [launch + 等完成] 闭环 26µs, 实测大头在提交→设备侧派发→kernel 开跑的下行链路 (只把等待换成标志位轮询几乎无收益); 双芯 decode 每 token 129 个汇合点, v9 用预下发 + GM 标志位 doorbell (往返 12µs, 下发延迟被核上自旋隐藏) 把 decode 18.1 提到 20.3 tok/s。310P 不支持 host 内存映射 (zero-copy), 标志位只能放设备 GM、host 用 4B 同步 memcpy 轮询; kernel 侧轮询必须 volatile 读 + 每次 dcci。
 
 ### KV cache fp32 的代价
 

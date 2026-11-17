@@ -120,6 +120,8 @@ struct Dev { // 每芯一份的全部状态 (权重分片 + 激活缓冲 + 重�
     int pack_t = 0, pack_k = 0, pack_xs = 0;
     const void* qx_src = nullptr; // k_qx8 结果缓存 (decode 时同一 x 只量化一次)
     int qx_k = 0;
+    void* d_flag = nullptr; // doorbell 标志位 (int32 槽, 各占 64B): [0] 门槛 seq, [16+16b] block b 完成 seq
+    int32_t dn_seq = 0, db_seq = 0; // 完成 / 门槛序号 (单调递增, qwen_reset 清零)
     vector<int> vheads; // 本芯 v 头 -> 全局 tiled v 头
     vector<int> rows_qkv, rows_z; // in_proj_qkv / in_proj_z 的本地行 -> HF 行 (conv1d 通道同 rows_qkv)
     vector<int> kblk_out; // out_proj k 方向 128 块 -> HF k 块 (一块恰好一个 v 头, 与量化组对齐)
@@ -140,6 +142,7 @@ float* G_logits = nullptr; // pinned host, 完整 VOCAB (各芯写各自的一�
 float* G_ar_host[QWEN_TP][2]; // all-reduce 的 host 中转缓冲 (pinned, 每芯 × 奇偶双缓冲, 免去"对方读完才能覆盖"的 barrier)
 vector<float> G_hnorm; // host 侧 norm 权重 [N_LAYER][2][D] (attn, post) + [D] (final)
 const St::Tensor* G_embd_t = nullptr; // embedding bf16 tensor (NDEV>1 时 St 保持 mmap 打开)
+bool G_use_db = false; // decode 汇合点用 doorbell 标志位轮询替代 sync (实测省 ~14us/往返); QWEN_NPU_NODB=1 退回 sync
 bool G_hid_host = false; // 最近一个 chunk 的 hidden 在 host (G_hidden) 还是设备
 vector<float> G_hidden;
 vector<float> G_work;
@@ -445,6 +448,13 @@ void pack_invalidate() {
     DV->qx_src = nullptr;
 }
 
+void seed_qx() { // hostx 预下发: d_xn 的量化版由 host 算好放 d_xq, 先于 host_norm_push 下发的 matmul 不得再启动 k_qx8
+    DV->qx_src = DV->d_xn;
+    DV->qx_k = D;
+    DV->qx_rep = DV->d_xq;
+    DV->qx_aux = (uint8_t*)DV->d_xq + XQ_AUX;
+}
+
 // QWEN_NPU_PROF=1 时逐 kernel 同步计时 (调试用, 会拖慢; 多芯时只统计芯 0)
 const char* G_prof_names[] = {"gemm", "pack_x/qx8", "gemv_f32t", "conv", "deltanet", "qk_rope", "attn", "add_norm", "silu", "misc", "allreduce"};
 double G_prof_ms[11];
@@ -456,6 +466,16 @@ void prof_mark(int id) { // 把距上个标记的耗时记到 id 上
     auto now = std::chrono::steady_clock::now();
     G_prof_ms[id] += std::chrono::duration<double>(now - G_prof_t0).count() * 1e3;
     G_prof_t0 = now;
+}
+
+void wait_done(int32_t seq) { // 轮询段尾 kernel 8 个 block 的完成标志 (一次 512B d2h), 绕开 sync 的完成上报链路
+    int32_t s[128];
+    while (true) {
+        Acl::d2h(s, (uint8_t*)DV->d_flag + 64, 512);
+        int ok = 1;
+        for (int b = 0; b < 8; b++) ok &= s[b * 16] >= seq;
+        if (ok) return;
+    }
 }
 
 void allreduce_out(int T) { // 两芯 partial 求和 (P2P 不可用, 走 host 中转): d_out += 对方 d_out
@@ -559,12 +579,14 @@ __attribute__((target("avx512f"))) void qx8_avx512(const float* x, int k, uint8_
 
 // decode 的汇合点: 取回两芯 partial -> CPU 残差累加 + RMSNorm (+qx8) -> 下发 (need_f32: ab gemv / lm_head 要 f32 xn)
 // 两线程各自算一份相同的结果 (输入相同, 逐位一致), 免去"等对方线程算完"的第二个 barrier
-void host_norm_push(const float* w, float* hidden_slot, bool with_partial, bool need_f32, bool need_quant) {
+void host_norm_push(const float* w, float* hidden_slot, bool with_partial, bool need_f32, bool need_quant, int32_t ring = 0, int32_t wait_seq = -1) {
     prof_mark(9);
     const float *p0 = nullptr, *p1 = nullptr;
     if (with_partial) {
         int par = ++DV->ar_seq & 1; // 奇偶双缓冲: 对方最多落后一个汇合点, 不会读到被覆盖的 partial
-        Acl::sync(); // 本芯 partial 算完
+        int32_t ws = wait_seq < 0 ? DV->dn_seq : wait_seq; // gated 时 push 在下一段 launch 之后执行, 等待序号须由调用方在 launch 前捕获
+        if (ws) wait_done(ws); // 本芯 partial 算完 (段尾 matmul 写的完成标志)
+        else Acl::sync();
         Acl::d2h(G_ar_host[DV->idx][par], DV->d_out, (size_t)D * 4);
         dev_barrier(); // 唯一 barrier: 两边 partial 都已就位
         p0 = G_ar_host[0][par];
@@ -598,10 +620,11 @@ void host_norm_push(const float* w, float* hidden_slot, bool with_partial, bool 
         DV->qx_aux = (uint8_t*)DV->d_xq + XQ_AUX;
     } else if (need_f32)
         Acl::h2d((uint8_t*)DV->d_xq + XQ_XN, DV->xn_pin, (size_t)D * 4);
+    if (ring) Acl::h2d(DV->d_flag, &ring, 4); // doorbell: 数据就绪, 放行预下发的段首 kernel
     prof_mark(10);
 }
 
-void matmul(const Weight& w, void* x, int T, void* y, int xs = 0) { // x: [T][k] f32 (行跨步 xs 元素, 0 = 紧凑), y: [T][n] f32
+void matmul(const Weight& w, void* x, int T, void* y, int xs = 0, int32_t done_seq = 0, int32_t gate_seq = 0) { // x: [T][k] f32 (行跨步 xs 元素, 0 = 紧凑), y: [T][n] f32; done_seq/gate_seq 非 0 时段尾写完成标志/段首自旋等 doorbell
     if (!xs) xs = w.k;
     if (w.fmt == Repack::FMT_F32) { // alpha/beta: 行常驻向量 GEMV, 每核 8 行
         prof_mark(9);
@@ -632,14 +655,14 @@ void matmul(const Weight& w, void* x, int T, void* y, int xs = 0) { // x: [T][k]
     }
     prof_mark(9);
     aclError e;
-    if (w.fmt == Repack::FMT_I8F) e = ACLRT_LAUNCH_KERNEL(k_gemm_i8)(8, Acl::stream(), w.data, x, xp, y, T, w.n, w.k);
-    else if (T == 1) e = ACLRT_LAUNCH_KERNEL(k_gemm_w8d)(8, Acl::stream(), w.data, DV->qx_rep, DV->qx_aux, y, w.n, w.k);
+    if (w.fmt == Repack::FMT_I8F) e = ACLRT_LAUNCH_KERNEL(k_gemm_i8)(8, Acl::stream(), w.data, x, xp, y, T, w.n, w.k, DV->d_flag, gate_seq, done_seq);
+    else if (T == 1) e = ACLRT_LAUNCH_KERNEL(k_gemm_w8d)(8, Acl::stream(), w.data, DV->qx_rep, DV->qx_aux, y, w.n, w.k, DV->d_flag, gate_seq, done_seq);
     else e = ACLRT_LAUNCH_KERNEL(k_gemm_w8p)(8, Acl::stream(), w.data, xp, y, T, w.n, w.k);
     Acl::ck(e, "launch gemm");
     prof_mark(0);
 }
 
-void matmul_tok(const Weight& w, void* x, void* y) { matmul(w, x, 1, y); }
+void matmul_tok(const Weight& w, void* x, void* y, int32_t done_seq = 0, int32_t gate_seq = 0) { matmul(w, x, 1, y, 0, done_seq, gate_seq); }
 
 void dq_rows(const Weight& w, void* d_rows, void* d_out, int nr) { // 反量化 nr 行到自然顺序 f32 (tok_embd, wave I8)
     Acl::ck(ACLRT_LAUNCH_KERNEL(k_dq_i8)(8, Acl::stream(), w.data, d_rows, d_out, nr, w.k, w.stride), "launch dq");
@@ -696,12 +719,16 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
     }
     const char* stop_env = getenv("QWEN_NPU_STOP"); // 调试: 跑完第 N 层后停
     int stop_l = stop_env ? atoi(stop_env) : -1;
+    // gated: 段 kernel 预下发 (段首在核上自旋等 doorbell), 汇合计算完一次 4B h2d 放行, 隐藏任务下发延迟; 与 sync 类调试钩子互斥
+    bool gated = hostx && G_use_db && !G_prof_on && stop_l < 0 && !getenv("QWEN_NPU_PHASE");
     for (int l = 0; l < N_LAYER; l++) {
         Layer& L = DV->layers[l];
-        if (hostx) host_norm_push(&G_hnorm[(size_t)l * 2 * D], G_hidden.data() + (size_t)l * D, l > 0, L.recr, true);
+        int32_t g1 = gated ? ++DV->db_seq : 0, w1 = DV->dn_seq; // w1: 上一段的完成序号, 须在本段 launch 递增 dn_seq 前捕获
+        if (gated) seed_qx(); // 汇合推迟到段 launch 之后, 先把 qx8 缓存指到 d_xq
+        else if (hostx) host_norm_push(&G_hnorm[(size_t)l * 2 * D], G_hidden.data() + (size_t)l * D, l > 0, L.recr, true);
         else add_norm(l ? DV->d_out : nullptr, L.attn_norm, fp(DV->d_hidden, (size_t)l * D), T);
         if (L.recr) {
-            matmul(L.qkv, DV->d_xn, T, DV->d_qkv);
+            matmul(L.qkv, DV->d_xn, T, DV->d_qkv, 0, 0, g1);
             matmul(L.ab, hostx ? (uint8_t*)DV->d_xq + XQ_XN : DV->d_xn, T, DV->d_ab); // gemv 要读 f32 xn 本体
             Acl::ck(ACLRT_LAUNCH_KERNEL(k_conv)(8, Acl::stream(), DV->d_qkv, L.conv_state, L.conv_w, T), "launch conv");
             prof_mark(3);
@@ -713,10 +740,10 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
             else Acl::ck(ACLRT_LAUNCH_KERNEL(k_dnc)(8, Acl::stream(), DV->d_qkv, DV->d_bd, L.ssm_norm, L.ssm_state, DV->d_o, T), "launch dnc"); // chunk 化 cube 版
             prof_mark(4);
             pack_invalidate();
-            matmul(L.ssm_out, DV->d_o, T, DV->d_out);
+            matmul(L.ssm_out, DV->d_o, T, DV->d_out, 0, hostx && G_use_db ? ++DV->dn_seq : 0);
             if (!hostx) allreduce_out(T); // hostx 时 partial 由下一个 host_norm_push 取回累加
         } else {
-            matmul(L.wqkv, DV->d_xn, T, DV->d_qg);
+            matmul(L.wqkv, DV->d_xn, T, DV->d_qg, 0, 0, g1);
             const char* ph2 = getenv("QWEN_NPU_PHASE");
             if (ph2 && l == stop_l && atoi(ph2) == 10) { Acl::sync(); return; }
             Acl::ck(ACLRT_LAUNCH_KERNEL(k_qk_rope)(8, Acl::stream(), DV->d_qg, L.q_norm, L.k_norm, DV->d_cos, d_sin, L.kq, L.ksc, L.vq, L.vsc, G_n_past, T, G_max_ctx), "launch qk_rope");
@@ -727,32 +754,49 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
             prof_mark(6);
             if (ph2 && l == stop_l && atoi(ph2) == 12) { Acl::sync(); return; }
             pack_invalidate();
-            matmul(L.wo, DV->d_att, T, DV->d_out);
+            matmul(L.wo, DV->d_att, T, DV->d_out, 0, hostx && G_use_db ? ++DV->dn_seq : 0);
             if (!hostx) allreduce_out(T);
         }
-        if (hostx) host_norm_push(&G_hnorm[(size_t)l * 2 * D + D], nullptr, true, false, true);
+        if (gated) host_norm_push(&G_hnorm[(size_t)l * 2 * D], G_hidden.data() + (size_t)l * D, l > 0, L.recr, true, g1, w1); // 本段 (attn/recr) 的汇合, 敲铃 g1
+        int32_t g2 = gated ? ++DV->db_seq : 0, w2 = DV->dn_seq;
+        if (gated) seed_qx();
+        else if (hostx) host_norm_push(&G_hnorm[(size_t)l * 2 * D + D], nullptr, true, false, true);
         else add_norm(DV->d_out, L.post_norm, nullptr, T);
-        matmul(L.ffn_gu, DV->d_xn, T, DV->d_g); // 一次 gemm 输出 [T][2*FF_N] = 行内 [g|u]
+        matmul(L.ffn_gu, DV->d_xn, T, DV->d_g, 0, 0, g2); // 一次 gemm 输出 [T][2*FF_N] = 行内 [g|u]
         const char* ph = getenv("QWEN_NPU_PHASE"); // 调试: 在 FFN 的某一步后直接停 (gate/up 已合并, 0/1 同点)
         if (ph && l == stop_l && (atoi(ph) == 0 || atoi(ph) == 1)) { Acl::sync(); return; }
         Acl::ck(ACLRT_LAUNCH_KERNEL(k_silu_mul)(8, Acl::stream(), DV->d_g, T, FF_N[DV->idx]), "launch silu_mul");
         prof_mark(8);
         if (ph && l == stop_l && atoi(ph) == 2) { Acl::sync(); return; }
         pack_invalidate();
-        matmul(L.ffn_down, DV->d_g, T, DV->d_out, 2 * FF_N[DV->idx]); // 行跨步 2*FF_N, 只取 g 段
+        matmul(L.ffn_down, DV->d_g, T, DV->d_out, 2 * FF_N[DV->idx], hostx && G_use_db ? ++DV->dn_seq : 0); // 行跨步 2*FF_N, 只取 g 段
         if (!hostx) allreduce_out(T);
+        if (gated) host_norm_push(&G_hnorm[(size_t)l * 2 * D + D], nullptr, true, false, true, g2, w2); // FFN 段的汇合, 敲铃 g2
         if (l == stop_l) {
             Acl::sync();
             advance_pos(pos, T); // 提前返回也推进位置, 保持多 chunk 的 n_past 语义 (hostx 时 x_res 不跨 chunk, 不必取回 partial)
             return;
         }
     }
-    if (hostx) host_norm_push(&G_hnorm[(size_t)N_LAYER * 2 * D], G_hidden.data() + (size_t)N_LAYER * D, true, true, false);
-    else add_norm(DV->d_out, DV->output_norm, fp(DV->d_hidden, (size_t)N_LAYER * D), T);
-    advance_pos(pos, T);
-    if (!need_logits) return;
-    matmul_tok(DV->output, hostx ? (uint8_t*)DV->d_xq + XQ_XN : fp(DV->d_xn, (size_t)(T - 1) * D), DV->d_logits);
-    Acl::sync();
+    if (gated) { // lm_head 预下发 (门 g3), final norm 汇合后敲铃
+        int32_t g3 = 0, w3 = DV->dn_seq;
+        if (need_logits) {
+            g3 = ++DV->db_seq;
+            matmul_tok(DV->output, (uint8_t*)DV->d_xq + XQ_XN, DV->d_logits, ++DV->dn_seq, g3);
+        }
+        host_norm_push(&G_hnorm[(size_t)N_LAYER * 2 * D], G_hidden.data() + (size_t)N_LAYER * D, true, true, false, g3, w3);
+        advance_pos(pos, T);
+        if (!need_logits) return;
+        wait_done(DV->dn_seq);
+    } else {
+        if (hostx) host_norm_push(&G_hnorm[(size_t)N_LAYER * 2 * D], G_hidden.data() + (size_t)N_LAYER * D, true, true, false);
+        else add_norm(DV->d_out, DV->output_norm, fp(DV->d_hidden, (size_t)N_LAYER * D), T);
+        advance_pos(pos, T);
+        if (!need_logits) return;
+        matmul_tok(DV->output, hostx ? (uint8_t*)DV->d_xq + XQ_XN : fp(DV->d_xn, (size_t)(T - 1) * D), DV->d_logits, hostx && G_use_db ? ++DV->dn_seq : 0);
+        if (hostx && G_use_db) wait_done(DV->dn_seq);
+        else Acl::sync();
+    }
     Acl::d2h(G_logits + (size_t)DV->idx * VOCAB_TP, DV->d_logits, (size_t)VOCAB_TP * 4); // 各芯写 vocab 的各自一半
 }
 
@@ -774,6 +818,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
     }
     auto t0 = std::chrono::steady_clock::now();
     Acl::init(device, NDEV);
+    G_use_db = NDEV > 1 && !getenv("QWEN_NPU_NODB");
     if (!St::open(G_st, path)) return -1;
     G_max_ctx = max_ctx;
     for (int j = 0; j < LV; j++) G_perm48[j] = (j % LK) * 3 + j / LK; // tiled 头 j <- HF 头
@@ -887,6 +932,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
         DV->d_cos = Acl::alloc((size_t)CHUNK * 256); // cos+sin 合并一块
         if (NDEV > 1) DV->d_xq = Acl::alloc((size_t)XQ_TOTAL + PAD);
         DV->d_bd = Acl::alloc((size_t)CHUNK * 2 * LV_TP * 4 + PAD); // k_dn_pre 的 beta/decay [T][2*LV_TP]
+        DV->d_flag = Acl::alloc(4096); // doorbell 标志位
         if (NDEV > 1) {
             DV->d_peer = Acl::alloc((size_t)CHUNK * D * 4 + PAD); // all-reduce 对方 partial 落地
             for (int pa = 0; pa < 2; pa++) Acl::ck(aclrtMallocHost((void**)&G_ar_host[di][pa], (size_t)CHUNK * D * 4), "aclrtMallocHost ar");
@@ -1017,6 +1063,9 @@ void qwen_reset() {
             Acl::ck(aclrtMemset(L.conv_state, (size_t)3 * QKV_TP * 4, 0, (size_t)3 * QKV_TP * 4), "memset conv");
             Acl::ck(aclrtMemset(L.ssm_state, (size_t)LV_TP * LHD * LHD * 4, 0, (size_t)LV_TP * LHD * LHD * 4), "memset ssm");
         }
+        Acl::ck(aclrtMemset(DV->d_flag, 4096, 0, 4096), "memset flag"); // doorbell 序号同步清零
+        DV->dn_seq = 0;
+        DV->db_seq = 0;
     }
     dev_enter(0);
     G_n_past = 0;

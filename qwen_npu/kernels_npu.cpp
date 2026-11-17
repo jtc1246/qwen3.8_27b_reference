@@ -28,6 +28,28 @@ enum { FMT_F32 = 0, FMT_I8 = 1, FMT_I8B = 2, FMT_I4 = 3, FMT_I8F = 4, FMT_I8BF =
 
 __aicore__ inline int pad64i(int x) { return (x + 63) / 64 * 64; }
 
+// doorbell: host 用 4B memcpy 轮询标志位替代 launch/sync 的完成上报链路 (实测往返 12us vs 26us, 见 tests/npu_doorbell)
+// flags 布局 (int32, 每槽独占 64B cacheline): [0] host 写的门槛 seq, [16+16b] block b 写的完成 seq
+// GM 标量读必须 volatile + 每次 dcci, 否则编译器提升出循环 / 读到缓存旧值 (两个都实测踩过)
+__aicore__ inline void db_gate(GM_ADDR flags, int32_t seq) { // 段首自旋等 host 的 doorbell
+    if (!seq) return;
+    GlobalTensor<int32_t> g;
+    g.SetGlobalBuffer((__gm__ int32_t*)flags);
+    while (true) {
+        AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE>(g);
+        if (*(__gm__ volatile int32_t*)flags >= seq) return;
+    }
+}
+
+__aicore__ inline void db_done(GM_ADDR flags, int32_t seq) { // 段尾本 block 写完成 seq (调用前需 PIPE_ALL)
+    if (!seq) return;
+    __gm__ volatile int32_t* p = (__gm__ volatile int32_t*)flags + 16 + AscendC::GetBlockIdx() * 16;
+    *p = seq;
+    GlobalTensor<int32_t> g;
+    g.SetGlobalBuffer((__gm__ int32_t*)p);
+    AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE>(g);
+}
+
 // 量化权重 fractal 布局 (见 repack.h) 的 cube GEMM: 向量反量化 fp16 -> L1 -> L0B -> mmad fp16 累加 fp32
 // m=1 (decode): x 为 f32 [k], kernel 内转 fp16 后常驻 L0A (gemv 模式, 按 512B fractal 对齐取片)
 // m>1 (prefill): xp 为 k_pack_x 产出的 fp16 zZ 切片布局 [kc][mi][ki][16m][16k], 按切片流进 L1/L0A
@@ -338,7 +360,12 @@ template <int FMT> __aicore__ inline void dq_body(GM_ADDR w, GM_ADDR rows, GM_AD
 
 } // namespace
 
-extern "C" __global__ __aicore__ void k_gemm_i8(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I8F>(w, x, xp, y, m, n, k); }
+extern "C" __global__ __aicore__ void k_gemm_i8(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k, GM_ADDR flags, int32_t gate_seq, int32_t done_seq) {
+    db_gate(flags, gate_seq);
+    gemm_body<FMT_I8F>(w, x, xp, y, m, n, k);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    db_done(flags, done_seq);
+}
 extern "C" __global__ __aicore__ void k_gemm_i8b(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I8BF>(w, x, xp, y, m, n, k); }
 extern "C" __global__ __aicore__ void k_gemm_i4(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I4F>(w, x, xp, y, m, n, k); }
 extern "C" __global__ __aicore__ void k_gemm_i4s(GM_ADDR w, GM_ADDR x, GM_ADDR xp, GM_ADDR y, int32_t m, int32_t n, int32_t k) { gemm_body<FMT_I4SF>(w, x, xp, y, m, n, k); }
@@ -2201,8 +2228,9 @@ extern "C" __global__ __aicore__ void k_qx8(GM_ADDR x, GM_ADDR xrep, GM_ADDR xau
     AscendC::PipeBarrier<PIPE_ALL>();
 }
 
-extern "C" __global__ __aicore__ void k_gemm_w8d(GM_ADDR w, GM_ADDR xrep, GM_ADDR xaux, GM_ADDR y, int32_t n, int32_t k)
+extern "C" __global__ __aicore__ void k_gemm_w8d(GM_ADDR w, GM_ADDR xrep, GM_ADDR xaux, GM_ADDR y, int32_t n, int32_t k, GM_ADDR flags, int32_t gate_seq, int32_t done_seq)
 {
+    db_gate(flags, gate_seq);
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> ub_buf;
     AscendC::TBuf<AscendC::TPosition::A1> l1_buf;
@@ -2378,6 +2406,7 @@ extern "C" __global__ __aicore__ void k_gemm_w8d(GM_ADDR w, GM_ADDR xrep, GM_ADD
         AscendC::WaitFlag<AscendC::HardEvent::V_M>(ec[i]);
     }
     AscendC::PipeBarrier<PIPE_ALL>();
+    db_done(flags, done_seq);
 }
 
 // m>1 prefill: W4A8 布局 -> 五平面拆解反量化 fp16 -> mmad (fp16, fp32 累加整个 k)
