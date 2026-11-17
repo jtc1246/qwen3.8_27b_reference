@@ -687,10 +687,11 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
     } else {
         Acl::h2d(DV->d_tok, tokens, (size_t)T * 4);
         dq_rows(DV->tok_embd, DV->d_tok, DV->d_x, T); // token embedding
-        if (mask) { // 图片 embedding 行直接覆盖
+        if (mask) { // 图片 embedding 行直接覆盖 (embd 是紧凑的图片行, 只含 mask 为 1 的行, 与 CPU 版语义一致)
             Acl::sync();
+            int j = 0;
             for (int t = 0; t < T; t++)
-                if (mask[t]) Acl::h2d(fp(DV->d_x, (size_t)t * D), embd + (size_t)t * D, (size_t)D * 4);
+                if (mask[t]) Acl::h2d(fp(DV->d_x, (size_t)t * D), embd + (size_t)j++ * D, (size_t)D * 4);
         }
     }
     const char* stop_env = getenv("QWEN_NPU_STOP"); // 调试: 跑完第 N 层后停
@@ -936,9 +937,10 @@ int qwen_eval(const int* tokens, int n, const float* embd, const uint8_t* embd_m
             Acl::sync();
             G_prof_t0 = std::chrono::steady_clock::now();
         }
-        for (int i = 0; i < n; i += CHUNK) {
+        for (int i = 0, r = 0; i < n; i += CHUNK) { // r: 之前各 chunk 的图片行数 (embd 只含 mask 为 1 的行)
             int T = std::min(CHUNK, n - i);
-            eval_chunk(tokens + i, T, embd ? embd + (size_t)i * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+            eval_chunk(tokens + i, T, embd ? embd + (size_t)r * D : nullptr, embd_mask ? embd_mask + i : nullptr, pos3 ? pos3 + i * 3 : nullptr, i + T == n);
+            for (int t = i; embd_mask && t < i + T; t++) r += embd_mask[t];
         }
     });
     return 0;
@@ -951,7 +953,9 @@ void qwen_prof_dump() { // 打印并清零 QWEN_NPU_PROF 的逐 kernel 累计耗
     }
 }
 
-int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist) {
+int qwen_sample(float temperature, int top_k, float top_p, float min_p, float presence_penalty, const int* hist, int n_hist, int think_ok) {
+    // 与 CPU 版一致: 只在可采样的 token 里采样: 普通文本 token [0, N_TEXT), think_ok (开了 thinking 且还在思考中) 时加上思考结束 token, 否则加上 im_end (思考中不能直接结束); 其余控制 token 和输出层的填充位不参与
+    const int N_TEXT = 248044, THINK_END = 248069, IM_END = 248046;
     float* l = G_work.data();
     memcpy(l, G_logits, VOCAB * sizeof(float));
     if (presence_penalty != 0 && hist) {
@@ -964,12 +968,14 @@ int qwen_sample(float temperature, int top_k, float top_p, float min_p, float pr
         for (int i = 0; i < n_hist; i++)
             if (hist[i] >= 0 && hist[i] < VOCAB) G_seen[hist[i]] = 0;
     }
-    if (temperature <= 0) return (int)(std::max_element(l, l + VOCAB) - l);
     int* idx = G_idx.data();
-    for (int i = 0; i < VOCAB; i++) idx[i] = i;
-    int n = (top_k > 0 && top_k < VOCAB) ? top_k : VOCAB;
+    int m = 0; // 可采样的个数
+    for (int i = 0; i < VOCAB; i++)
+        if (i < N_TEXT || i == (think_ok ? THINK_END : IM_END)) idx[m++] = i;
+    if (temperature <= 0) return *std::max_element(idx, idx + m, [&](int a, int b) { return l[a] < l[b]; }); // 相同时取 id 小的, 与原来一致
+    int n = (top_k > 0 && top_k < m) ? top_k : m;
     auto cmp = [&](int a, int b) { return l[a] > l[b]; };
-    if (n < VOCAB) std::nth_element(idx, idx + n, idx + VOCAB, cmp);
+    if (n < m) std::nth_element(idx, idx + n, idx + m, cmp);
     std::sort(idx, idx + n, cmp);
     vector<double> p(n);
     double sum = 0;

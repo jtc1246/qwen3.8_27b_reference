@@ -97,23 +97,24 @@ export CANN_HOME=/path/to/ascend-toolkit/latest
 ./qwen_npu/compile.sh
 ```
 
-产物是 `qwen_npu/cmake_build/libqwen_npu.so` (单芯) 和 `libqwen_npu2.so` (双芯张量并行, 用 device 和 device+1 两颗), 运行前需 `source $CANN_HOME/set_env.sh`; 目前通过 ctypes 直接加载使用, 尚未接入 server.py。
+产物是 `qwen_npu/cmake_build/libqwen_npu2.so` (双芯张量并行, 用 device 和 device+1 两颗, 服务的 `npu` 后端用它) 和 `libqwen_npu.so` (单芯, 只用于测试验证, 不接服务), 运行前需 `source $CANN_HOME/set_env.sh`。NPU 后端不用 GGUF, 模型是 [RedHatAI/Qwen3.8-27B-INT4](https://huggingface.co/RedHatAI/Qwen3.8-27B-INT4) 的 `model.safetensors` (服务里用 `--st` 指定)。
 
 ## 运行
 
 ### 需要的文件
 
-- GGUF: `Qwen3.8-27B-Q4_K_M.gguf`
+- GGUF: `Qwen3.8-27B-Q4_K_M.gguf` (cpu / cuda 后端; npu 后端用 [RedHatAI/Qwen3.8-27B-INT4](https://huggingface.co/RedHatAI/Qwen3.8-27B-INT4) 的 `model.safetensors`, `--st` 指定)
 - 官方仓库 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) 的 tokenizer/processor 配置文件 (`tokenizer.json`、`tokenizer_config.json`、`chat_template.jinja`、`preprocessor_config.json`、`config.json`、`model.safetensors.index.json` 等), 以及包含视觉塔权重的 `model-00001-of-00018.safetensors` (只需要这一个分片)
 
 ### OpenAI 兼容服务
 
 ```bash
 python -u server.py --type cuda --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --hf-dir /path/to/Qwen3.8-27B --port 8000
+python -u server.py --type npu --st /path/to/Qwen3.8-27B-INT4/model.safetensors --hf-dir /path/to/Qwen3.8-27B --port 8000 # NPU (昇腾双芯)
 python -u tests/test_server.py --base http://127.0.0.1:8000/v1
 ```
 
-`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数) 或 `cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。`--ctx` 默认 cpu 32768, cuda 262144 (cuda 是每个槽的上下文, 启动时分配 4 个槽的 KV, 约 52GB 显存)。`--cache-dir <目录>` 启用磁盘前缀缓存 (cpu 和 cuda 都支持, 直接使用该目录, 见 docs/cpu_impl.md 9.1 节和 docs/cuda_impl.md 4.2 节); 通过 router 启动时由 router 统一传入。`--sampler-rootfs` 见下面的自定义采样。完整的参数和行为见 [docs/python_impl.md](docs/python_impl.md)。
+`--type` 选择后端: `cpu` (默认, `--threads` 指定线程数)、`cuda` (`--device` 指定 GPU, 文本主干和视觉塔都在 GPU 上) 或 `npu` (昇腾双芯张量并行, `--device` 指定 NPU 编号, 用 device 和 device+1 两颗; 模型用 `--st` 指定, 运行前需 `source $CANN_HOME/set_env.sh`; 视觉塔有 CUDA 用 CUDA, 否则 CPU; 请求串行处理, 并发的在 python 排队; 不支持前缀缓存和自定义采样)。`--port 0` 由系统自动分配端口, 实际端口打印在启动完成的日志里。`--ctx` 默认 cpu 32768, cuda / npu 262144 (cuda 是每个槽的上下文, 启动时分配 4 个槽的 KV, 约 52GB 显存; npu 的 KV 在 256k 时每芯约 5.4GB)。`--cache-dir <目录>` 启用磁盘前缀缓存 (cpu 和 cuda 都支持, 直接使用该目录, 见 docs/cpu_impl.md 9.1 节和 docs/cuda_impl.md 4.2 节); 通过 router 启动时由 router 统一传入。`--sampler-rootfs` 见下面的自定义采样。完整的参数和行为见 [docs/python_impl.md](docs/python_impl.md)。
 
 ### 自定义采样 (只有 cuda)
 
@@ -128,7 +129,7 @@ python -u tests/test_wasm_sampler.py --base http://127.0.0.1:8000/v1 --hf-dir /p
 ### 多后端路由
 
 ```bash
-python -u router.py --mask 11 --port 8000 --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --hf-dir /path/to/Qwen3.8-27B --cache-dir /path/to/cache_root
+python -u router.py --mask 111 --port 8000 --gguf /path/to/Qwen3.8-27B-Q4_K_M.gguf --st /path/to/Qwen3.8-27B-INT4/model.safetensors --hf-dir /path/to/Qwen3.8-27B --cache-dir /path/to/cache_root # mask 三位依次是 cpu/cuda/npu
 python -u tests/test_router.py --base http://127.0.0.1:8000/v1
 python -u tests/test_server.py --base http://127.0.0.1:8000/v1 --model qwen3.8-27b-cuda # 经路由测某个后端
 ```
@@ -146,10 +147,10 @@ python -u tests/smoke_test.py --type cuda --gguf /path/to/Qwen3.8-27B-Q4_K_M.ggu
 python 代码在仓库根目录, 与具体后端无关 (各后端只有 C++ 库, C 接口相同)。完整的实现和内部机制见 [docs/python_impl.md](docs/python_impl.md)。
 
 - `server.py`: OpenAI 兼容服务 (单个后端), 用法见上面的"运行"
-  - 接口: `POST /v1/chat/completions` (支持 `stream`), `GET /v1/models`, `GET /health`; 模型名是 `qwen3.8-27b-{cpu,cuda}`
+  - 接口: `POST /v1/chat/completions` (支持 `stream`), `GET /v1/models`, `GET /health`; 模型名是 `qwen3.8-27b-{cpu,cuda,npu}`
   - 支持的参数: `messages` (system / user / assistant, 文本 + `image_url` 图片, 只支持 base64 的 data URL), `temperature`, `seed`, 思考控制 (`enable_thinking` 或 `chat_template_kwargs.enable_thinking`; `reasoning_effort`: none / minimal 关闭思考, low / medium / high / xhigh), 自定义采样 (`sampler_cpp` / `sampler_data`, 只有 cuda), 其余参数忽略
   - 返回: 思考内容在 `reasoning_content`, 正文在 `content`, 都是模型原样生成的文本 (不做 strip); `usage` 里另有前缀缓存的命中 / 写入统计
-  - 默认采样参数与官方推荐一致, `temperature` 只覆盖温度; cuda 最多 4 个请求同时进行, 更多的排队; cpu 串行处理
+  - 默认采样参数与官方推荐一致, `temperature` 只覆盖温度; cuda 最多 4 个请求同时进行, 更多的排队; cpu / npu 串行处理
 - `router.py`: 同时启动多个后端, 对外是一个服务, 按请求里的 `model` 转发 (用法见上面的"多后端路由")
 - `qwen.py`: C++ 库的 ctypes 封装, 可以不起服务直接在 python 里推理: `qwen.load(gguf, backend)` 后用 `qwen.generate(token 序列, thinking=...)` 逐个得到输出 token (例子见 `tests/smoke_test.py`)
 - `qwen_tok.py`: tokenizer, 只用标准库: `qwen_tok.load("tokenizer.json")`, `encode(text)` / `decode(ids)` / `token_bytes(id)`

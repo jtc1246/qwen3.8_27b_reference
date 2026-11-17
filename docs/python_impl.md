@@ -8,7 +8,7 @@ python 代码在仓库根目录, 与具体后端无关; 各后端 (`qwen_cpu/`�
 
 C++ 库的 ctypes 封装。
 
-- `load(gguf, backend, n_threads, device, max_ctx)` 按 `backend` 选择 `LIBS` 里的 so (新增后端只需在 `LIBS` 加一项); 输入 token 序列 (可附带图片 embedding 和 3D 位置), `generate()` 逐个返回采样出的 token id
+- `load(gguf, backend, n_threads, device, max_ctx)` 按 `backend` 选择 `LIBS` 里的 so (新增后端只需在 `LIBS` 加一项; 目前是 `cpu`、`cuda`、`npu` (昇腾双芯张量并行, 单芯 so 只用于测试不接服务), npu 的模型路径是 RedHatAI INT4 的 `model.safetensors`, 运行前需 source CANN 的 set_env.sh); 输入 token 序列 (可附带图片 embedding 和 3D 位置), `generate()` 逐个返回采样出的 token id
 - 一个模块实例只加载一个后端, 需要同时用两个时用 importlib 把 `qwen.py` 加载成两个模块 (见 `tests/cuda_vs_cpu.py`)
 - cuda 另有引擎模式 `engine_*` (server.py 用), 与 `eval_tokens` 等不能混用: `engine_args` 预先准备好 `qwen_prefill` 的全部参数 (拿到 ticket 之后不能再出错), `engine_prefill` 按 ticket 顺序 prefill 并采样第一个 token, `engine_next` 阻塞读取新 token, `engine_cancel` 取消, `engine_cache_stats` / `engine_error` 在请求结束后取缓存统计和自定义采样的错误
 
@@ -29,7 +29,7 @@ OpenAI 兼容服务 (单个后端)。
 ### 3.1 接口和参数
 
 - 接口: `POST /v1/chat/completions` (支持 `stream`), `GET /v1/models`, `GET /health`
-- 模型名: `{--model-name}-{--type}`, 默认 `qwen3.8-27b-cpu` / `qwen3.8-27b-cuda`, 只用于 `/v1/models` 和响应里的 `model` 字段, 请求里的 `model` 不校验。`/v1/models` 返回 `{"object": "list", "data": [{"id": "qwen3.8-27b-cuda", "object": "model", "created": <请求时的时间戳>, "owned_by": "local"}]}`
+- 模型名: `{--model-name}-{--type}`, 默认 `qwen3.8-27b-{cpu,cuda,npu}`, 只用于 `/v1/models` 和响应里的 `model` 字段, 请求里的 `model` 不校验。`/v1/models` 返回 `{"object": "list", "data": [{"id": "qwen3.8-27b-cuda", "object": "model", "created": <请求时的时间戳>, "owned_by": "local"}]}`
 - 支持的参数: `messages` (system/user/assistant, 文本 + `image_url` 图片, 只支持 base64 的 data URL `data:<类型>;base64,<数据>`, 不支持链接, 不会因为图片发出网络请求), `temperature`, `seed`, 思考控制 (`enable_thinking` 或 `chat_template_kwargs.enable_thinking`; `reasoning_effort`: none/minimal 关闭思考, low/medium/high/xhigh), 自定义采样 (`sampler_cpp` / `sampler_data`, 只有 cuda, 见 [custom_sampler.md](custom_sampler.md)), 其余参数忽略
 - 启动时先加载完所有内容再开始监听; 流式请求的客户端断开会立即停止生成
 
@@ -42,7 +42,7 @@ OpenAI 兼容服务 (单个后端)。
 
 ### 3.3 并发
 
-- cpu: 推理是单序列, 并发请求排队串行处理, 不会报错
+- cpu / npu: 推理是单序列, 并发请求在 python 排队串行处理 (不进 C++), 不会报错; npu 后端模型用 `--st` 指定 (RedHatAI INT4 的 `model.safetensors`), 默认 `--ctx` 262144, 不支持前缀缓存和自定义采样
 - cuda: 最多 4 个请求同时进行, 更多的按到达顺序排队; 输入 (prefill) 按到达顺序逐个算, 输出 (decode) 所有请求每步一起算; prefill 和 decode 同时运行时按 SM 分区 (`--dec-ratio`, decode 默认占 0.31, 本卡 156 SM 时为 48 个, 其余给 prefill), 只有一种时用整卡。同一请求 (固定 seed) 单独跑和并发跑的输出完全相同
 
 ### 3.4 拼 prompt (`build_tokens`)
@@ -61,7 +61,7 @@ OpenAI 兼容服务 (单个后端)。
 
 ### 3.6 图片
 
-- 图片预处理用 transformers 的官方 image processor, 视觉塔用 transformers 的模块加载官方权重; 视觉塔 fp32, `--type cuda` 时在 GPU 上, 否则在 CPU 上
+- 图片预处理用 transformers 的官方 image processor, 视觉塔用 transformers 的模块加载官方权重; 视觉塔 fp32, `--type cuda` 时在 GPU 上, npu 时不上 NPU (CUDA 可用就在 GPU 上, 否则 CPU), 其余在 CPU 上
 - 图片大小上限默认与官方相同 (最多 16777216 像素, 约 16384 token), `--max-image-pixels` 可以调小
 - 图片缓存: 视觉塔的输出按图片原始字节 (base64 解码后) 的 sha256 缓存, 只在内存里, 不写文件; 一个请求里命中的图片直接用缓存, 未命中的图片一起过视觉塔再按图片拆开存入。按 LRU 淘汰, 上限 `--image-cache-mb` (默认 4096MB, 每张 1024 token 的图约 20MB), 0 表示不缓存。图片预处理 (resize、切 patch) 每次仍会执行, 因为需要它确定图片 token 数
 
@@ -69,12 +69,12 @@ OpenAI 兼容服务 (单个后端)。
 
 多后端路由, 后端列表都取自 `qwen.LIBS`, 新增后端不需要改路由。
 
-- `--mask`: 0/1 串, 第 i 位对应 `qwen.LIBS` 的第 i 个后端 (目前依次是 `cpu`、`cuda`), 1 表示启动; 默认全 1 (现在是 `11`)。位数不对、一个都没选都直接报错
+- `--mask`: 0/1 串, 第 i 位对应 `qwen.LIBS` 的第 i 个后端 (目前依次是 `cpu`、`cuda`、`npu`), 1 表示启动; 默认全 1 (现在是 `111`)。位数不对、一个都没选都直接报错
 - 每个选中的后端启动一个 `server.py --type <后端> --host 127.0.0.1 --port 0` 子进程, 实际端口从子进程日志中解析; 除 `--host`、`--port`、`--mask`、`--start-timeout`、`--cache-dir` 外的参数 (`--gguf`、`--hf-dir`、`--ctx`、`--threads`、`--device`、`--sampler-rootfs` 等) 原样传给每个子进程, 不能传 `--type`
 - `--cache-dir` (必填, 没有默认值): 前缀缓存根目录, 不存在则创建 (上级目录必须存在); 支持缓存的后端 (`qwen.CACHE_BACKENDS`, 目前是 cpu 和 cuda) 收到 `--cache-dir <根目录>/<后端名>`, 其余后端不传; 子目录由 server 自己检查和创建
 - 子进程日志加 `[后端名]` 前缀转发到路由的 stderr
 - 启动阶段同时等待所有子进程, 任何一个启动失败 (没有 GPU、显存不够、参数错误等, 子进程退出) 或超过 `--start-timeout` (默认 600s) 未就绪, 立即结束全部子进程并报错退出; 运行中任一子进程退出, 路由也整体退出。子进程设置了 `PR_SET_PDEATHSIG`, 路由被 kill 时子进程也会被结束
-- `GET /v1/models`: 返回所有已启动后端的模型 (各子进程自己报告的名字), 例如 `--mask 11` 时是 `qwen3.8-27b-cpu` 和 `qwen3.8-27b-cuda`
+- `GET /v1/models`: 返回所有已启动后端的模型 (各子进程自己报告的名字), 例如 `--mask 110` 时是 `qwen3.8-27b-cpu` 和 `qwen3.8-27b-cuda`
 - `POST /v1/chat/completions`: 把 `model` 转小写后, 检查包含哪些后端名; 恰好包含一个且该后端已启动时原样转发 (流式边收边回, 客户端断开会传到后端并停止生成), 一个都不包含、包含多个或后端没启动都返回 400
 
 ## 5. wasm_sampler.py

@@ -6,7 +6,7 @@ import os, sys, time, ctypes, hashlib, threading
 from array import array
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-LIBS = {"cpu": "qwen_cpu/cmake_build/libqwen.so", "cuda": "qwen_cuda/cmake_build/libqwen_cuda.so"}
+LIBS = {"cpu": "qwen_cpu/cmake_build/libqwen.so", "cuda": "qwen_cuda/cmake_build/libqwen_cuda.so", "npu": "qwen_npu/cmake_build/libqwen_npu2.so"} # npu: 昇腾双芯张量并行 (单芯版 libqwen_npu.so 只用于测试验证, 不接服务), 模型路径是 RedHatAI INT4 的 model.safetensors, 运行前需 source CANN 的 set_env.sh
 CACHE_BACKENDS = ("cpu", "cuda") # 支持前缀缓存 (qwen_cache_init) 的后端
 EOS_IDS = (248046, 248044) # <|im_end|>, <|endoftext|>
 IM_START, IM_END, IMAGE_TOKEN, THINK_END = 248045, 248046, 248056, 248069
@@ -19,7 +19,7 @@ def log(msg):
 
 
 def load(gguf_path, backend="cpu", n_threads=16, device=0, max_ctx=32768, dec_sm=None, cache_dir=None, cache_threads=8):
-    # backend: LIBS 的 key; n_threads 只对 cpu 有效, device (GPU 编号) 只对 cuda 有效
+    # backend: LIBS 的 key; n_threads 只对 cpu 有效, device 对 cuda (GPU 编号) 和 npu (NPU 编号, 用 device 和 device+1 两颗) 有效
     # cuda: max_ctx 是每个槽的上下文 (qwen_nseq() 个槽的 KV 全部预先分配); dec_sm: prefill 和 decode 同时运行时 decode 分区的 SM 数, None 用 C++ 默认值
     # cache_dir: 前缀缓存目录 (CACHE_BACKENDS 里的后端, 调用方已检查并加锁, 其中 tmp/ 已清空), cache_threads: 后台量化 state 的线程数
     global G_lib, G_backend

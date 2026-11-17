@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # OpenAI 兼容 chat completions 服务: 支持图片、system、temperature、seed、thinking 控制, 其余参数忽略
-# cpu: C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求排队等待而不报错
+# cpu / npu: C++ 推理是单序列全局状态, 请求用全局锁串行处理, 并发请求在 python 排队等待而不报错 (npu 是昇腾双芯张量并行, 模型用 --st 指定, 不支持前缀缓存和自定义采样; 视觉塔有 CUDA 用 CUDA, 否则 CPU)
 # cuda: 引擎模式, 最多 qwen.nseq() (4) 个请求同时进行: 超出的在 python 按到达顺序排队; prefill 在 C++ 里按顺序逐个算, decode 所有序列每步一起算, 两者同时跑时按 SM 分区
 # --type 选择后端 (qwen.LIBS), cuda 时视觉塔也在 GPU 上; 视觉塔输出按图片原始字节的 sha256 缓存在内存 (LRU)
 import os, re, sys, io, json, time, uuid, codecs, fcntl, shlex, base64, random, ctypes, shutil, sqlite3, hashlib, argparse, threading, contextlib
@@ -628,14 +628,15 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global G_args, G_imgproc, G_vis, G_dev, G_pool, G_cache_dir
     p = argparse.ArgumentParser(description="Qwen3.8-27B OpenAI 兼容服务")
-    p.add_argument("--gguf", required=True, help="Q4_K_M GGUF 路径")
+    p.add_argument("--gguf", default=None, help="Q4_K_M GGUF 路径 (cpu / cuda 后端必填)")
+    p.add_argument("--st", default=None, help="RedHatAI INT4 的 model.safetensors 路径 (npu 后端必填; 运行前需 source CANN 的 set_env.sh)")
     p.add_argument("--hf-dir", required=True, help="官方 HF 仓库目录: tokenizer/processor 配置 + 含 model.visual.* 的 safetensors 分片")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000, help="0 表示由系统自动分配, 实际端口见启动完成的日志")
-    p.add_argument("--type", default="cpu", choices=list(qwen.LIBS), help="推理后端; cuda 时文本主干和视觉塔都在 GPU 上")
+    p.add_argument("--type", default="cpu", choices=list(qwen.LIBS), help="推理后端; cuda 时文本主干和视觉塔都在 GPU 上; npu 时主干在昇腾 NPU (双芯), 视觉塔在 CUDA (可用时) 或 CPU")
     p.add_argument("--threads", type=int, default=16, help="cpu 后端的推理线程数, 以及 torch (CPU 上的视觉塔、预处理) 的线程数")
-    p.add_argument("--device", type=int, default=0, help="cuda 后端使用的 GPU 编号")
-    p.add_argument("--ctx", type=int, default=None, help="最大上下文 (prompt + 输出), 默认 cpu 32768, cuda 262144; cuda 是每个槽的上下文, 启动时分配全部槽的 KV")
+    p.add_argument("--device", type=int, default=0, help="cuda 的 GPU 编号 / npu 的 NPU 编号 (用 device 和 device+1 两颗)")
+    p.add_argument("--ctx", type=int, default=None, help="最大上下文 (prompt + 输出), 默认 cpu 32768, cuda / npu 262144; cuda 是每个槽的上下文, 启动时分配全部槽的 KV")
     p.add_argument("--dec-ratio", type=float, default=0.31, help="cuda: prefill 和 decode 同时运行时 decode 分区占的 SM 比例 (其余给 prefill), 取最近的可用值 (偶数个, 两边都至少 8 个), 本卡 156 SM 时 0.31 为 48 个")
     p.add_argument("--max-image-pixels", type=int, default=16777216, help="单张图片最大像素数 (约每 1024 像素 1 个 token), 默认与官方 preprocessor_config 相同 (16777216), 0 也表示用官方配置")
     p.add_argument("--model-name", default="qwen3.8-27b", help="模型名前缀, 对外返回的名称是 {model-name}-{type}; 请求里的 model 不校验")
@@ -646,8 +647,11 @@ def main():
     p.add_argument("--wasm-tmp-dir", default="/dev/shm", help="自定义采样编译用的临时目录, 每次编译在这里解压一份编译镜像 (约 360MB), 用完删除")
     G_args = p.parse_args()
     G_args.model_name = f"{G_args.model_name}-{G_args.type}"
+    model_path = G_args.st if G_args.type == "npu" else G_args.gguf
+    if model_path is None:
+        p.error(f"❌ {G_args.type} 后端必须指定 {'--st' if G_args.type == 'npu' else '--gguf'}")
     if G_args.ctx is None:
-        G_args.ctx = 262144 if G_args.type == "cuda" else 32768
+        G_args.ctx = 32768 if G_args.type == "cpu" else 262144
     t0 = time.time()
     torch.set_num_threads(G_args.threads)
     if G_args.type == "cuda":
@@ -656,6 +660,8 @@ def main():
         G_dev = f"cuda:{G_args.device}"
         n_sm = torch.cuda.get_device_properties(G_args.device).multi_processor_count
         dec_sm = min(max(round(n_sm * G_args.dec_ratio / 2) * 2, 8), n_sm - 8) # green context 按 2 个 SM 分, 每个分区至少 8 个
+    elif G_args.type == "npu" and torch.cuda.is_available(): # 图片不上 NPU: 视觉塔有 CUDA 用 CUDA, 否则留在 CPU
+        G_dev = "cuda:0"
     if G_args.cache_dir is not None and G_args.type not in qwen.CACHE_BACKENDS:
         log(f"⚠️ {G_args.type} 后端暂不支持前缀缓存, 忽略 --cache-dir")
     elif G_args.cache_dir is not None:
@@ -665,7 +671,7 @@ def main():
         wasm_sampler.init(G_args.sampler_rootfs, os.path.join(G_cache_dir, "wasm") if G_cache_dir else None, G_args.wasm_tmp_dir) # 编译缓存放在前缀缓存目录里 (前缀缓存只认两位十六进制的子目录, 不受影响)
         if G_args.sampler_rootfs:
             log(f"ℹ️ 自定义采样: 编译镜像 {wasm_sampler.G_image}, 编译缓存 {wasm_sampler.G_dir}, 临时目录 {wasm_sampler.G_tmp}")
-    qwen.load(G_args.gguf, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None, G_cache_dir, G_args.cache_threads)
+    qwen.load(model_path, G_args.type, G_args.threads, G_args.device, G_args.ctx, dec_sm if G_args.type == "cuda" else None, G_cache_dir, G_args.cache_threads)
     if G_args.type == "cuda":
         G_pool = SlotPool(qwen.nseq())
         qwen.engine_start()
