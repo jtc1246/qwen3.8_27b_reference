@@ -28,6 +28,7 @@
 #include "aclrtlaunch_k_conv.h"
 #include "aclrtlaunch_k_dn_pre.h"
 #include "aclrtlaunch_k_deltanet.h"
+#include "aclrtlaunch_k_dnc.h"
 #include "aclrtlaunch_k_qk_rope.h"
 #include "aclrtlaunch_k_attn.h"
 #include "aclrtlaunch_k_attn_merge.h"
@@ -466,7 +467,11 @@ void eval_chunk(const int* tokens, int T, const float* embd, const uint8_t* mask
             Acl::ck(ACLRT_LAUNCH_KERNEL(k_conv)(8, Acl::G_stream, G_d_qkv, L.conv_state, L.conv_w, T), "launch conv");
             prof_mark(3);
             Acl::ck(ACLRT_LAUNCH_KERNEL(k_dn_pre)(8, Acl::G_stream, G_d_qkv, G_d_ab, L.ssm_a, L.dt_bias, G_d_bd, T), "launch dn_pre");
-            Acl::ck(ACLRT_LAUNCH_KERNEL(k_deltanet)(8, Acl::G_stream, G_d_qkv, G_d_bd, L.ssm_norm, L.ssm_state, G_d_o, T), "launch deltanet");
+            static int tokdn = getenv("QWEN_NPU_TOKDN") ? 1 : 0; // 调试: 强制 prefill 也走逐 token 版
+            static int dnconly = getenv("QWEN_NPU_DNCONLY") ? atoi(getenv("QWEN_NPU_DNCONLY")) : -1; // 调试: 仅该层用 chunk 版
+            bool use_tok = tokdn || (dnconly >= 0 && l != dnconly);
+            if (T == 1 || use_tok) Acl::ck(ACLRT_LAUNCH_KERNEL(k_deltanet)(8, Acl::G_stream, G_d_qkv, G_d_bd, L.ssm_norm, L.ssm_state, G_d_o, T), "launch deltanet");
+            else Acl::ck(ACLRT_LAUNCH_KERNEL(k_dnc)(8, Acl::G_stream, G_d_qkv, G_d_bd, L.ssm_norm, L.ssm_state, G_d_o, T), "launch dnc"); // chunk 化 cube 版
             prof_mark(4);
             pack_invalidate();
             matmul(L.ssm_out, G_d_o, T, G_d_out);
@@ -812,6 +817,11 @@ int qwen_dbg(const char* name, float* out, long long n) { // 调试: 读取中�
     else if (s == "att") p = G_d_att;
     else if (s == "g") p = G_d_g;
     else if (s == "u") p = G_d_u;
+    else if (s == "bd") p = G_d_bd;
+    else if (s == "sst") { // 调试: 某层的 DeltaNet 状态, 层号用 QWEN_NPU_SSTL
+        const char* e = getenv("QWEN_NPU_SSTL");
+        p = G_layers[e ? atoi(e) : 0].ssm_state;
+    }
     else return -1;
     Acl::bind();
     Acl::sync();

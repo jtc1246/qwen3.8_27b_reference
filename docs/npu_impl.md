@@ -2,7 +2,7 @@
 
 `qwen_npu/` 是文本主干在华为 Atlas 300I Duo (Ascend 310P3) 上的实现, 结构对应 [cpu_impl.md](cpu_impl.md) / [cuda_impl.md](cuda_impl.md): 模型常量、权重绑定、前向流程、采样和 C 接口与 CPU / CUDA 版一一对应。
 
-当前状态 (2026-11-15): **v3, 权重源从 GGUF 换成 RedHatAI/Qwen3.8-27B-INT4 的 `model.safetensors`** (compressed-tensors, int4 对称 group128, AWQ 平滑 + GPTQ; 选型调研见该模型卡与本文第 2 节), matmul 全部走 cube (fp16 反量化 + mmad)。单芯片、单序列, 不含投机解码 (MTP 文件不加载)。**v4: decode 改走 W4A8** — 主干 matmul 在 decode 时用 u8×u8 整数 mmad (x 由 `k_qx8` 动态量化 int8, 权重 int4 原位喂 cube), 反量化向量瓶颈消除; prefill 仍走 fp16 反量化 + mmad (从同一份权重布局五平面拆解)。**v5: attention 上 cube + KV cache q8** — KV cache 由 fp32 改为 u8 (零点 128) + per-128 fp16 scale (存储量化、计算 fp16, 与 CUDA 版 q8_0 同构), `k_attn` 重写为按 kv 头合并单元的 fp16 mmad 版 (见第 3 节), decode 的 KV 读冗余从 ~9× 降到 1×, 斜率 4.9→~0.4µs/ctx token (64K 外推 ~8.8 tok/s)。KV 为 i8 对称量化 (无零点), decode 的 V 反量化只剩一条 Cast (scale 折进 P)。**v6 (2026-11-16): prefill 向量侧优化** — ① `k_gemm_w8p` 事件流水化 (qbuf 双缓冲、se/so 两半 V→MTE3 乒乓、L1 w/x 槽按组奇偶双缓冲、MTE1/M 事件串接), 单 kernel 34~43 TFLOPS (原 ~21); ② DeltaNet 拆出 `k_dn_pre` (按 token 分核批量算 β/decay/softplus + q/k L2 归一化原位写回), `k_deltanet` 去掉全部逐 token 小向量操作与标量同步 (β/decay 表常驻 UB 直接 GetValue, 门控 1/sqrt 走向量广播, 输入/输出事件双缓冲); ③ `k_gemv_f32t`/`k_conv`/`k_silu_mul` 事件流水化。全部改动与 v5 在正确同步下逐位一致。**同时修复一个 v1 起就存在的宿主竞态**: `aclrtMemcpy` H2D 不进 stream 队列, 多 chunk prefill 时下一 chunk 的 cos/sin/tok 上传会在上一 chunk 的 kernel (qk_rope 等) 执行前覆盖数据 (无 sync 的 chunk 边界即 >256 token 都受影响, >512 token 可稳定观测到 build 相关差异), `eval_chunk` 开头加 `Acl::sync()` 修复, 修复后精度还略有提升。性能: prefill 1024 为 295 tok/s (v5 206), prefill 300 为 256 (v5 176); decode 与 v5 持平 (同条件对照一致, ~10.9-11.3 区间随机器状态波动, dn_pre 额外启动开销 ~0.3%)。精度 (竞态修复后新基线, 与修复后的 v5 逐位一致): decode KL vs CPU fp32 = 2.42e-2 / top1 29/32, 1100 tok prefill KL 7.82e-2 (修复前 9.53e-2); vs CPU (GGUF Q4_K_M) 300 tok prefill 后贪心 19/20, top10 10/10。python 侧 (`qwen.py` / `server.py`) 尚未接入该后端, 目前通过 ctypes 直接加载测试。
+当前状态 (2026-11-15): **v3, 权重源从 GGUF 换成 RedHatAI/Qwen3.8-27B-INT4 的 `model.safetensors`** (compressed-tensors, int4 对称 group128, AWQ 平滑 + GPTQ; 选型调研见该模型卡与本文第 2 节), matmul 全部走 cube (fp16 反量化 + mmad)。单芯片、单序列, 不含投机解码 (MTP 文件不加载)。**v4: decode 改走 W4A8** — 主干 matmul 在 decode 时用 u8×u8 整数 mmad (x 由 `k_qx8` 动态量化 int8, 权重 int4 原位喂 cube), 反量化向量瓶颈消除; prefill 仍走 fp16 反量化 + mmad (从同一份权重布局五平面拆解)。**v5: attention 上 cube + KV cache q8** — KV cache 由 fp32 改为 u8 (零点 128) + per-128 fp16 scale (存储量化、计算 fp16, 与 CUDA 版 q8_0 同构), `k_attn` 重写为按 kv 头合并单元的 fp16 mmad 版 (见第 3 节), decode 的 KV 读冗余从 ~9× 降到 1×, 斜率 4.9→~0.4µs/ctx token (64K 外推 ~8.8 tok/s)。KV 为 i8 对称量化 (无零点), decode 的 V 反量化只剩一条 Cast (scale 折进 P)。**v6 (2026-11-16): prefill 向量侧优化** — ① `k_gemm_w8p` 事件流水化 (qbuf 双缓冲、se/so 两半 V→MTE3 乒乓、L1 w/x 槽按组奇偶双缓冲、MTE1/M 事件串接), 单 kernel 34~43 TFLOPS (原 ~21); ② DeltaNet 拆出 `k_dn_pre` (按 token 分核批量算 β/decay/softplus + q/k L2 归一化原位写回), `k_deltanet` 去掉全部逐 token 小向量操作与标量同步 (β/decay 表常驻 UB 直接 GetValue, 门控 1/sqrt 走向量广播, 输入/输出事件双缓冲); ③ `k_gemv_f32t`/`k_conv`/`k_silu_mul` 事件流水化。全部改动与 v5 在正确同步下逐位一致。**同时修复一个 v1 起就存在的宿主竞态**: `aclrtMemcpy` H2D 不进 stream 队列, 多 chunk prefill 时下一 chunk 的 cos/sin/tok 上传会在上一 chunk 的 kernel (qk_rope 等) 执行前覆盖数据 (无 sync 的 chunk 边界即 >256 token 都受影响, >512 token 可稳定观测到 build 相关差异), `eval_chunk` 开头加 `Acl::sync()` 修复, 修复后精度还略有提升。性能: prefill 1024 为 295 tok/s (v5 206), prefill 300 为 256 (v5 176); decode 与 v5 持平 (同条件对照一致, ~10.9-11.3 区间随机器状态波动, dn_pre 额外启动开销 ~0.3%)。精度 (竞态修复后新基线, 与修复后的 v5 逐位一致): decode KL vs CPU fp32 = 2.42e-2 / top1 29/32, 1100 tok prefill KL 7.82e-2 (修复前 9.53e-2); vs CPU (GGUF Q4_K_M) 300 tok prefill 后贪心 19/20, top10 10/10。**v7 (2026-11-17): DeltaNet chunk 化上 cube + prefill attn 流水化 + pack_x 写出优化** — ① `k_dnc`: prefill (T>1) 的 DeltaNet 换成 chunk 化 (C=64) WY/UT 形式 (推导见 kernel 注释), chunk 内矩阵乘走 fp16 mmad 且全部 **split-fp16** (hi+lo 残差补偿, 把 u 的误差压到 ~1e-6 — delta rule 的 v−u 抵消会把任何进入 u 的 fp16 噪声放大几个量级, 普通 fp16 不可用), S 存储/累加链全程 f32, dl 求解 4×16 分块 (块间 fp16 mmad + 块内 f32 标量×行前代), decay 比值全在 log 域 (Ln 前钳 1e-30 防下溢 0, 外差钳 ≤0 防 Exp 溢出); 单层 1393→428ms, 对 host double 参考输出相对 ~1e-5 / 终态 ~5e-6; decode (T=1) 仍走逐 token 版, `QWEN_NPU_TOKDN=1` 可整体切回逐 token 版。② prefill 版 `k_attn` 事件流水化 (staging 早释放, 同 decode 模式), 310→238ms。③ `k_pack_x` UB 内交织成 fractal 连续序一次写出 (替代 8 次 32B 跨步 GM 写), 305→129ms。性能: **prefill 1024 = 444 tok/s** (v6 295), prefill 300 = 358, decode 不变。精度: decode KL 3.49e-2 (token 版基线 2.42e-2, 增量 ~1.1e-2 来自 chunk 版 ~1e-5/层的残余噪声经 delta 递推的敏感放大), top1 29/32 与基线持平, vs CPU 贪心 19/20 持平, 真实生成连贯; 若要基线精度可用 TOKDN 开关退回 (prefill 降至 ~330)。调试中发现并修复一个 **v5 起就潜伏的大坑**: `Brcb` 与 V 管线的依赖完全不保序 (PIPE_V 都不够, 必须前后 PIPE_ALL), 影响 v5 attn 的 linvd、v6 dn_pre/k_deltanet 的门控广播 (低概率 8 行一组坏值), 均已修复, 见第 4 节第 17 条。python 侧 (`qwen.py` / `server.py`) 尚未接入该后端, 目前通过 ctypes 直接加载测试。
 
 ## 1. 文件与构建
 
@@ -85,6 +85,7 @@ norm、ssm_a 等小向量转 f32 上传; `conv1d.weight` 重排成 `[4][QKV_DIM]
 | `k_silu_mul` | g = silu(g)·u, 按核均分逐元素; v6: 段双缓冲事件流水 (重载守卫用 MTE3_MTE2, 见第 4 节第 15 条) |
 | `k_conv` | 因果 conv1d (核宽 4) + SiLU, 作用于合并输出 [T][QKVZ] 的前 QKV_DIM 通道; 通道均分到核; v6: 6 缓冲轮转 (状态 3 + xn + 预取 2, token t 占用槽 t..t+3 mod 6, 预取目标 t+4), 输出双缓冲, 无逐 token barrier |
 | `k_dn_pre` | **v6 新增**, DeltaNet 预计算 (按 token 分核): β=sigmoid(b)、decay=exp(a·softplus) 批量算好写 bd [T][96]; q/k 行 L2 归一化(含 QSCALE)原位写回 qkvz。数值链与原逐 token 版逐位一致 (两半分别树求和再相加、先 1/x 再乘 QSCALE) |
+| `k_dnc` | **v7 新增**, prefill (T>1) 的 DeltaNet chunk 化 cube 版 (C=64, 尾块 β=0/w=0/行清零 pad): 每核 6 头 × 4 sub-chunk 串行, S [128][128] f32 常驻 UB。chunk 公式 (log 域): (I+A)dl = β∘v − β∘Λprev∘(K·S0), A=β∘exp(clprev_i−cl_j)∘tril∘(K·Kᵀ); O = diag(Λ)·(Q·S0) + (exp(cl_i−cl_j)∘tril∘QKᵀ)·DL; S' = Λ_C·S0 + K̃ᵀ·DL。全部 mmad 操作数 split-fp16 (hi+lo, ~23 个小 mmad), dl 分块求解 (块间 3-way split mmad, 块内 f32 标量×行前代, A 对角不读故 mask 只存含对角版), 门控 RMSNorm/silu 批量行操作。L0C 分 6 区; 独立测试台 tests/npu_dnchunk (host double 逐 token 参考 + 真实层数据回放) |
 | `k_deltanet` | 每核 6 个 v 头顺序处理, 状态 S[128][128] 常驻 UB; v6 重写: 输入为 `k_dn_pre` 归一化后的 qkvz + bd 表 (常驻 UB, β/decay 标量直接 GetValue, 无逐 token V↔S 同步), 门控 RMSNorm 的 1/sqrt 走 Brcb+Div 向量广播, 输入 4 行/输出行事件双缓冲; 剩余为递推本身的向量下限 (decay Muls S + 两次 S⊙广播 + 两棵列求和树 + MulAddDst ≈ 3.5µs/头/token) |
 | `k_qk_rope` | (t, 头) 单元分核; 输入 q+k+v 合并输出 [T][QKVC]; RMSNorm + 交错 MRoPE + **K/V 量化写入 q8 cache** (i8 对称 per-128 组, 量化用 fp16 舍入后的 scale, RINT 后钳 ±127, half→int8 Cast 实测可用); cos/sin 由 host 算好上传 |
 | `k_attn` | **cube 版 (v5)**: KV q8 反量化 fp16 (Cast+Adds−128+Mul, scale 以 16 复制存放配合 src1BlkStride=0 块乘) 后 Q·K^T 与 P·V 都走 fp16 mmad (fp32 累加)。scores 按转置方向算 (scoresT[j][m]=K·Q^T, A=K 流式 48-key tile, B=Q^T 常驻 L1), softmax 的行归约全部变成整列向量操作, 无行广播。decode (T=1): 单元 = (kv头, ctx 两段) 共 8 个, tile = 96 key, 单遍在线 softmax (sT 用 [96][16] 紧凑布局, 减 max 的广播靠 tmax 复制 4 份对齐整 repeat), staging 单缓冲 + 全事件流水 (反量化后立即释放, DMA 与余下链重叠)。**输出按转置方向累加 (outT[d][m] = V^T·P'_g 双 mmad, 每 d-half 一个)**: V 只 Cast 不乘 scale (scale 以 [j][2][16] 隔块跨步折进 P'), V 的 L0A 一次转置加载 48 fractal, OaccT 的重缩放/累加因 m 在 lane 维而各只需 1 条整 repeat 指令; 部分结果 (OaccT/m/l) 写 attp; prefill: 单元 = (kv头, 16-query 块), m = 6头×16token = 96 行, 两遍扫描 (K 二读走 16MB 共享缓存), 输出在 L0C 跨 tile 累加 (无重缩放), 门控在 kernel 内。因果边界行按 16-lane 周期掩码屏蔽 |
@@ -120,6 +121,11 @@ v6 (流水化) 新增:
 15. **`WaitFlag<SRC_DST>` 由 DST 管线执行, 事件类型必须按"谁等谁"选**: 要挡 MTE2 重载必须用 `MTE3_MTE2`/`V_MTE2`; 误用 `MTE3_V` 时等待发生在 V 管线, MTE2 完全不被挡, 跑飞覆盖在用缓冲。踩坑表现: k_silu_mul 用 `WaitFlag<MTE3_V>` 想挡重载, 结果大 T 时输入被下一段覆盖, 全模型表现为 prefill logits 大错而 decode (单段) 正常
 16. **宿主 `aclrtMemcpy` H2D 是同步拷贝但不排队到 stream**: 对已入队未执行的 kernel 要读的缓冲 (cos/sin/tok) 写入会直接覆盖 (WAR), 多 chunk prefill 必现; 且 corruption 随 build 的时序不同而不同 (每个 build 内确定, 跨 build 不同), 表现为"两个应当逐位一致的 build 在 >512 token 时结果不同"。修复: 覆盖宿主写之前 `aclrtSynchronizeStream` (eval_chunk 开头, decode 时 stream 已空闲, 代价可忽略)
 
+v7 (deltanet chunk 化) 新增:
+
+17. **`Brcb` 与 V 管线的依赖完全不保序, 前后都必须 `PipeBarrier<PIPE_ALL>` (PIPE_V 不够)**: 第 9 条的"同 V 管线依赖硬件保序"对 Brcb 不成立, Brcb 读前序 V 写 / 后续 V 读 Brcb 输出都会撞到旧值。表现: 低概率 (~每单元 0.1% 级) 一组 8 行 (= Brcb 一个 repeat) 用旧广播值, 整体 10-20% 运行出错且位置随机; 源与 Brcb 相隔指令多时窗口极小, 长期潜伏 (v5 attn 的 linvd、v6 dn_pre/k_deltanet 门控都踩了, 已修)。定位手段: 失败样本的坏行恰好 8 行对齐
+18. **f32 向量数学函数的边界**: Exp 对大正数溢出产生垃圾 (乘 mask 0 不保证得 0), 比值矩阵的上三角要先 `Mins(0)` 再 Exp; decay 可下溢到 0, `Ln(0)=-inf` 会让 log 域差值变 NaN, Ln 前要 `Maxs(1e-30)`。都是"数学上该是 0 的部分"被浮点边界放大成大错, 且只在真实分布 (强 decay / 长序列) 下触发, 随机测试数据难覆盖
+
 ## 5. 显存
 
 - 权重约 17.5GB (第 2 节, 含 embed 1.59GB); KV cache q8: 每 token 每层 2560B (K/V 各 1024B u8 + 256B scale), 16 层共 40KB/token (fp32 时代为 128KB), ctx 4096 时 160MB; DeltaNet 状态 201MB; 激活按 CHUNK = 256; x 打包缓冲 8.9MB
@@ -147,28 +153,28 @@ v6 (流水化) 新增:
 - `tests/npu_cube`: mmad fractal 布局验证 (第 4 节第 7 条的出处)
 - `tests/npu_attn2` (v5): `attn2_test` 对 k_attn/k_attn_merge/k_qk_rope 与 host double 参考全面对比 (decode n_past 扫 0~3100 含段/tile 边界, prefill 各 (T, n_past) 含因果边界, 全部相对误差 ~2e-4); `dbg_test`/`k_dbg.cpp` 是逐环节隔离测试台 (反量化链/两条 mmad 通路/P^T cast/双 mmad 共存/全 tile 复刻), 第 4 节第 13 条就是用它定位的
 
-## 8. 性能 (v6, Atlas 300I Duo 单颗 310P3, ECC 关)
+## 8. 性能 (v7, Atlas 300I Duo 单颗 310P3, ECC 关)
 
-| 项目 | v6 (prefill 流水化) | v5 (q8 KV + cube attn) | v4 (W4A8 decode) | v3 | v2 | v1 |
-|---|---|---|---|---|---|---|
-| prefill (300 tok, 256+44 两 chunk) | 256 tok/s | 176 | 161 | 215 | - | 1.9 |
-| prefill (1024 token) | 295 tok/s | 206 | 150 | 178 | 178 | - |
-| decode (ctx ~1024 / ~3100) | 持平 v5 | 11.3 / 11.1 tok/s | 10.6 / 9.6 | 6.67 / 6.23 | 5.1 / 4.8 | - |
-| 模型加载 (重打包 + 上传) | 25s | 26s | 26s | 23s | 21s | 14s |
+| 项目 | v7 (deltanet chunk 化) | v6 (prefill 流水化) | v5 (q8 KV + cube attn) | v4 (W4A8 decode) | v3 | v2 | v1 |
+|---|---|---|---|---|---|---|---|
+| prefill (300 tok, 256+44 两 chunk) | 358 tok/s | 256 | 176 | 161 | 215 | - | 1.9 |
+| prefill (1024 token) | 444 tok/s | 295 | 206 | 150 | 178 | 178 | - |
+| decode (ctx ~1024 / ~3100) | 持平 | 持平 v5 | 11.3 / 11.1 tok/s | 10.6 / 9.6 | 6.67 / 6.23 | 5.1 / 4.8 | - |
+| 模型加载 (重打包 + 上传) | 25s | 25s | 26s | 26s | 23s | 21s | 14s |
 
 分解与说明:
 
-- decode ~89ms/token 几乎全是权重 DMA (每 token 流读 ~14.8GB, I4W8 原型独立压测 170-192GB/s 接近纯 DMA 204), 绝对值随机器状态在 ~10.9-11.3 波动, v6 与 v5 同条件对照持平 (dn_pre 额外 48 次启动 ≈0.3%); attention 斜率实测 ~0.39µs/ctx token (演进见 v5 说明)
-- prefill 1024 分解 (v6, 开 prof 含同步开销, 总 3.95s / 实际 3.59s): gemm 1328ms (流水化后 ~40T, v5 2361), deltanet+dn_pre 1393ms (v5 1724, 已接近 fp32 向量递推下限 ~3.5µs/头/token), gemv_f32t 312 (两波调度所限), attn 310 (未流水), pack_x 305, 其余小 kernel ~300
-- 继续往上的空间: deltanet chunk 化上 cube (大头, 涉及混合精度需实测 KL), prefill 版 k_attn 流水化, pack_x 合并进上游 kernel; 全做完单芯估计 ~350-400
-- KV q8 对精度的增量 ~7e-4 KL, 低于预研时纯 A8 的增量 (2.03e-3), 被 W4 本底淹没
-- 原型与微测试在本机 tests/npu_w4a8 (W4A8 + w8p 流水版 pf_test) 和 tests/npu_attn2 (v5 attention, 见第 7 节); 向量/标量除法逐位一致性微测试在 tests/npu_div (排查 v6 差异时写的, 结论: 一致)
+- decode ~89ms/token 几乎全是权重 DMA (每 token 流读 ~14.8GB, I4W8 原型独立压测 170-192GB/s 接近纯 DMA 204), 绝对值随机器状态在 ~10.6-11.3 波动, 同条件对照各版持平; attention 斜率实测 ~0.39µs/ctx token (演进见 v5 说明)
+- prefill 1024 分解 (v7, 开 prof 含同步开销, 总 2.74s / 实际 2.31-2.39s): gemm 1316ms (~40T), deltanet(dn_pre+k_dnc) 428ms (v6 1393; k_dnc 原型单独计时 ~2ms/层/chunk, PIPE_ALL 满写法仍有流水空间), gemv_f32t 313 (两波调度所限), attn 238 (事件流水后; 剩余为逐 tile 串行 V 链), pack_x 130, 其余小 kernel ~310
+- 继续往上的空间: k_dnc 事件流水化 (当前全 PIPE_ALL, 估计还能省 100-200ms), gemv_f32t 输出布局改造, attn 更深流水; 单芯估计还有 ~500-550 的空间
+- KV q8 对精度的增量 ~7e-4 KL, 纯 A8 增量 2.03e-3, chunk 化 deltanet 增量 ~1.1e-2 (top1/贪心持平, TOKDN 开关可退回)
+- 原型与微测试: tests/npu_w4a8 (W4A8 + w8p 流水版), tests/npu_attn2 (attention), tests/npu_dnchunk (deltanet chunk 化, host double 参考 + 真实层数据回放 + DNC_REAL/DNC_D1 等开关), tests/npu_div (向量/标量除法逐位一致)
 
 ## 9. 已知不足与下一步
 
-1. **DeltaNet chunk 化上 cube** (prefill 剩余大头 1.4s): 向量侧修补已做完 (v6, 接近递推下限); 彻底方案是 chunk 化 (WY 表示), chunk 内两个大矩阵乘走 fp16 mmad、S 的累加链保 fp32 (fp16 舍入只发生在单次读出操作数, 不跨 token 累积), 需实测 KL 验证
-2. **prefill 版 k_attn 流水化** (310ms, 当前整段 PIPE_ALL 串行); **k_pack_x 合并进上游 kernel** (add_norm/silu 直接多产出一份 fp16 zZ, 省 305ms 的独立 pass)
+1. **k_dnc 事件流水化** (428ms, 当前全 PIPE_ALL 保守写法, 每头-chunk ~40 个 barrier); **精度余量**: KL 增量 1.1e-2 来自 split 后 ~1e-5/层残余噪声的 delta 递推放大, 若要进一步压需把 DLr 也参与块间/BDL 的 r·r 项 (收益有限) 或减小 C
+2. **prefill 版 k_attn 深度流水** (238ms, 已事件化但逐 tile 的 V 链仍串行); **k_pack_x 合并进上游 kernel** (add_norm/silu 直接多产出 fp16 zZ, 省掉 130ms 的独立 pass)
 3. **decode attention 斜率余量**: 实测 ~0.39µs/ctx token, DMA 理想 ~0.2; 已做: i8 对称 (省零点 Adds)、V scale 折进 P (V 反量化只剩 Cast)、outT 方向累加 (累加/重缩放各 1 条指令)。剩余是 K 的 Cast+Mul、K/V 各 16 次列片 copy 与残余不可重叠, 继续压空间不大
-4. **k_gemv_f32t 两波调度** (312ms): block_dim 12 > 物理 8 核; 改 8 块受输出 32B 对齐粒度限制 (每核 12 行 = 48B), 需要换输出布局才有解
+4. **k_gemv_f32t 两波调度** (313ms): block_dim 12 > 物理 8 核; 改 8 块受输出 32B 对齐粒度限制 (每核 12 行 = 48B), 需要换输出布局才有解
 5. 双芯片张量并行 (每颗一半权重, 两倍带宽)、与 python 服务接入
 6. 自定义采样 (wasm) 未移植; 图片按计划固定走 CPU / CUDA, 不上 NPU
