@@ -23,6 +23,7 @@ export CANN_HOME=/path/to/ascend-toolkit/latest  # 包含 set_env.sh 的目录
 ```
 
 - 需要: CANN toolkit + 与设备匹配的 ops 包、系统 g++ (C++17)、cmake; `compile.sh` 里的 cmake 路径按机器情况通过 `CMAKE_BIN` 覆盖
+- 环境搭建 (CANN/310P ops 下载校验、只有驱动时的用户态隔离安装) 和 AscendCL / ACLNN / Ascend C 的最小可运行示例见 [ascend_usage](https://github.com/jtc1246/ascend_usage), 本实现即在该环境上开发
 - kernel 通过 CANN 的 `ascendc.cmake` 框架编译 (SOC `Ascend310P3`, 核函数直调模式), host 通过生成的 `aclrtlaunch_*.h` 启动 kernel
 - 产物 `cmake_build/libqwen_npu.so` (单芯) 和 `libqwen_npu2.so` (双芯张量并行, 见第 9 节), 带 RPATH 指向 CANN lib64 和驱动目录; **运行前仍需 `source $CANN_HOME/set_env.sh`** (CANN 二级依赖和环境变量)
 - 链接时需要 `-Wl,-rpath-link` 指向 CANN lib64 与驱动目录, 否则 ld 解析 so 的二级依赖 (libascend_hal.so、libruntime.so 的符号) 会失败, CMakeLists 已包含

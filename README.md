@@ -90,7 +90,7 @@ export WAMR_DIR=/path/to/wasm-micro-runtime-WAMR-2.4.5 # 可选 (环境准备第
 
 产物是 `qwen_cuda/cmake_build/libqwen_cuda.so`, 唯一的动态依赖是驱动的 `libcuda.so.1`。
 
-NPU 版本 (需要昇腾驱动和 CANN toolkit + ops 包, 用系统 g++ 而不是 musl, 详见 [docs/npu_impl.md](docs/npu_impl.md)):
+NPU 版本 (需要昇腾驱动和 CANN toolkit + ops 包, 用系统 g++ 而不是 musl, 详见 [docs/npu_impl.md](docs/npu_impl.md); CANN 环境搭建与纯 C++ 用法的最小示例见 [ascend_usage](https://github.com/jtc1246/ascend_usage)):
 
 ```bash
 export CANN_HOME=/path/to/ascend-toolkit/latest
