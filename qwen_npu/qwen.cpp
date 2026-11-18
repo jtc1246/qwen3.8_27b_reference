@@ -19,6 +19,7 @@
 #include "acl.h"
 #include "st.h"
 #include "repack.h"
+#include "bar.h"
 #include "aclrtlaunch_k_gemm_i8.h"
 #include "aclrtlaunch_k_gemm_w8d.h"
 #include "aclrtlaunch_k_gemm_w8p.h"
@@ -121,6 +122,7 @@ struct Dev { // 每芯一份的全部状态 (权重分片 + 激活缓冲 + 重�
     const void* qx_src = nullptr; // k_qx8 结果缓存 (decode 时同一 x 只量化一次)
     int qx_k = 0;
     void* d_flag = nullptr; // doorbell 标志位 (int32 槽, 各占 64B): [0] 门槛 seq, [16+16b] block b 完成 seq
+    volatile int32_t* bar_flag = nullptr; // d_flag 的 BAR MMIO 别名 (标志页探测命中时非空, host 直读直写)
     int32_t dn_seq = 0, db_seq = 0; // 完成 / 门槛序号 (单调递增, qwen_reset 清零)
     vector<int> vheads; // 本芯 v 头 -> 全局 tiled v 头
     vector<int> rows_qkv, rows_z; // in_proj_qkv / in_proj_z 的本地行 -> HF 行 (conv1d 通道同 rows_qkv)
@@ -468,9 +470,14 @@ void prof_mark(int id) { // 把距上个标记的耗时记到 id 上
     G_prof_t0 = now;
 }
 
-void wait_done(int32_t seq) { // 轮询段尾 kernel 8 个 block 的完成标志 (一次 512B d2h), 绕开 sync 的完成上报链路
+void wait_done(int32_t seq) { // 轮询段尾 kernel 8 个 block 的完成标志, 绕开 sync 的完成上报链路
+    if (DV->bar_flag) { // BAR 直读 (0.44us/次); 序号单调递增, 过了的槽不用再看
+        for (int b = 0; b < 8; b++)
+            while (DV->bar_flag[16 + 16 * b] < seq) {}
+        return;
+    }
     int32_t s[128];
-    while (true) {
+    while (true) { // 一次 512B d2h (~6us)
         Acl::d2h(s, (uint8_t*)DV->d_flag + 64, 512);
         int ok = 1;
         for (int b = 0; b < 8; b++) ok &= s[b * 16] >= seq;
@@ -620,7 +627,10 @@ void host_norm_push(const float* w, float* hidden_slot, bool with_partial, bool 
         DV->qx_aux = (uint8_t*)DV->d_xq + XQ_AUX;
     } else if (need_f32)
         Acl::h2d((uint8_t*)DV->d_xq + XQ_XN, DV->xn_pin, (size_t)D * 4);
-    if (ring) Acl::h2d(DV->d_flag, &ring, 4); // doorbell: 数据就绪, 放行预下发的段首 kernel
+    if (ring) { // doorbell: 数据就绪, 放行预下发的段首 kernel (BAR 直写 0.14us, 否则 4B h2d ~6us)
+        if (DV->bar_flag) *DV->bar_flag = ring;
+        else Acl::h2d(DV->d_flag, &ring, 4);
+    }
     prof_mark(10);
 }
 
@@ -819,6 +829,7 @@ int qwen_init(const char* path, int device, int max_ctx) {
     auto t0 = std::chrono::steady_clock::now();
     Acl::init(device, NDEV);
     G_use_db = NDEV > 1 && !getenv("QWEN_NPU_NODB");
+    if (G_use_db && !getenv("QWEN_NPU_NOBAR")) Bar::open_map(); // mmap 一次 (主线程), 标志页探测在每芯初始化末尾
     if (!St::open(G_st, path)) return -1;
     G_max_ctx = max_ctx;
     for (int j = 0; j < LV; j++) G_perm48[j] = (j % LK) * 3 + j / LK; // tiled 头 j <- HF 头
@@ -940,6 +951,10 @@ int qwen_init(const char* path, int device, int max_ctx) {
             Acl::ck(aclrtMallocHost((void**)&DV->qx_pin, (size_t)XQ_TOTAL), "aclrtMallocHost qx");
             memset(DV->qx_pin, 0, (size_t)XQ_TOTAL); // 旋转副本的空隙字节保持 0
             DV->xn_pin = (float*)(DV->qx_pin + XQ_XN);
+            if (G_use_db && Bar::G_base) { // 标志页探测须在本芯全部分配之后 (高物理地址段才在窗口内)
+                void* pg = Bar::probe_flag_page(&DV->bar_flag, di);
+                if (pg) DV->d_flag = pg; // kernel 侧语义不变 (还是普通 GM), 只是 host 侧多了 MMIO 别名
+            }
         }
     });
     double up = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();

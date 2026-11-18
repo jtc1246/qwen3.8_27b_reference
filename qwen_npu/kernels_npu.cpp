@@ -2230,7 +2230,6 @@ extern "C" __global__ __aicore__ void k_qx8(GM_ADDR x, GM_ADDR xrep, GM_ADDR xau
 
 extern "C" __global__ __aicore__ void k_gemm_w8d(GM_ADDR w, GM_ADDR xrep, GM_ADDR xaux, GM_ADDR y, int32_t n, int32_t k, GM_ADDR flags, int32_t gate_seq, int32_t done_seq)
 {
-    db_gate(flags, gate_seq);
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> ub_buf;
     AscendC::TBuf<AscendC::TPosition::A1> l1_buf;
@@ -2273,6 +2272,21 @@ extern "C" __global__ __aicore__ void k_gemm_w8d(GM_ADDR w, GM_ADDR xrep, GM_ADD
     gx.SetGlobalBuffer((__gm__ uint8_t*)xrep, (uint64_t)KH * 4 * khalf);
     ga.SetGlobalBuffer((__gm__ float*)xaux, (uint64_t)KS * 8 * 3);
     gy.SetGlobalBuffer((__gm__ float*)y, n);
+    if (gate_seq) { // gated: 等铃期间把本核权重前段灌进片上共享缓存 (MTE2 不空转, 放行后真实读取命中缓存)
+        GlobalTensor<int32_t> gf;
+        gf.SetGlobalBuffer((__gm__ int32_t*)flags);
+        AscendC::TEventID ewm = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_S>();
+        uint64_t wmax = wtotal < (1ull << 20) ? wtotal : (1ull << 20);
+        for (uint64_t off = 0; off + 32768 <= wmax; off += 32768) { // 查铃 (S) 与拷贝 (MTE2) 并行, 每块完成再发下一块 (不把预读排队排过铃点, 最多多拷一块)
+            AscendC::DataCopy(qbuf0, gw[off], 32768);
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE>(gf);
+            bool rung = *(__gm__ volatile int32_t*)flags >= gate_seq;
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(ewm);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(ewm);
+            if (rung) break;
+        }
+        db_gate(flags, gate_seq);
+    }
     AscendC::SetVectorMask<half>(FULL, FULL);
     AscendC::Duplicate(mk, (uint16_t)0x0F0F, 16);
     AscendC::Duplicate(mk[16], (uint16_t)0xF0F0, 16);
